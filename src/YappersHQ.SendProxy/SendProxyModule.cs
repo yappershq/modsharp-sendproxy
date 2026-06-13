@@ -70,12 +70,29 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     ///     Logs the resolved addresses. Touches no memory — this is the Phase-1 offset-verification
     ///     groundwork (confirms the string-anchor resolution works on this build before any patch).
     /// </summary>
+    // CFlattenedSerializer::EncodeField prologue (true entry; Ghidra's FUN_004334e0 was 0x10 in,
+    // mid-instruction). Distinctive via the `and ebx,0x7fffffff` hash mask. Build-specific.
+    private const string EncodeFieldSig =
+        "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 83 EC 08 8B 57 04 89 D3 81 E3 FF FF FF 7F";
+
     private void ResolveNativeTargets()
     {
         var ns = _bridge.LibraryModuleManager.NetworkSystem;
         var en = _bridge.LibraryModuleManager.Engine;
 
-        ResolveByString(ns, "EncodeField", "CFlattenedSerializer::EncodeField encoder wrote %d bits %s %s %s!");
+        // EncodeField: resolve by byte-signature (FindString fails on its long format strings).
+        try
+        {
+            var ef = ns.FindPattern(EncodeFieldSig);
+            _logger.LogInformation("SendProxy resolve EncodeField (sig): fn=0x{Fn:X}", ef);
+            if (ef == 0)
+                _logger.LogWarning("SendProxy: EncodeField sig not found (changed this build?)");
+        }
+        catch (Exception e)
+        {
+            _logger.LogWarning("SendProxy EncodeField sig resolve failed: {Msg}", e.Message);
+        }
+
         ResolveByString(en, "SendClientMessages", "SV:  SendClientMessages");
         ResolveByString(en, "WriteDeltaEntity",
             "SV: CNetworkGameServerBase::WriteDeltaEntity_Internal merging changes added in %d additional fields!");
