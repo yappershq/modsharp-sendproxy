@@ -3,5 +3,6 @@
     <File Path="src/Directory.Build.props" />
     <Project Path="src/YappersHQ.SendProxy.Shared/YappersHQ.SendProxy.Shared.csproj" />
     <Project Path="src/YappersHQ.SendProxy/YappersHQ.SendProxy.csproj" />
+    <Project Path="src/YappersHQ.SendProxy.Example/YappersHQ.SendProxy.Example.csproj" />
   </Folder>
 </Solution>

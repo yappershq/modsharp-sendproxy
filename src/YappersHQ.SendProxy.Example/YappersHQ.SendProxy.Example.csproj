@@ -1,0 +1,5 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <ProjectReference Include="..\YappersHQ.SendProxy.Shared\YappersHQ.SendProxy.Shared.csproj" Private="false" />
+  </ItemGroup>
+</Project>

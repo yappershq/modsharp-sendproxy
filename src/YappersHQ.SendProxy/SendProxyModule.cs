@@ -34,6 +34,8 @@ public sealed class SendProxyModule : IModSharpModule
         // Loads .asset/gamedata/yappershq.sendproxy.games.jsonc (offsets/sigs for the encode path).
         _bridge.GameData.Register("yappershq.sendproxy");
 
+        ResolveNativeTargets();
+
         if (!EncoderHook.Enabled)
             _logger.LogWarning(
                 "SendProxy loaded in REGISTRATION-ONLY mode — the live encoder patch is disabled until "
@@ -41,6 +43,37 @@ public sealed class SendProxyModule : IModSharpModule
                 + "are not yet substituted. See README.");
 
         return true;
+    }
+
+    /// <summary>
+    ///     Read-only resolution self-test: locate the encode-path functions on the live binary via
+    ///     their referenced log strings (<see cref="Sharp.Shared.ILibraryModule.FindFunction(string)"/>).
+    ///     Logs the resolved addresses. Touches no memory — this is the Phase-1 offset-verification
+    ///     groundwork (confirms the string-anchor resolution works on this build before any patch).
+    /// </summary>
+    private void ResolveNativeTargets()
+    {
+        try
+        {
+            var ns = _bridge.LibraryModuleManager.NetworkSystem;
+            var en = _bridge.LibraryModuleManager.Engine;
+
+            var encodeField = ns.FindFunction("CFlattenedSerializer::EncodeField encoder wrote %d bits %s %s %s!");
+            var sendClients = en.FindFunction("SV:  SendClientMessages");
+            var writeDelta  = en.FindFunction(
+                "SV: CNetworkGameServerBase::WriteDeltaEntity_Internal merging changes added in %d additional fields!");
+
+            _logger.LogInformation(
+                "SendProxy native resolution — EncodeField={EncodeField:X}, SendClientMessages={Send:X}, WriteDeltaEntity={Write:X}",
+                encodeField, sendClients, writeDelta);
+
+            if (encodeField == 0)
+                _logger.LogWarning("EncodeField not resolved by string anchor — anchor may have changed this build");
+        }
+        catch (Exception e)
+        {
+            _logger.LogError(e, "SendProxy native resolution self-test threw");
+        }
     }
 
     public void PostInit()

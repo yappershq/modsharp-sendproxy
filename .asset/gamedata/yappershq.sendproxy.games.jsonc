@@ -18,23 +18,20 @@
     // sig: void EncodeFieldFn(bf_write*, CNetworkSerializerFieldInfo*, void* valuePtr, void* ctx, uint)
     "CFlattenedSerializer::EncodeField": {
       "library": "networksystem",
-      "refs": { "strings": [ "CFlattenedSerializer::EncodeField encoder wrote %d bits %s %s %s!" ] },
-      "linux": "TODO_VERIFY"
+      "refs": { "strings": [ "CFlattenedSerializer::EncodeField encoder wrote %d bits %s %s %s!" ] }
     },
 
     // Per-client send loop (clients at gameserver+0x4b, count +0x4a; SendSnapshot vtable +0x80).
     // Phase 2 — set thread_local "current client" here. Observed @ 0x7a7280.
     "CNetworkGameServer::SendClientMessages": {
       "library": "engine2",
-      "refs": { "strings": [ "SV:  SendClientMessages" ] },
-      "linux": "TODO_VERIFY"
+      "refs": { "strings": [ "SV:  SendClientMessages" ] }
     },
 
     // Per-entity delta write (re-encodes field values from snapshot). Phase 2. Observed @ 0x7d15c0.
     "CNetworkGameServerBase::WriteDeltaEntity_Internal": {
       "library": "engine2",
-      "refs": { "strings": [ "SV: CNetworkGameServerBase::WriteDeltaEntity_Internal merging changes added in %d additional fields!" ] },
-      "linux": "TODO_VERIFY"
+      "refs": { "strings": [ "SV: CNetworkGameServerBase::WriteDeltaEntity_Internal merging changes added in %d additional fields!" ] }
     }
   }
 }
