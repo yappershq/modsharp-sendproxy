@@ -1,0 +1,55 @@
+<Project>
+  <PropertyGroup>
+    <SendProxyRoot>$(MSBuildThisFileDirectory)</SendProxyRoot>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <Authors>Prefix</Authors>
+    <VersionPrefix>0.1</VersionPrefix>
+    <VersionSuffix>0</VersionSuffix>
+    <Version>$(VersionPrefix).$(VersionSuffix)</Version>
+    <Copyright>© 2026 Prefix</Copyright>
+
+    <TargetFramework>net10.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <LangVersion>14</LangVersion>
+    <Nullable>enable</Nullable>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <PlatformTarget>x64</PlatformTarget>
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+
+    <BuildDateTime>$([System.DateTime]::Now.ToString("yyyy-MM-dd HH:mm:ss"))</BuildDateTime>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Release|AnyCPU'">
+    <TreatWarningsAsErrors>True</TreatWarningsAsErrors>
+    <DebugSymbols>true</DebugSymbols>
+    <DebugType>embedded</DebugType>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <IsSharedProject>$([System.String]::new('$(MSBuildProjectName)').EndsWith('.Shared'))</IsSharedProject>
+    <IsModuleProject Condition="'$(IsSharedProject)' != 'true'">true</IsModuleProject>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(IsSharedProject)' == 'true'">
+    <OutputPath>$(MSBuildThisFileDirectory)..\.build\shared\$(MSBuildProjectName)\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(IsModuleProject)' == 'true'">
+    <OutputPath>$(MSBuildThisFileDirectory)..\.build\modules\$(MSBuildProjectName)\</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="obj\**" />
+    <EmbeddedResource Remove="obj\**" />
+    <None Remove="obj\**" />
+  </ItemGroup>
+
+  <!-- ModSharp packages — pinned to match the server runtime -->
+  <ItemGroup>
+    <PackageReference Include="ModSharp.Sharp.Shared" Version="2.1.123" ExcludeAssets="runtime" />
+  </ItemGroup>
+</Project>

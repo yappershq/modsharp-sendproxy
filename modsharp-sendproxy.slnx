@@ -1,0 +1,7 @@
+<Solution>
+  <Folder Name="/src/">
+    <File Path="src/Directory.Build.props" />
+    <Project Path="src/YappersHQ.SendProxy.Shared/YappersHQ.SendProxy.Shared.csproj" />
+    <Project Path="src/YappersHQ.SendProxy/YappersHQ.SendProxy.csproj" />
+  </Folder>
+</Solution>

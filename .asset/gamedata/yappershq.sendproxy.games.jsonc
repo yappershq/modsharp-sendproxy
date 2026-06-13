@@ -1,0 +1,40 @@
+// SendProxy gamedata — CS2 flattened-serializer encode path.
+//
+// Reverse-engineered from libnetworksystem.so / libengine2.so (build 2026-06-02).
+// These entries document the hook targets. The `linux` byte signatures below are marked
+// TODO and MUST be extracted + verified against the live binary before the encoder patch is
+// enabled (Native/FlattenedSerializerLayout.cs::EncoderHook.Enabled). Until then the module
+// runs registration-only and never resolves/patches these — so missing sigs are harmless.
+//
+// Offsets used by the hook (struct CNetworkSerializerFieldInfo), NOT resolved here but kept
+// for reference — see Native/FlattenedSerializerLayout.cs:
+//   +0x28  m_NetworkSendProxyRecipientsFilter (shared_ptr)   — per-client presence (Phase 2)
+//   +0x38  encoder dispatch ptr; **(void***)(field+0x38) = encode fn (slot 0)  — VALUE hook
+//   +0x40  m_nFieldOffset (value offset within entity)
+//   +0xC9  secondary field-offset adjust byte (0xFF = none)
+{
+  "Signatures": {
+    // Per-field value encode (the Source1 SendProp::m_pProxyFn analog). Observed @ 0x4334e0.
+    // sig: void EncodeFieldFn(bf_write*, CNetworkSerializerFieldInfo*, void* valuePtr, void* ctx, uint)
+    "CFlattenedSerializer::EncodeField": {
+      "library": "networksystem",
+      "refs": { "strings": [ "CFlattenedSerializer::EncodeField encoder wrote %d bits %s %s %s!" ] },
+      "linux": "TODO_VERIFY"
+    },
+
+    // Per-client send loop (clients at gameserver+0x4b, count +0x4a; SendSnapshot vtable +0x80).
+    // Phase 2 — set thread_local "current client" here. Observed @ 0x7a7280.
+    "CNetworkGameServer::SendClientMessages": {
+      "library": "engine2",
+      "refs": { "strings": [ "SV:  SendClientMessages" ] },
+      "linux": "TODO_VERIFY"
+    },
+
+    // Per-entity delta write (re-encodes field values from snapshot). Phase 2. Observed @ 0x7d15c0.
+    "CNetworkGameServerBase::WriteDeltaEntity_Internal": {
+      "library": "engine2",
+      "refs": { "strings": [ "SV: CNetworkGameServerBase::WriteDeltaEntity_Internal merging changes added in %d additional fields!" ] },
+      "linux": "TODO_VERIFY"
+    }
+  }
+}
