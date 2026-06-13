@@ -13,6 +13,27 @@ namespace YappersHQ.SendProxy.Native;
 /// </summary>
 internal static class FlattenedSerializerLayout
 {
+    // ── CFlattenedSerializer object layout (VERIFIED in CFlattenedSerializer::WriteFieldList) ──
+    /// <summary>Serializer's own name pointer (CUtlString/char*). Verified.</summary>
+    public const int SerializerNameOffset = 0x00;
+    /// <summary>Field count (int32). Verified.</summary>
+    public const int SerializerFieldCountOffset = 0x08;
+    /// <summary>Field array base: an array of POINTERS to field records (stride = 8). Verified.</summary>
+    public const int SerializerFieldArrayOffset = 0x10;
+    public const int FieldArrayStride = 8;
+
+    // ── Per field-record layout ──
+    /// <summary>Field record vtable ptr (record+0x00). Verified.</summary>
+    public const int FieldRecordVTableOffset = 0x00;
+    /// <summary>Field name lives in a sub-object reached via record+0x10. INFERRED — confirm on a live dump.</summary>
+    public const int FieldRecordNameSubObjectOffset = 0x10;
+
+    // REMAINING UNKNOWNS before the live patch is safe (see README Phase 1):
+    //  - entity/class -> CFlattenedSerializer accessor (registry lookup @ ~0x4901a6, not yet RE'd).
+    //  - confirm the +0x10 field-array record IS the same object EncodeField receives as `fieldInfo`
+    //    (so EncoderDispatchOffset 0x38 applies to it) — needs decompiling CFlattenedSerializer::Encode.
+    //  - confirm FieldRecordNameSubObjectOffset for name matching.
+
     /// <summary>
     ///     Offset within CNetworkSerializerFieldInfo of the pointer to the encoder dispatch
     ///     object. The actual per-field encode function is vtable slot 0 of that object —
