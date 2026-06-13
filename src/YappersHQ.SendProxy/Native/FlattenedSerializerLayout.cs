@@ -28,11 +28,23 @@ internal static class FlattenedSerializerLayout
     /// <summary>Field name lives in a sub-object reached via record+0x10. INFERRED — confirm on a live dump.</summary>
     public const int FieldRecordNameSubObjectOffset = 0x10;
 
-    // REMAINING UNKNOWNS before the live patch is safe (see README Phase 1):
-    //  - entity/class -> CFlattenedSerializer accessor (registry lookup @ ~0x4901a6, not yet RE'd).
-    //  - confirm the +0x10 field-array record IS the same object EncodeField receives as `fieldInfo`
-    //    (so EncoderDispatchOffset 0x38 applies to it) — needs decompiling CFlattenedSerializer::Encode.
-    //  - confirm FieldRecordNameSubObjectOffset for name matching.
+    // ── GAME-FUNCTION RESOLUTION PATH (preferred — robust, no hardcoded fn addresses) ──
+    // Per hl2sdk-cs2 entityinstance.h, GetNetworkSerializerInfo() is CEntityInstance VTABLE SLOT 0:
+    //   nint classInfo = ((delegate* unmanaged<nint,nint>)(*(nint*)(*(nint*)entityPtr)))(entityPtr);
+    // → CNetworkSerializerClassInfo*. Layout (inetworkserializer.h): leading ExcludeIncludeFilter_t
+    // (2x CUtlVector), CUtlStringToken m_nHash, CUtlString m_pszClassName, then
+    // CUtlVector<CNetworkSerializerFieldInfo*> m_Fields. Walk m_Fields, match each field's
+    // m_FieldNameHash (CUtlStringToken = MurmurHash2-lowercase of the prop) or m_pszFieldName,
+    // then swap that field's +0x38 encoder dispatch ptr (slot 0 = encode fn) for our trampoline.
+    /// <summary>CEntityInstance vtable slot for GetNetworkSerializerInfo() → CNetworkSerializerClassInfo*.</summary>
+    public const int GetNetworkSerializerInfoVtableSlot = 0;
+
+    // REMAINING (confirm via a read-only dump on TTT — safe, crash = restart):
+    //  - exact byte offset of m_Fields (CUtlVector) within CNetworkSerializerClassInfo (depends on
+    //    the leading ExcludeIncludeFilter_t + CUtlString sizes — runtime CUtl layout).
+    //  - CUtlVector layout (element ptr + count offsets) for m_Fields.
+    //  - m_FieldNameHash / m_pszFieldName offset within CNetworkSerializerFieldInfo (SDK order known).
+    //  - then the +0x38 encoder swap (memory write) + [UnmanagedCallersOnly] encode trampoline.
 
     /// <summary>
     ///     Offset within CNetworkSerializerFieldInfo of the pointer to the encoder dispatch
