@@ -3,13 +3,15 @@ using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Sharp.Shared;
 using Sharp.Shared.Enums;
+using Sharp.Shared.GameEntities;
+using Sharp.Shared.Listeners;
 using Sharp.Shared.Types;
 using YappersHQ.SendProxy.Native;
 using YappersHQ.SendProxy.Shared;
 
 namespace YappersHQ.SendProxy;
 
-public sealed class SendProxyModule : IModSharpModule
+public sealed class SendProxyModule : IModSharpModule, IEntityListener
 {
     public string DisplayName   => "SendProxy";
     public string DisplayAuthor => "Prefix";
@@ -102,11 +104,22 @@ public sealed class SendProxyModule : IModSharpModule
     }
 
     public void PostInit()
-        => _bridge.SharpModuleManager.RegisterSharpModuleInterface<ISendProxyManager>(
+    {
+        _bridge.SharpModuleManager.RegisterSharpModuleInterface<ISendProxyManager>(
             this, ISendProxyManager.Identity, _manager);
+
+        // Drop hooks when an entity is deleted — its index gets reused (flaw #2 fix).
+        _bridge.EntityManager.InstallEntityListener(this);
+    }
+
+    // IEntityListener (other members use the interface's default no-op impls).
+    int IEntityListener.ListenerVersion => IEntityListener.ApiVersion;
+    int IEntityListener.ListenerPriority => 0;
+    void IEntityListener.OnEntityDeleted(IBaseEntity entity) => _manager.RemoveEntityHooks((int) entity.Index);
 
     public void Shutdown()
     {
+        _bridge.EntityManager.RemoveEntityListener(this);
         _bridge.ConVarManager.ReleaseCommand("sp_dump");
         _manager.Clear();
     }

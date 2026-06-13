@@ -65,6 +65,12 @@ public interface ISendProxyManager
     bool HookGameRulesFloat(string prop, SendProxyFloatCallback callback);
 
     bool Unhook(int entity, string prop, System.Delegate callback);
+
+    /// <summary>
+    ///     Remove ALL hooks on (entity, prop). Use this when you registered with a lambda (which
+    ///     can't be matched by reference in the delegate overload).
+    /// </summary>
+    bool Unhook(int entity, string prop);
     bool UnhookGameRules(string prop, System.Delegate callback);
     bool IsHooked(int entity, string prop);
     bool IsHookedGameRules(string prop);

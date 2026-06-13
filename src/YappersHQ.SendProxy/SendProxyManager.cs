@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Linq;
 using Microsoft.Extensions.Logging;
 using YappersHQ.SendProxy.Native;
 using YappersHQ.SendProxy.Shared;
@@ -83,7 +84,33 @@ internal sealed class SendProxyManager : ISendProxyManager
         return removed;
     }
 
+    public bool Unhook(int entity, string prop)
+    {
+        var had = _hooks.Remove((entity, prop));
+        if (had && EncoderHook.Enabled)
+            RemoveEncoderSwap(entity, prop);
+        return had;
+    }
+
     public bool UnhookGameRules(string prop, Delegate callback) => Unhook(GameRulesEntity, prop, callback);
+
+    /// <summary>
+    ///     Drop every hook bound to <paramref name="entity"/>. Called on entity deletion — entity
+    ///     indices are reused after a disconnect / round restart, so a stale hook would otherwise
+    ///     apply to a different entity that later takes the same index. (Flaw #2 fix.)
+    /// </summary>
+    internal void RemoveEntityHooks(int entity)
+    {
+        foreach (var key in _hooks.Keys.Where(k => k.Entity == entity).ToList())
+        {
+            _hooks.Remove(key);
+            if (EncoderHook.Enabled)
+                RemoveEncoderSwap(key.Entity, key.Prop);
+        }
+
+        foreach (var key in _changeHooks.Keys.Where(k => k.Entity == entity).ToList())
+            _changeHooks.Remove(key);
+    }
 
     public bool IsHooked(int entity, string prop) => _hooks.ContainsKey((entity, prop));
 
