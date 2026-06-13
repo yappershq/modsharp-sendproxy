@@ -115,6 +115,29 @@ the per-client send (+0x80) and override only hooked entities' hooked fields in 
 
 ---
 
+## 4b. Re-deriving the EncodeField signature (do this on every game update)
+
+The `EncodeField` byte-signature is build-specific and **will break on engine updates**. To regenerate:
+
+1. `strings libnetworksystem.so | grep 'CFlattenedSerializer::EncodeField encoder wrote'` — confirm the
+   anchor string still exists.
+2. In Ghidra (or via the string xref), find the function that references it. ⚠️ Ghidra frequently sets
+   the function entry **mid-instruction** on this stripped binary (it put EncodeField's entry 0x10 bytes
+   too far in, at 0x4334e0 instead of 0x4334d0). **Always verify the real entry**: disassemble backward
+   until you hit a clean prologue right after a prior `ret`:
+   `55 (push rbp) / 48 89 E5 (mov rbp,rsp) / 41 57 41 56 41 55 41 54 (push r15..r12) / 53 (push rbx) / 48 83 EC xx (sub rsp,xx)`.
+3. The function is identifiable a few bytes in by its **31-bit hash mask + loop-bound check**:
+   `8B 57 04 (mov edx,[rdi+4]) / 89 D3 (mov ebx,edx) / 81 E3 FF FF FF 7F (and ebx,0x7fffffff) / 39 F3 (cmp ebx,esi) / 0F 8D (jge)`.
+   That `81 E3 FF FF FF 7F` is the most distinctive marker — include it so the sig is unique.
+4. Build the sig from the prologue through the hash mask. Current (build 2026-06-02):
+   `55 48 89 E5 41 57 41 56 41 55 41 54 53 48 83 EC 08 8B 57 04 89 D3 81 E3 FF FF FF 7F`
+   Wildcard (`?`) any rel32/rip-relative displacement bytes — there are none in this prologue.
+5. Verify at runtime: `NetworkSystem.FindPattern(sig)` must return a non-zero address pointing at the
+   prologue (`55 48 89 E5 …`). The module logs this on load (`SendProxy resolve EncodeField (sig)`).
+6. ⚠️ The function's true **argument signature** must be re-derived from the *correct* entry (0x4334d0),
+   not Ghidra's mid-function entry — decompiling the wrong entry gives a wrong arg layout, and a detour
+   built on it will crash. Confirm arity/types before installing the detour.
+
 ## 5. ModSharp resolution tooling (verified live on a server)
 
 - `ILibraryModule.FindString(str)` → `ILibraryModule.FindFunction(nint ptr)` reliably locates a
