@@ -88,6 +88,10 @@ Deploy the module DLL to `<sharp>/modules/YappersHQ.SendProxy/`, the Shared DLL 
   clients, not all × clients).
 
 ## Reverse-engineering notes
+**Full RE writeup: [`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md)** — the complete CS2
+networking analysis (pipeline, hook point, struct layouts, game-function resolution, per-client
+verdict, offsets table, dead ends).
+
 Binaries: CS2 dedicated-server `libnetworksystem.so` / `libengine2.so` (build 2026-06-02), stripped.
 Targets located via assert-string xrefs + RTTI in Ghidra. Struct layout cross-checked against the
 [hl2sdk `cs2` branch](https://github.com/alliedmodders/hl2sdk/tree/cs2)
