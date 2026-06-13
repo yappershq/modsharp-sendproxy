@@ -101,15 +101,19 @@ internal sealed class SendProxyManager : ISendProxyManager
     public bool UnhookPropChange(int entity, string prop, PropChangeCallback callback)
         => _changeHooks.TryGetValue((entity, prop), out var list) && list.Remove(callback);
 
-    // ── Live encoder swap (Phase 1 completion — gated by EncoderHook.Enabled) ────────
-    // Resolve the CNetworkSerializerFieldInfo for (entity-class, prop), read the encoder
-    // dispatch pointer at +FlattenedSerializerLayout.EncoderDispatchOffset, and swap vtable
-    // slot 0 for our trampoline (which invokes the recorded callback). Implemented once the
-    // offsets are verified on a live server; see README "Phase 1 — remaining".
+    // ── Live encoder hook (Phase 1 completion — gated by EncoderHook.Enabled) ────────
+    // Resolution of (entity -> serializer -> field) is CONFIRMED LIVE: entity vtable[0] =
+    // GetNetworkSerializerInfo() -> CNetworkSerializerClassInfo (classname +0x08, field count
+    // +0x10, field-array ptr +0x18); each field record has m_FieldNameHash +0x00 / m_pszFieldName
+    // +0x08. BUT the value-substitution mechanism is NOT settled: the live dump disproved the
+    // "+0x38 encoder ptr" assumption (+0x38 = m_nFieldSize/m_nFieldOffset). The encode fn is
+    // resolved from the named m_NetworkEncoder at serialize time — there's no stored per-field
+    // encode ptr to swap in this record. Likely path: global detour of CFlattenedSerializer::
+    // EncodeField (resolved via FindFunction) + a hooked-(class,field) fast filter. See README.
     private void ApplyEncoderSwap(int entity, string prop, SendPropType type, int element)
     {
-        // TODO(phase1-live): walk entity -> flattened serializer -> field -> encoder dispatch,
-        // install trampoline. No-op until verified to avoid corrupting engine memory.
+        // TODO(phase1-live): install EncodeField detour (or locate the cached dispatch block).
+        // No-op until the value-substitution mechanism is settled — never patch unverified memory.
     }
 
     private void RemoveEncoderSwap(int entity, string prop)

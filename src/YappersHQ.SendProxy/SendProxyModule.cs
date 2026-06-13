@@ -2,6 +2,8 @@ using System;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Sharp.Shared;
+using Sharp.Shared.Enums;
+using Sharp.Shared.Types;
 using YappersHQ.SendProxy.Native;
 using YappersHQ.SendProxy.Shared;
 
@@ -44,6 +46,12 @@ public sealed class SendProxyModule : IModSharpModule
         }
 
         ResolveNativeTargets();
+
+        // Read-only diagnostic: dump an entity's serializer layout (entity vtable[0] ->
+        // CNetworkSerializerClassInfo) to confirm runtime offsets before the patch is wired.
+        _bridge.ConVarManager.CreateServerCommand("sp_dump", OnDumpCommand,
+            "Read-only: dump an entity's network serializer layout: sp_dump <entityIndex>",
+            ConVarFlags.Release);
 
         if (!EncoderHook.Enabled)
             _logger.LogWarning(
@@ -97,5 +105,27 @@ public sealed class SendProxyModule : IModSharpModule
         => _bridge.SharpModuleManager.RegisterSharpModuleInterface<ISendProxyManager>(
             this, ISendProxyManager.Identity, _manager);
 
-    public void Shutdown() => _manager.Clear();
+    public void Shutdown()
+    {
+        _bridge.ConVarManager.ReleaseCommand("sp_dump");
+        _manager.Clear();
+    }
+
+    private ECommandAction OnDumpCommand(StringCommand command)
+    {
+        if (command.ArgCount < 1)
+        {
+            SerializerProbe.Scan(_bridge, _logger); // no arg → scan for live entities + dump the first
+            return ECommandAction.Stopped;
+        }
+
+        if (!int.TryParse(command.GetArg(1), out var idx))
+        {
+            _logger.LogInformation("usage: sp_dump [entityIndex]  (no arg = scan)");
+            return ECommandAction.Stopped;
+        }
+
+        SerializerProbe.Dump(_bridge, _logger, idx);
+        return ECommandAction.Stopped;
+    }
 }

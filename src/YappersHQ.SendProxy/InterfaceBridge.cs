@@ -17,6 +17,7 @@ internal sealed class InterfaceBridge
 
     public IModSharp ModSharp { get; }
     public IGameData GameData { get; }
+    public IConVarManager ConVarManager { get; }
     public IEntityManager EntityManager { get; }
     public IClientManager ClientManager { get; }
     public ISchemaManager SchemaManager { get; }
@@ -35,6 +36,7 @@ internal sealed class InterfaceBridge
 
         ModSharp = sharedSystem.GetModSharp();
         GameData = sharedSystem.GetModSharp().GetGameData();
+        ConVarManager = sharedSystem.GetConVarManager();
         EntityManager = sharedSystem.GetEntityManager();
         ClientManager = sharedSystem.GetClientManager();
         SchemaManager = sharedSystem.GetSchemaManager();

@@ -46,23 +46,29 @@ internal static class FlattenedSerializerLayout
     //  - m_FieldNameHash / m_pszFieldName offset within CNetworkSerializerFieldInfo (SDK order known).
     //  - then the +0x38 encoder swap (memory write) + [UnmanagedCallersOnly] encode trampoline.
 
-    /// <summary>
-    ///     Offset within CNetworkSerializerFieldInfo of the pointer to the encoder dispatch
-    ///     object. The actual per-field encode function is vtable slot 0 of that object —
-    ///     i.e. <c>**(void***)(fieldInfo + EncoderDispatchOffset)</c>. This is the Source2
-    ///     analog of Source1's <c>SendProp::m_pProxyFn</c> and the swap target for a hook.
-    /// </summary>
-    public const int EncoderDispatchOffset = 0x38;
+    // ── CNetworkSerializerFieldInfo (entity-reachable field record) — CONFIRMED LIVE ──
+    // Dump of CCSGameRulesProxy.m_pGameRules on the running server:
+    //   +0x00 m_FieldNameHash (CUtlStringToken) — match a field by this (hash of the prop)
+    //   +0x08 m_pszFieldName  (char*)  e.g. "m_pGameRules"   ← or match by this string
+    //   +0x10 m_pszTypeName, +0x18 m_pszRawType, +0x20 m_pszEncodedType (char*)
+    //   +0x28 m_ClassNameHash, +0x30 m_pszClassName (char*)
+    //   +0x38 m_nFieldSize (int32, low) + m_nFieldOffset (int32, high)
+    public const int FieldNameHashOffset = 0x00;
+    public const int FieldNameOffset     = 0x08;
+    public const int FieldSizeOffset     = 0x38; // int32
+    public const int FieldValueOffset    = 0x3C; // int32 (m_nFieldOffset, high dword of +0x38 qword)
 
-    /// <summary>
-    ///     Offset of the field's value within the owning entity instance (int32). The encode
-    ///     function reads the value from <c>entityBase + m_nFieldOffset</c> (with a secondary
-    ///     byte adjust at +0xC9 when present — see EncodeField decomp).
-    /// </summary>
-    public const int FieldValueOffset = 0x40;
-
-    /// <summary>Secondary field-offset adjust byte (0xFF = none). From EncodeField line ~330.</summary>
-    public const int FieldValueAdjustByte = 0xC9;
+    // ⚠️ CORRECTION: an earlier note put the encoder dispatch ptr at +0x38. The live dump
+    // DISPROVES that — +0x38 is m_nFieldSize/m_nFieldOffset (matches the SDK). The "+0x38
+    // encoder" seen in the CFlattenedSerializer::EncodeField decomp was a DIFFERENT, processed
+    // structure (the per-encode dispatch block built from the named m_NetworkEncoder via the
+    // encoder registry — see "InitFakeField" RE), NOT this entity-reachable field record.
+    // => There is no stored per-field encode-fn pointer in this record to swap. The encode fn is
+    //    resolved from m_NetworkEncoder (a name) at serialize time. Implication: the clean
+    //    per-field pointer-swap may not be possible from the static field record; the value hook
+    //    likely needs the global EncodeField detour (resolve via FindFunction) + a hooked-field
+    //    fast filter, OR locating where the processed dispatch block is cached. NEEDS more RE.
+    public const int EncoderDispatchOffset_DISPROVEN = 0x38;
 
     /// <summary>Per-field send-proxy recipients filter (shared_ptr&lt;NetworkRecipientsFilter_t&gt;). Phase 2.</summary>
     public const int RecipientsFilterOffset = 0x28;
