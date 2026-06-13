@@ -31,8 +31,17 @@ public sealed class SendProxyModule : IModSharpModule
 
     public bool Init()
     {
-        // Loads .asset/gamedata/yappershq.sendproxy.games.jsonc (offsets/sigs for the encode path).
-        _bridge.GameData.Register("yappershq.sendproxy");
+        // Loads gamedata/yappershq.sendproxy.jsonc (encode-path offsets/sigs). Non-fatal: the
+        // string-anchor resolution below doesn't depend on it, so a missing/invalid gamedata
+        // must not block module load.
+        try
+        {
+            _bridge.GameData.Register("yappershq.sendproxy");
+        }
+        catch (Exception e)
+        {
+            _logger.LogWarning(e, "SendProxy gamedata register failed (continuing without it)");
+        }
 
         ResolveNativeTargets();
 
@@ -53,26 +62,34 @@ public sealed class SendProxyModule : IModSharpModule
     /// </summary>
     private void ResolveNativeTargets()
     {
+        var ns = _bridge.LibraryModuleManager.NetworkSystem;
+        var en = _bridge.LibraryModuleManager.Engine;
+
+        ResolveByString(ns, "EncodeField", "CFlattenedSerializer::EncodeField encoder wrote %d bits %s %s %s!");
+        ResolveByString(en, "SendClientMessages", "SV:  SendClientMessages");
+        ResolveByString(en, "WriteDeltaEntity",
+            "SV: CNetworkGameServerBase::WriteDeltaEntity_Internal merging changes added in %d additional fields!");
+    }
+
+    // Locate a function by a string it references: FindString -> FindFunction(ptr). Both can throw
+    // when there's no match, so each lookup is isolated. Read-only.
+    private void ResolveByString(Sharp.Shared.ILibraryModule lib, string name, string anchor)
+    {
         try
         {
-            var ns = _bridge.LibraryModuleManager.NetworkSystem;
-            var en = _bridge.LibraryModuleManager.Engine;
+            var strAddr = lib.FindString(anchor);
+            if (strAddr == 0)
+            {
+                _logger.LogWarning("SendProxy resolve {Name}: string anchor not found (changed this build?)", name);
+                return;
+            }
 
-            var encodeField = ns.FindFunction("CFlattenedSerializer::EncodeField encoder wrote %d bits %s %s %s!");
-            var sendClients = en.FindFunction("SV:  SendClientMessages");
-            var writeDelta  = en.FindFunction(
-                "SV: CNetworkGameServerBase::WriteDeltaEntity_Internal merging changes added in %d additional fields!");
-
-            _logger.LogInformation(
-                "SendProxy native resolution — EncodeField={EncodeField:X}, SendClientMessages={Send:X}, WriteDeltaEntity={Write:X}",
-                encodeField, sendClients, writeDelta);
-
-            if (encodeField == 0)
-                _logger.LogWarning("EncodeField not resolved by string anchor — anchor may have changed this build");
+            var fn = lib.FindFunction(strAddr);
+            _logger.LogInformation("SendProxy resolve {Name}: string=0x{Str:X} fn=0x{Fn:X}", name, strAddr, fn);
         }
         catch (Exception e)
         {
-            _logger.LogError(e, "SendProxy native resolution self-test threw");
+            _logger.LogWarning("SendProxy resolve {Name} failed: {Msg}", name, e.Message);
         }
     }
 

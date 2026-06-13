@@ -9,7 +9,7 @@ namespace YappersHQ.SendProxy.Native;
 ///     ⚠️ These offsets are build-specific and were derived from one server build. They MUST
 ///     be re-verified against the live binary before the encoder pointer is patched — that is
 ///     why <see cref="EncoderHook.Enabled"/> gates the live memory write. Prefer driving these
-///     from the gamedata file (yappershq.sendproxy.games.jsonc) once stabilized.
+///     from the gamedata file (yappershq.sendproxy.jsonc) once stabilized.
 /// </summary>
 internal static class FlattenedSerializerLayout
 {
