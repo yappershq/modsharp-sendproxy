@@ -382,26 +382,20 @@ internal static unsafe class FieldSubstitution
     /// <summary>
     ///     Resolve the leaf field name from a CFlattenedSerializer and a decoded CFieldPath token.
     ///
-    ///     Serializer layout (confirmed by WriteFieldProbe + SerializerProbe + encodefield.out):
-    ///       serializer+0x08 = field count (int32)
-    ///       serializer+0x10 = field array base — array of POINTERS, stride 8
-    ///       field_record+0x08 = char* field name (leaf) OR CFlattenedSerializer* child (nested)
+    ///     Flattened-serializer field array layout (verified from encodefield.out lines 207/228-232):
+    ///       arrayBase  = *(nint*)(serializer + 0x30)   — deref: pointer stored at +0x30
+    ///       record_i   = arrayBase + i * 0x2E          — inline records, byte stride 0x2E
+    ///       record+0x00 = CNetworkSerializerFieldInfo*  — fieldInfo ptr (for leaf name)
+    ///       record+0x08 = CFlattenedSerializer*         — child serializer (for nested descent)
+    ///       leaf name  = *(char**)(*(nint*)(record+0x00) + 0x08) → ASCII
     ///
-    ///     Token descent (from encodefield.out — EncodeField recursive call pattern):
-    ///       Level 0: recPtr = *(fieldArray + i0*8)
-    ///       Level 1: childSer = *(recPtr + 0x08); recPtr = *(childFieldArray + i1*8)
-    ///       Level 2: childSer2 = *(recPtr + 0x08); recPtr = *(childFieldArray2 + i2*8)
-    ///       Leaf name: ReadShortAscii(*(recPtr + 0x08))
+    ///     Descent pattern (i0/i1/i2 are 0-based indices; negative = absent):
+    ///       base = *(nint*)(serializer + 0x30); rec = base + i0*0x2E
+    ///       if i1 >= 0: child = *(nint*)(rec+0x08); base = *(nint*)(child+0x30); rec = base + i1*0x2E
+    ///       if i2 >= 0: child = *(nint*)(rec+0x08); base = *(nint*)(child+0x30); rec = base + i2*0x2E
+    ///       fieldInfo = *(nint*)(rec+0x00); namePtr = *(nint*)(fieldInfo+0x08); return ReadShortAscii(namePtr)
     ///
-    ///     Child serializer offset confirmed from encodefield.out:
-    ///       puStack_2a0 = (undefined *)plVar40[1]  → inline_record+0x08 = child CFlattenedSerializer*
-    ///       This is then passed as param_1 (the serializer) in the recursive EncodeField call.
-    ///       For leaf fields, record+0x08 is the char* field name.
-    ///       For nested fields, record+0x08 is the child CFlattenedSerializer* (its own +0x00 is
-    ///       the child serializer name, +0x08 count, +0x10 child field array).
-    ///
-    ///     All pointer dereferences are guarded by IsUserPtr checks and a try/catch.
-    ///     Returns "" on any fault (bounds-check, invalid pointer, or exception).
+    ///     All dereferences are IsUserPtr-gated; entire function is wrapped in try/catch → "" on fault.
     /// </summary>
     private static string ResolveFieldName(nint serializer, uint token, int i0, int i1, int i2)
     {
@@ -412,66 +406,56 @@ internal static unsafe class FieldSubstitution
         try
         {
             // ── Level 0 ─────────────────────────────────────────────────────────
-            var count0   = *(int*) (serializer + 0x08);
-            if (count0 <= 0 || i0 >= count0 || count0 > 4096)
-                return string.Empty;
-
-            var arr0 = *(nint*) (serializer + 0x10);
+            // Array base is a pointer stored at serializer+0x30 (must deref once).
+            var arr0 = *(nint*) (serializer + 0x30);
             if (!IsUserPtr(arr0))
                 return string.Empty;
 
-            var rec0 = *(nint*) (arr0 + i0 * 8);
-            if (!IsUserPtr(rec0))
-                return string.Empty;
+            // Inline records, stride 0x2E bytes — NOT a pointer array.
+            var rec0 = arr0 + i0 * 0x2E;
 
             if (i1 < 0)
             {
-                // Leaf at level 0 — record+0x08 is the char* field name.
-                return ReadShortAscii(*(nint*) (rec0 + 0x08), 48);
+                // Leaf at level 0: fieldInfo @ rec+0x00, name char* @ fieldInfo+0x08.
+                var fi0 = *(nint*) (rec0 + 0x00);
+                if (!IsUserPtr(fi0)) return string.Empty;
+                return ReadShortAscii(*(nint*) (fi0 + 0x08), 48);
             }
 
-            // ── Level 1 descent: record+0x08 = child CFlattenedSerializer* ─────
+            // ── Level 1 descent: child serializer ptr @ rec+0x08 ────────────────
             var child1 = *(nint*) (rec0 + 0x08);
             if (!IsUserPtr(child1))
                 return string.Empty;
 
-            var count1 = *(int*) (child1 + 0x08);
-            if (count1 <= 0 || i1 >= count1 || count1 > 4096)
-                return string.Empty;
-
-            var arr1 = *(nint*) (child1 + 0x10);
+            var arr1 = *(nint*) (child1 + 0x30);
             if (!IsUserPtr(arr1))
                 return string.Empty;
 
-            var rec1 = *(nint*) (arr1 + i1 * 8);
-            if (!IsUserPtr(rec1))
-                return string.Empty;
+            var rec1 = arr1 + i1 * 0x2E;
 
             if (i2 < 0)
             {
                 // Leaf at level 1.
-                return ReadShortAscii(*(nint*) (rec1 + 0x08), 48);
+                var fi1 = *(nint*) (rec1 + 0x00);
+                if (!IsUserPtr(fi1)) return string.Empty;
+                return ReadShortAscii(*(nint*) (fi1 + 0x08), 48);
             }
 
-            // ── Level 2 descent: record+0x08 = child CFlattenedSerializer* ─────
+            // ── Level 2 descent: child serializer ptr @ rec+0x08 ────────────────
             var child2 = *(nint*) (rec1 + 0x08);
             if (!IsUserPtr(child2))
                 return string.Empty;
 
-            var count2 = *(int*) (child2 + 0x08);
-            if (count2 <= 0 || i2 >= count2 || count2 > 4096)
-                return string.Empty;
-
-            var arr2 = *(nint*) (child2 + 0x10);
+            var arr2 = *(nint*) (child2 + 0x30);
             if (!IsUserPtr(arr2))
                 return string.Empty;
 
-            var rec2 = *(nint*) (arr2 + i2 * 8);
-            if (!IsUserPtr(rec2))
-                return string.Empty;
+            var rec2 = arr2 + i2 * 0x2E;
 
             // Leaf at level 2.
-            return ReadShortAscii(*(nint*) (rec2 + 0x08), 48);
+            var fi2 = *(nint*) (rec2 + 0x00);
+            if (!IsUserPtr(fi2)) return string.Empty;
+            return ReadShortAscii(*(nint*) (fi2 + 0x08), 48);
         }
         catch
         {
