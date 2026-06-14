@@ -50,7 +50,7 @@ their native pointer, so the other ~10k entities cost **zero**.
   plus an `IGameClient?` recipient argument for the per-client matrix.
 - **`YappersHQ.SendProxy`** — the module: lifecycle, the hook registry, and the encoder swap
   (gated). `Native/FlattenedSerializerLayout.cs` holds the RE'd offsets;
-  `.asset/gamedata/yappershq.sendproxy.jsonc` documents the targets.
+  `.assets/gamedata/yappershq.sendproxy.jsonc` documents the targets.
 
 ## Usage (consumer plugin)
 ```csharp

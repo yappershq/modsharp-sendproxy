@@ -1,6 +1,6 @@
 # Signature tooling
 
-Scripts for (re-)deriving the gamedata signatures in `.asset/gamedata/yappershq.sendproxy.jsonc`
+Scripts for (re-)deriving the gamedata signatures in `.assets/gamedata/yappershq.sendproxy.jsonc`
 when CS2 updates. See `docs/REVERSE_ENGINEERING.md` §8 for the full manual recipe.
 
 ## makesig.py (nosoop)
