@@ -103,6 +103,79 @@ internal static class SerializerProbe
         }
     }
 
+    /// <summary>
+    ///     READ-ONLY: find the first live entity whose serializer class == <paramref name="classFilter"/>,
+    ///     walk its field array for <paramref name="fieldName"/>, and dump the raw qword window of that
+    ///     field record (offsets 0x28..0x50) with pointer-likeness tags. This resolves the open question
+    ///     of what lives at field+0x38 (encoder-dispatch ptr per the Ghidra decomp, vs m_nFieldSize/Offset
+    ///     per an earlier gdb read) BEFORE we swap anything. No writes. Every deref is range-gated.
+    /// </summary>
+    public static unsafe void DumpField(InterfaceBridge bridge, ILogger logger, string classFilter, string fieldName)
+    {
+        try
+        {
+            for (var i = 0; i < 2048; i++)
+            {
+                var ent = bridge.EntityManager.FindEntityByIndex((EntityIndex) i);
+                if (ent is null) continue;
+                var p = ent.GetAbsPtr();
+                if (p == 0) continue;
+
+                var ci = ((delegate* unmanaged<nint, nint>) (*(nint*) (*(nint*) p)))(p);
+                if (ci == 0) continue;
+                if (TryReadAscii(*(nint*) (ci + 0x08)) != classFilter) continue;
+
+                var count = *(int*) (ci + 0x10);
+                var arr   = *(nint*) (ci + 0x18);
+                if (arr == 0 || count <= 0 || count > 4096) continue;
+
+                logger.LogInformation("sp_field: matched class \"{Cls}\" at idx={Idx} (fields={Cnt})",
+                    classFilter, i, count);
+
+                for (var f = 0; f < count; f++)
+                {
+                    var rec = *(nint*) (arr + f * 8);
+                    if (!PtrLike(rec)) continue;
+                    if (TryReadAscii(*(nint*) (rec + 0x08)) != fieldName) continue;
+
+                    // Found the field record. Dump the qword window + tag pointer-likeness.
+                    logger.LogInformation("sp_field: FOUND \"{Cls}::{Field}\" rec=0x{Rec:X}", classFilter, fieldName, rec);
+                    for (var off = 0x20; off <= 0x50; off += 0x08)
+                    {
+                        var q = *(ulong*) (rec + off);
+                        var ptr = (nint) q;
+                        var tag = PtrLike(ptr) ? "ptr?" : (q < 0x100000 ? "int?" : "----");
+                        // If it looks like a pointer, peek one level (vtable) + the would-be slot0.
+                        var deref = "";
+                        if (PtrLike(ptr))
+                        {
+                            var v = *(ulong*) ptr;
+                            if (PtrLike((nint) v))
+                            {
+                                var slot0 = *(ulong*) (nint) v;
+                                deref = $" -> *=0x{v:X}" + (PtrLike((nint) slot0) ? $" -> **=0x{slot0:X} (code?)" : "");
+                            }
+                        }
+                        logger.LogInformation("  +0x{Off:X2} = 0x{Q:X} [{Tag}]{Deref}", off, q, tag, deref);
+                    }
+                    return;
+                }
+
+                logger.LogWarning("sp_field: class \"{Cls}\" found but no field \"{Field}\"", classFilter, fieldName);
+                return;
+            }
+            logger.LogWarning("sp_field: no live entity with serializer class \"{Cls}\"", classFilter);
+        }
+        catch (Exception e)
+        {
+            logger.LogError(e, "sp_field failed");
+        }
+    }
+
+    // Linux x64 mapped-pointer heuristic: high bytes == 0x00007F.. (heap/.so range). Cheap gate to
+    // avoid dereferencing scalar field values (small ints) as pointers and segfaulting.
+    private static bool PtrLike(nint p) => p > 0x10000 && ((ulong) p >> 40) == 0x7F;
+
     // Read up to 31 printable ASCII bytes at p. Gated to Linux x64 heap/rodata range
     // (0x00007Fxx_xxxxxxxx) so we don't dereference scalar field values and segfault.
     private static unsafe string TryReadAscii(nint p)

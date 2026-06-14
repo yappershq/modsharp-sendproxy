@@ -57,6 +57,12 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
             "Read-only: dump an entity's network serializer layout: sp_dump <entityIndex>",
             ConVarFlags.Release);
 
+        // Read-only field-record dumper: sp_field <serializerClass> <fieldName>. Walks a live entity's
+        // serializer field array, dumps the qword window around the target field (resolves the field+0x38
+        // encoder-vs-offset question before any swap). e.g. sp_field CCSPlayerPawn m_iHealth
+        _bridge.ConVarManager.CreateServerCommand("sp_field", OnFieldCommand,
+            "Read-only: dump a serializer field record: sp_field <class> <fieldName>", ConVarFlags.Release);
+
         // Read-only EncodeField detour probe (manual on/off — logs the real args of the first calls).
         _bridge.ConVarManager.CreateServerCommand("sp_detour_on", OnDetourOn,
             "Install the read-only EncodeField detour probe", ConVarFlags.Release);
@@ -125,6 +131,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         EncodeFieldDetour.Uninstall();
         _bridge.EntityManager.RemoveEntityListener(this);
         _bridge.ConVarManager.ReleaseCommand("sp_dump");
+        _bridge.ConVarManager.ReleaseCommand("sp_field");
         _bridge.ConVarManager.ReleaseCommand("sp_detour_on");
         _bridge.ConVarManager.ReleaseCommand("sp_detour_off");
         _manager.Clear();
@@ -145,6 +152,18 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         }
 
         SerializerProbe.Dump(_bridge, _logger, idx);
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnFieldCommand(StringCommand command)
+    {
+        if (command.ArgCount < 2)
+        {
+            _logger.LogInformation("usage: sp_field <serializerClass> <fieldName>  (e.g. sp_field CCSPlayerPawn m_iHealth)");
+            return ECommandAction.Stopped;
+        }
+
+        SerializerProbe.DumpField(_bridge, _logger, command.GetArg(1), command.GetArg(2));
         return ECommandAction.Stopped;
     }
 
