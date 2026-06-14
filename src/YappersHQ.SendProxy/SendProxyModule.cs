@@ -22,6 +22,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
     private nint _encodeFieldAddr;  // CFlattenedSerializer::EncodeField, resolved via sig on load
     private nint _intEncoderAddr;   // CFlattenedSerializer::EncodeInt32, resolved via sig on load
+    private nint _wdeAddr;          // CNetworkGameServerBase::WriteDeltaEntity_Internal, resolved via sig on load
 
     public SendProxyModule(
         ISharedSystem  sharedSystem,
@@ -77,6 +78,14 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.ConVarManager.CreateServerCommand("sp_encprobe_off", OnEncProbeOff,
             "Uninstall the IntEncoder detour probe", ConVarFlags.Release);
 
+        // Read-only WriteDeltaEntity_Internal probe: logs first 40 calls (thread id + arg layout)
+        // to confirm serial per-client execution and reveal ctx field offsets for Phase-2 per-client spoofing.
+        _bridge.ConVarManager.CreateServerCommand("sp_wdeprobe", OnWdeProbeOn,
+            "Install the read-only WriteDeltaEntity_Internal detour probe (logs first 40 calls with thread id + ctx fields)",
+            ConVarFlags.Release);
+        _bridge.ConVarManager.CreateServerCommand("sp_wdeprobe_off", OnWdeProbeOff,
+            "Uninstall the WriteDeltaEntity_Internal detour probe", ConVarFlags.Release);
+
         // Live value spoof: sp_fakehp <value> — makes all clients see fake HP; server keeps real.
         _bridge.ConVarManager.CreateServerCommand("sp_fakehp", OnFakeHp,
             "Spoof m_iHealth for all clients: sp_fakehp <value>", ConVarFlags.Release);
@@ -97,6 +106,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private const string EncodeFieldKey       = "CFlattenedSerializer::EncodeField";
     private const string EncodeInt32Key       = "CFlattenedSerializer::EncodeInt32";
     private const string SendClientMessagesKey = "CNetworkGameServer::SendClientMessages";
+    private const string WriteDeltaInternalKey = "CNetworkGameServerBase::WriteDeltaEntity_Internal";
 
     /// <summary>
     ///     Resolve the encode-path functions from gamedata (single source of truth — sigs are in
@@ -108,7 +118,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _encodeFieldAddr = ResolveFromGameData(EncodeFieldKey);
         _intEncoderAddr  = ResolveFromGameData(EncodeInt32Key);
         ResolveFromGameData(SendClientMessagesKey); // Phase-2 anchor; logged for verification only.
-        // WriteDeltaEntity_Internal is Phase-2-only and not yet in gamedata (see the json + RE doc).
+        _wdeAddr         = ResolveFromGameData(WriteDeltaInternalKey);
     }
 
     // GetAddress throws KeyNotFoundException if the entry didn't resolve (sig miss / not registered).
@@ -146,6 +156,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     {
         EncodeFieldDetour.Uninstall();
         IntEncoderDetour.Uninstall();
+        WriteDeltaProbe.Uninstall();
         _bridge.EntityManager.RemoveEntityListener(this);
         _bridge.ConVarManager.ReleaseCommand("sp_dump");
         _bridge.ConVarManager.ReleaseCommand("sp_field");
@@ -153,6 +164,8 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.ConVarManager.ReleaseCommand("sp_detour_off");
         _bridge.ConVarManager.ReleaseCommand("sp_encprobe");
         _bridge.ConVarManager.ReleaseCommand("sp_encprobe_off");
+        _bridge.ConVarManager.ReleaseCommand("sp_wdeprobe");
+        _bridge.ConVarManager.ReleaseCommand("sp_wdeprobe_off");
         _bridge.ConVarManager.ReleaseCommand("sp_fakehp");
         _bridge.ConVarManager.ReleaseCommand("sp_fakehp_off");
         _manager.Clear();
@@ -260,6 +273,21 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         if (!IntEncoderDetour.HasSpoofs)
             IntEncoderDetour.Uninstall();
         _logger.LogInformation("fakehp off");
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnWdeProbeOn(StringCommand command)
+    {
+        if (_wdeAddr == 0)
+            _logger.LogWarning("sp_wdeprobe: WriteDeltaEntity_Internal address not resolved — cannot install");
+        else
+            WriteDeltaProbe.Install(_bridge, _logger, _wdeAddr);
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnWdeProbeOff(StringCommand command)
+    {
+        WriteDeltaProbe.Uninstall();
         return ECommandAction.Stopped;
     }
 }
