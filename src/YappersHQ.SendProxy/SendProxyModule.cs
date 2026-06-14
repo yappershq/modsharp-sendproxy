@@ -20,9 +20,10 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private readonly InterfaceBridge _bridge;
     private readonly SendProxyManager _manager;
 
-    private nint _encodeFieldAddr;  // CFlattenedSerializer::EncodeField, resolved via sig on load
-    private nint _intEncoderAddr;   // CFlattenedSerializer::EncodeInt32, resolved via sig on load
-    private nint _wdeAddr;          // CNetworkGameServerBase::WriteDeltaEntity_Internal, resolved via sig on load
+    private nint _encodeFieldAddr;    // CFlattenedSerializer::EncodeField, resolved via sig on load
+    private nint _intEncoderAddr;    // CFlattenedSerializer::EncodeInt32, resolved via sig on load
+    private nint _wdeAddr;           // CNetworkGameServerBase::WriteDeltaEntity_Internal, resolved via sig on load
+    private nint _perClientEncodeAddr; // CNetworkGameServer::PerClientEncode, resolved via sig on load
 
     public SendProxyModule(
         ISharedSystem  sharedSystem,
@@ -86,6 +87,16 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.ConVarManager.CreateServerCommand("sp_wdeprobe_off", OnWdeProbeOff,
             "Uninstall the WriteDeltaEntity_Internal detour probe", ConVarFlags.Release);
 
+        // Per-client encode entry probe: sp_recipcap (on) / sp_recipcap_off (off).
+        // Detours CNetworkGameServer::PerClientEncode; captures rsi (CServerSideClient*) into a
+        // [ThreadStatic] and logs the first 30 calls to confirm: one call per client, on worker
+        // threads, with a stable non-null pointer. Pure passthrough — no values modified.
+        _bridge.ConVarManager.CreateServerCommand("sp_recipcap", OnRecipCapOn,
+            "Install the per-client encode entry probe (logs first 30 calls: tid + client ptr)",
+            ConVarFlags.Release);
+        _bridge.ConVarManager.CreateServerCommand("sp_recipcap_off", OnRecipCapOff,
+            "Uninstall the per-client encode entry probe", ConVarFlags.Release);
+
         // Live value spoof: sp_fakehp <value> — makes all clients see fake HP; server keeps real.
         _bridge.ConVarManager.CreateServerCommand("sp_fakehp", OnFakeHp,
             "Spoof m_iHealth for all clients: sp_fakehp <value>", ConVarFlags.Release);
@@ -103,10 +114,11 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
     // Gamedata keys. Sigs live in .assets/gamedata/yappershq.sendproxy.jsonc (makesig-derived,
     // see tools/) — NOT hardcoded here, so a game-update only touches the json.
-    private const string EncodeFieldKey       = "CFlattenedSerializer::EncodeField";
-    private const string EncodeInt32Key       = "CFlattenedSerializer::EncodeInt32";
-    private const string SendClientMessagesKey = "CNetworkGameServer::SendClientMessages";
-    private const string WriteDeltaInternalKey = "CNetworkGameServerBase::WriteDeltaEntity_Internal";
+    private const string EncodeFieldKey        = "CFlattenedSerializer::EncodeField";
+    private const string EncodeInt32Key        = "CFlattenedSerializer::EncodeInt32";
+    private const string SendClientMessagesKey  = "CNetworkGameServer::SendClientMessages";
+    private const string WriteDeltaInternalKey  = "CNetworkGameServerBase::WriteDeltaEntity_Internal";
+    private const string PerClientEncodeKey     = "CNetworkGameServer::PerClientEncode";
 
     /// <summary>
     ///     Resolve the encode-path functions from gamedata (single source of truth — sigs are in
@@ -115,10 +127,11 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     /// </summary>
     private void ResolveNativeTargets()
     {
-        _encodeFieldAddr = ResolveFromGameData(EncodeFieldKey);
-        _intEncoderAddr  = ResolveFromGameData(EncodeInt32Key);
+        _encodeFieldAddr    = ResolveFromGameData(EncodeFieldKey);
+        _intEncoderAddr     = ResolveFromGameData(EncodeInt32Key);
         ResolveFromGameData(SendClientMessagesKey); // Phase-2 anchor; logged for verification only.
-        _wdeAddr         = ResolveFromGameData(WriteDeltaInternalKey);
+        _wdeAddr            = ResolveFromGameData(WriteDeltaInternalKey);
+        _perClientEncodeAddr = ResolveFromGameData(PerClientEncodeKey);
     }
 
     // GetAddress throws KeyNotFoundException if the entry didn't resolve (sig miss / not registered).
@@ -157,6 +170,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         EncodeFieldDetour.Uninstall();
         IntEncoderDetour.Uninstall();
         WriteDeltaProbe.Uninstall();
+        RecipientCapture.Uninstall();
         _bridge.EntityManager.RemoveEntityListener(this);
         _bridge.ConVarManager.ReleaseCommand("sp_dump");
         _bridge.ConVarManager.ReleaseCommand("sp_field");
@@ -166,6 +180,8 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.ConVarManager.ReleaseCommand("sp_encprobe_off");
         _bridge.ConVarManager.ReleaseCommand("sp_wdeprobe");
         _bridge.ConVarManager.ReleaseCommand("sp_wdeprobe_off");
+        _bridge.ConVarManager.ReleaseCommand("sp_recipcap");
+        _bridge.ConVarManager.ReleaseCommand("sp_recipcap_off");
         _bridge.ConVarManager.ReleaseCommand("sp_fakehp");
         _bridge.ConVarManager.ReleaseCommand("sp_fakehp_off");
         _manager.Clear();
@@ -288,6 +304,21 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private ECommandAction OnWdeProbeOff(StringCommand command)
     {
         WriteDeltaProbe.Uninstall();
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnRecipCapOn(StringCommand command)
+    {
+        if (_perClientEncodeAddr == 0)
+            _logger.LogWarning("sp_recipcap: PerClientEncode address not resolved — cannot install");
+        else
+            RecipientCapture.Install(_bridge, _logger, _perClientEncodeAddr);
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnRecipCapOff(StringCommand command)
+    {
+        RecipientCapture.Uninstall();
         return ECommandAction.Stopped;
     }
 }

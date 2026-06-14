@@ -56,6 +56,17 @@
       "linux": "48 8B 01 55 48 89 E5 48 8D 34 00"
     }
 
+    // CNetworkGameServer::PerClientEncode (engine2) — per-client encode entry, file-RVA 0x8fae40.
+    // CServerSideClient* arrives in rsi (arg2). Called once per client per send tick from the
+    // client loop; internally reaches WriteDeltaEntity_Internal per entity for that client.
+    // Caller thunk at file-RVA 0x6ca7c0. Sig: nosoop makesig, 25 bytes, MATCHES:1 (2026-06-14).
+    // Two wildcarded rip-relative displacements (lea r15/r14 — shift on relink, rest is stable).
+    ,
+    "CNetworkGameServer::PerClientEncode": {
+      "library": "engine",
+      "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 4C 8D BD ? ? ? ? 41 56 4C 8D 35"
+    }
+
     // CNetworkGameServerBase::WriteDeltaEntity_Internal (engine2) — per-entity delta write, called
     // serially per-client from SendSnapshot inside SendClientMessages' client loop.
     // RVA 0x6d15c0 (file-vaddr); Ghidra addr = 0x7d15c0 (e2proj image base 0x100000).
