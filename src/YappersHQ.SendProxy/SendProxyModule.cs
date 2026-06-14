@@ -77,6 +77,12 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.ConVarManager.CreateServerCommand("sp_encprobe_off", OnEncProbeOff,
             "Uninstall the IntEncoder detour probe", ConVarFlags.Release);
 
+        // Live value spoof: sp_fakehp <value> — makes all clients see fake HP; server keeps real.
+        _bridge.ConVarManager.CreateServerCommand("sp_fakehp", OnFakeHp,
+            "Spoof m_iHealth for all clients: sp_fakehp <value>", ConVarFlags.Release);
+        _bridge.ConVarManager.CreateServerCommand("sp_fakehp_off", OnFakeHpOff,
+            "Stop spoofing m_iHealth", ConVarFlags.Release);
+
         if (!EncoderHook.Enabled)
             _logger.LogWarning(
                 "SendProxy loaded in REGISTRATION-ONLY mode — the live encoder patch is disabled until "
@@ -147,6 +153,8 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.ConVarManager.ReleaseCommand("sp_detour_off");
         _bridge.ConVarManager.ReleaseCommand("sp_encprobe");
         _bridge.ConVarManager.ReleaseCommand("sp_encprobe_off");
+        _bridge.ConVarManager.ReleaseCommand("sp_fakehp");
+        _bridge.ConVarManager.ReleaseCommand("sp_fakehp_off");
         _manager.Clear();
     }
 
@@ -223,6 +231,38 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private ECommandAction OnEncProbeOff(StringCommand command)
     {
         IntEncoderDetour.Uninstall();
+        return ECommandAction.Stopped;
+    }
+
+    // m_iHealth field byte offset in the network serializer (confirmed via sp_encprobe).
+    private const int MHealthFieldOffset = 728;
+
+    private ECommandAction OnFakeHp(StringCommand command)
+    {
+        if (command.ArgCount < 1 || !int.TryParse(command.GetArg(1), out var value))
+        {
+            _logger.LogInformation("usage: sp_fakehp <value>");
+            return ECommandAction.Stopped;
+        }
+
+        if (_intEncoderAddr == 0)
+        {
+            _logger.LogWarning("sp_fakehp: EncodeInt32 address not resolved — cannot install detour");
+            return ECommandAction.Stopped;
+        }
+
+        IntEncoderDetour.Install(_bridge, _logger, _intEncoderAddr);
+        IntEncoderDetour.SetSpoof(MHealthFieldOffset, value);
+        _logger.LogInformation("fakehp: m_iHealth -> {Value} for all clients (real HP unchanged)", value);
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnFakeHpOff(StringCommand command)
+    {
+        IntEncoderDetour.ClearSpoof(MHealthFieldOffset);
+        if (!IntEncoderDetour.HasSpoofs)
+            IntEncoderDetour.Uninstall();
+        _logger.LogInformation("fakehp off");
         return ECommandAction.Stopped;
     }
 }
