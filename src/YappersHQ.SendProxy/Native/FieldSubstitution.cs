@@ -263,7 +263,7 @@ internal static unsafe class FieldSubstitution
         // Only act when inside a WFL call (serializer ptr is valid) and the serializer
         // pointer is a plausible heap address.
         var serPtr = _currentSerializer;
-        if (serPtr == 0 || ((ulong) serPtr >> 40) != 0x7F)
+        if (!IsUserPtr(serPtr))
             goto Passthrough;
 
         try
@@ -271,23 +271,26 @@ internal static unsafe class FieldSubstitution
             // Resolve serializer name (needed for diag + spoof lookup).
             var serName = ReadShortAscii(*(nint*) (serPtr + 0x00), 48);
 
-            // Resolve field name from serializer + field index.
-            var fieldName = ResolveFieldName(serPtr, _currentFieldIndex);
+            // Decode the CFieldPath token and resolve field name.
+            var token = _currentFieldIndex;
+            DecodeToken(token, out var i0, out var i1, out var i2);
+            var fieldName = ResolveFieldName(serPtr, token, i0, i1, i2);
 
             // ── Unconditional diagnostic (first VcopyDiagMax calls) ────────────
-            // BEFORE any early-exit so we log even when fieldName is empty (index
-            // out-of-range or wrong semantics) and even on non-matching fields.
+            // BEFORE any early-exit so we see every call regardless of match.
+            // Logs token, decoded path, and resolved leaf name for verification.
             // Remove once field-index semantics are confirmed.
             {
                 var diagN = Interlocked.Increment(ref _vcopyDiagCount);
                 if (diagN <= VcopyDiagMax && _logger is { } diagLog)
                 {
                     diagLog.LogInformation(
-                        "VCOPY#{N} tid={Tid} ser=\"{SerName}\" fieldIdx={FieldIdx} name=\"{FieldName}\" bits={Bits} client=0x{Client:X}",
+                        "VCOPY#{N} tid={Tid} ser=\"{SerName}\" token=0x{Token:X} path=[{I0},{I1},{I2}] name=\"{FieldName}\" bits={Bits} client=0x{Client:X}",
                         diagN,
                         Environment.CurrentManagedThreadId,
                         serName,
-                        _currentFieldIndex,
+                        token,
+                        i0, i1, i2,
                         fieldName,
                         bitcount,
                         RecipientCapture.CurrentClient);
@@ -363,30 +366,112 @@ internal static unsafe class FieldSubstitution
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    ///     Resolve a field name from the CFlattenedSerializer field array.
-    ///     Layout (confirmed by WriteFieldProbe + SerializerProbe):
-    ///       serializer+0x08 = field count (int32)
-    ///       serializer+0x10 = field array ptr (array of ptr; stride 8)
-    ///       field_record+0x08 = char* field name
+    ///     Decode a packed CFieldPath token into up to three 0-based level indices.
+    ///     Token format (verified against CCSPlayerPawn examples):
+    ///       token = ((i0+1)&lt;&lt;22) | ((i1+1)&lt;&lt;11) | (i2+1)
+    ///       A level is absent when its decoded value is -1 (stored as 0 = bias-1 encoding).
+    ///       Special sentinel: 0xFFFFFFFF = root (skip).
     /// </summary>
-    private static string ResolveFieldName(nint serializer, uint fieldIndex)
+    private static void DecodeToken(uint token, out int i0, out int i1, out int i2)
     {
+        i0 = (int) ((token >> 22) & 0x7FF) - 1;
+        i1 = (int) ((token >> 11) & 0x7FF) - 1;
+        i2 = (int) ( token        & 0x7FF) - 1;
+    }
+
+    /// <summary>
+    ///     Resolve the leaf field name from a CFlattenedSerializer and a decoded CFieldPath token.
+    ///
+    ///     Serializer layout (confirmed by WriteFieldProbe + SerializerProbe + encodefield.out):
+    ///       serializer+0x08 = field count (int32)
+    ///       serializer+0x10 = field array base — array of POINTERS, stride 8
+    ///       field_record+0x08 = char* field name (leaf) OR CFlattenedSerializer* child (nested)
+    ///
+    ///     Token descent (from encodefield.out — EncodeField recursive call pattern):
+    ///       Level 0: recPtr = *(fieldArray + i0*8)
+    ///       Level 1: childSer = *(recPtr + 0x08); recPtr = *(childFieldArray + i1*8)
+    ///       Level 2: childSer2 = *(recPtr + 0x08); recPtr = *(childFieldArray2 + i2*8)
+    ///       Leaf name: ReadShortAscii(*(recPtr + 0x08))
+    ///
+    ///     Child serializer offset confirmed from encodefield.out:
+    ///       puStack_2a0 = (undefined *)plVar40[1]  → inline_record+0x08 = child CFlattenedSerializer*
+    ///       This is then passed as param_1 (the serializer) in the recursive EncodeField call.
+    ///       For leaf fields, record+0x08 is the char* field name.
+    ///       For nested fields, record+0x08 is the child CFlattenedSerializer* (its own +0x00 is
+    ///       the child serializer name, +0x08 count, +0x10 child field array).
+    ///
+    ///     All pointer dereferences are guarded by IsUserPtr checks and a try/catch.
+    ///     Returns "" on any fault (bounds-check, invalid pointer, or exception).
+    /// </summary>
+    private static string ResolveFieldName(nint serializer, uint token, int i0, int i1, int i2)
+    {
+        // token 0xFFFFFFFF = root sentinel (skip); token 0 = absent (all levels -1 after decode)
+        if (token == 0xFFFFFFFF || token == 0 || i0 < 0)
+            return string.Empty;
+
         try
         {
-            var count    = *(int*) (serializer + 0x08);
-            if (count <= 0 || (int) fieldIndex >= count || count > 4096)
+            // ── Level 0 ─────────────────────────────────────────────────────────
+            var count0   = *(int*) (serializer + 0x08);
+            if (count0 <= 0 || i0 >= count0 || count0 > 4096)
                 return string.Empty;
 
-            var arrayPtr = *(nint*) (serializer + 0x10);
-            if (arrayPtr == 0 || ((ulong) arrayPtr >> 40) != 0x7F)
+            var arr0 = *(nint*) (serializer + 0x10);
+            if (!IsUserPtr(arr0))
                 return string.Empty;
 
-            var recPtr = *(nint*) (arrayPtr + (int) fieldIndex * 8);
-            if (recPtr == 0 || ((ulong) recPtr >> 40) != 0x7F)
+            var rec0 = *(nint*) (arr0 + i0 * 8);
+            if (!IsUserPtr(rec0))
                 return string.Empty;
 
-            var namePtr = *(nint*) (recPtr + 0x08);
-            return ReadShortAscii(namePtr, 48);
+            if (i1 < 0)
+            {
+                // Leaf at level 0 — record+0x08 is the char* field name.
+                return ReadShortAscii(*(nint*) (rec0 + 0x08), 48);
+            }
+
+            // ── Level 1 descent: record+0x08 = child CFlattenedSerializer* ─────
+            var child1 = *(nint*) (rec0 + 0x08);
+            if (!IsUserPtr(child1))
+                return string.Empty;
+
+            var count1 = *(int*) (child1 + 0x08);
+            if (count1 <= 0 || i1 >= count1 || count1 > 4096)
+                return string.Empty;
+
+            var arr1 = *(nint*) (child1 + 0x10);
+            if (!IsUserPtr(arr1))
+                return string.Empty;
+
+            var rec1 = *(nint*) (arr1 + i1 * 8);
+            if (!IsUserPtr(rec1))
+                return string.Empty;
+
+            if (i2 < 0)
+            {
+                // Leaf at level 1.
+                return ReadShortAscii(*(nint*) (rec1 + 0x08), 48);
+            }
+
+            // ── Level 2 descent: record+0x08 = child CFlattenedSerializer* ─────
+            var child2 = *(nint*) (rec1 + 0x08);
+            if (!IsUserPtr(child2))
+                return string.Empty;
+
+            var count2 = *(int*) (child2 + 0x08);
+            if (count2 <= 0 || i2 >= count2 || count2 > 4096)
+                return string.Empty;
+
+            var arr2 = *(nint*) (child2 + 0x10);
+            if (!IsUserPtr(arr2))
+                return string.Empty;
+
+            var rec2 = *(nint*) (arr2 + i2 * 8);
+            if (!IsUserPtr(rec2))
+                return string.Empty;
+
+            // Leaf at level 2.
+            return ReadShortAscii(*(nint*) (rec2 + 0x08), 48);
         }
         catch
         {
@@ -394,9 +479,11 @@ internal static unsafe class FieldSubstitution
         }
     }
 
+    private static bool IsUserPtr(nint p) => p != 0 && ((ulong) p >> 40) == 0x7F;
+
     private static string ReadShortAscii(nint p, int maxLen)
     {
-        if (p == 0 || ((ulong) p >> 40) != 0x7F)
+        if (!IsUserPtr(p))
             return string.Empty;
         try
         {
