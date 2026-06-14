@@ -234,9 +234,6 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         return ECommandAction.Stopped;
     }
 
-    // m_iHealth field byte offset in the network serializer (confirmed via sp_encprobe).
-    private const int MHealthFieldOffset = 728;
-
     private ECommandAction OnFakeHp(StringCommand command)
     {
         if (command.ArgCount < 1 || !int.TryParse(command.GetArg(1), out var value))
@@ -252,14 +249,14 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         }
 
         IntEncoderDetour.Install(_bridge, _logger, _intEncoderAddr);
-        IntEncoderDetour.SetSpoof(MHealthFieldOffset, value);
+        IntEncoderDetour.SetSpoof("m_iHealth", value);
         _logger.LogInformation("fakehp: m_iHealth -> {Value} for all clients (real HP unchanged)", value);
         return ECommandAction.Stopped;
     }
 
     private ECommandAction OnFakeHpOff(StringCommand command)
     {
-        IntEncoderDetour.ClearSpoof(MHealthFieldOffset);
+        IntEncoderDetour.ClearSpoof("m_iHealth");
         if (!IntEncoderDetour.HasSpoofs)
             IntEncoderDetour.Uninstall();
         _logger.LogInformation("fakehp off");

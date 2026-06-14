@@ -1,3 +1,4 @@
+using System;
 using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -15,7 +16,9 @@ namespace YappersHQ.SendProxy.Native;
 ///     int and redirect d to point at it. The encoder reads the fake; the real entity memory is
 ///     never modified → clients see the spoofed value, server keeps the real one.
 ///
-///     Field identity: <c>*(int*)(fieldInfo+0x40)</c> is m_nFieldOffset (e.g. 728 for m_iHealth).
+///     Field identity: <c>*(nint*)(fieldInfo+0x08)</c> is a <c>char*</c> field name (same layout
+///     as CNetworkSerializerFieldInfo confirmed in SerializerProbe). Name-keyed lookup survives
+///     engine field-layout changes that shift byte offsets.
 /// </summary>
 internal static unsafe class IntEncoderDetour
 {
@@ -23,16 +26,16 @@ internal static unsafe class IntEncoderDetour
     private static nint _trampoline;
     private static ILogger? _logger;
 
-    // field byte-offset → fake value to broadcast
-    private static readonly Dictionary<int, int> _spoofs = new();
+    // field name → fake value to broadcast
+    private static readonly Dictionary<string, int> _spoofs = new(StringComparer.Ordinal);
     // native scratch int for the redirected pointer; allocated on Install, freed on Uninstall
     private static nint _scratch;
 
     // ── Public spoof API ──────────────────────────────────────────────────────────────────────
 
-    public static void SetSpoof(int fieldOffset, int fakeValue) => _spoofs[fieldOffset] = fakeValue;
+    public static void SetSpoof(string name, int fakeValue) => _spoofs[name] = fakeValue;
 
-    public static void ClearSpoof(int fieldOffset) => _spoofs.Remove(fieldOffset);
+    public static void ClearSpoof(string name) => _spoofs.Remove(name);
 
     public static void ClearAll() => _spoofs.Clear();
 
@@ -102,8 +105,8 @@ internal static unsafe class IntEncoderDetour
         {
             if (IsUserPtr(b))
             {
-                int off = *(int*) (b + 0x40);
-                if (_spoofs.TryGetValue(off, out var fake))
+                var name = ReadName(b);
+                if (name.Length > 0 && _spoofs.TryGetValue(name, out var fake))
                 {
                     *(int*) _scratch = fake;
                     d = _scratch;
@@ -113,6 +116,44 @@ internal static unsafe class IntEncoderDetour
         catch { /* never throw out of an unmanaged callback */ }
 
         return ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nint, nint>) _trampoline)(a, b, c, d, e);
+    }
+
+    // ── Helpers ──────────────────────────────────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Read the ASCII field name from a CNetworkSerializerFieldInfo record.
+    ///     Layout (confirmed by SerializerProbe): +0x08 = char* m_pszFieldName.
+    ///     Mirrors SerializerProbe.TryReadAscii — up to 40 printable ASCII bytes, stops at NUL,
+    ///     returns "" on any non-printable byte or access exception.
+    /// </summary>
+    private static string ReadName(nint fieldInfo)
+    {
+        if (!IsUserPtr(fieldInfo))
+            return string.Empty;
+        try
+        {
+            var np = *(nint*) (fieldInfo + 0x08);
+            if (!IsUserPtr(np))
+                return string.Empty;
+
+            var buf = stackalloc byte[41];
+            var len = 0;
+            for (; len < 40; len++)
+            {
+                var b = *(byte*) (np + len);
+                if (b == 0)
+                    break;
+                if (b < 0x20 || b > 0x7E)
+                    return string.Empty;
+                buf[len] = b;
+            }
+            buf[len] = 0;
+            return len == 0 ? string.Empty : new string((sbyte*) buf, 0, len, System.Text.Encoding.ASCII);
+        }
+        catch
+        {
+            return string.Empty;
+        }
     }
 
     // Cheap user-space range gate: valid Linux user pointers have bits [63:48] == 0,
