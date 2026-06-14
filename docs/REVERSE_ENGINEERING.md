@@ -208,6 +208,48 @@ debugger to connect+continue before starting). Pitfalls + the working recipe:
 | `SendClientMessages` | engine2 `0x7a7280` | RE |
 | └ per-client SendSnapshot | vtable +0x80 | RE |
 | `WriteDeltaEntity_Internal` | engine2 `0x7d15c0` | RE |
-| `EncodeField` | networksystem `0x4334e0` | RE |
+| `EncodeField` | networksystem `0x3334e0` | RE (string-anchor + prologue, **see §8**) |
 
 (Function addresses are this-build only — resolve at runtime via string anchors / vtable.)
+
+---
+
+## 8. Re-deriving `EncodeField` on a game update (the reliable recipe)
+
+The encoder entry has **no exported symbol** and no usable string of its own — but it spews
+`"EncodeField encoder wrote %d bits"`. Anchor on that string, then walk back to the function entry.
+Two earlier attempts were wrong; the failure modes are instructive:
+
+- ❌ `0x4334d0` — a `CUtlVector` realloc helper (IMemAlloc Alloc/Realloc/GetSize). Wrong xref.
+- ❌ `0x3356dd` — a **Ghidra image-base-offset** address. Ghidra rebases; its listing address is NOT
+  the file vaddr. Subtracting wrong → landed mid-instruction (live bytes `fe ff ff c6…`, not a
+  prologue). **Arming it would crash the server.** Always confirm the target is a real prologue.
+- ✅ `0x3334e0` — the function entry, derived purely from `objdump` (file vaddr, no rebasing).
+
+Recipe (build 2026-06-02, repeat per update):
+
+```bash
+SO=libnetworksystem.so
+# 1. Find the string's vaddr.
+readelf -p .rodata $SO | grep -n "encoder wrote"   # -> @ vaddr 0x15d580
+
+# 2. Find the instruction referencing it (objdump annotates rip-relative targets with '# <vaddr>').
+objdump -d $SO | grep -F '# 15d580'                # -> lea @ 0x3357fb
+
+# 3. Walk back to the entry: nearest `push %rbp; mov %rsp,%rbp` above it that owns the frame.
+#    Confirm by matching a frame slot — the xref site reads -0x290(%rbp); the entry must set it up.
+objdump -d --start-address=0x333000 --stop-address=0x3357fb $SO | grep -B2 'mov +%rsp,%rbp'
+#    -> 0x3334e0: push %rbp / mov %rsp,%rbp / ... / sub $0x2c8,%rsp / mov %r9,-0x290(%rbp) @0x33350b ✔
+
+# 4. Extract a UNIQUE prologue signature and verify it matches exactly once.
+objdump -s --start-address=0x3334e0 --stop-address=0x3334fe $SO
+#    -> 55 48 89 E5 41 57 49 89 D7 41 56 41 55 41 54 41 BC 01 00 00 00 53 48 81 EC C8 02 00 00
+```
+
+Cold-block layout caveat: `EncodeField` has an early `ret` (~0x33352e) followed by out-of-line blocks
+(spew/error paths, incl. the string xref at 0x3357fb) sharing the frame. Don't mistake that early
+`ret` for the function end when bounding it.
+
+**Still pending:** dynamic confirmation (gdb breakpoint `NS_base + 0x3334e0`, real client doing a
+visible netvar change like `ms_slap`) that this fires per field-encode + which arg register carries
+the value pointer. See `sp_gdb3.py`.
