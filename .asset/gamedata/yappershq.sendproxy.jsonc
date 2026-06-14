@@ -14,24 +14,15 @@
 //   +0xC9  secondary field-offset adjust byte (0xFF = none)
 {
   "Signatures": {
-    // Per-field value encode (the Source1 SendProp::m_pProxyFn analog). Observed @ 0x4334e0.
-    // sig: void EncodeFieldFn(bf_write*, CNetworkSerializerFieldInfo*, void* valuePtr, void* ctx, uint)
+    // Per-field value encode path. True entry 0x4334d0 (Ghidra's 0x4334e0 was mid-instruction).
+    // Sig is the prologue through the distinctive `and ebx,0x7fffffff` hash mask. Re-derive on
+    // game updates (see docs/REVERSE_ENGINEERING.md §4b). NOTE: live testing showed this is NOT
+    // the per-tick delta encoder (fires 0 with a connected client) — kept for resolution/reference.
     "CFlattenedSerializer::EncodeField": {
       "library": "networksystem",
-      "refs": { "strings": [ "CFlattenedSerializer::EncodeField encoder wrote %d bits %s %s %s!" ] }
-    },
-
-    // Per-client send loop (clients at gameserver+0x4b, count +0x4a; SendSnapshot vtable +0x80).
-    // Phase 2 — set thread_local "current client" here. Observed @ 0x7a7280.
-    "CNetworkGameServer::SendClientMessages": {
-      "library": "engine2",
-      "refs": { "strings": [ "SV:  SendClientMessages" ] }
-    },
-
-    // Per-entity delta write (re-encodes field values from snapshot). Phase 2. Observed @ 0x7d15c0.
-    "CNetworkGameServerBase::WriteDeltaEntity_Internal": {
-      "library": "engine2",
-      "refs": { "strings": [ "SV: CNetworkGameServerBase::WriteDeltaEntity_Internal merging changes added in %d additional fields!" ] }
+      "linux": "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 83 EC 08 8B 57 04 89 D3 81 E3 FF FF FF 7F"
     }
+    // SendClientMessages (engine2, "SV:  SendClientMessages") + WriteDeltaEntity_Internal are
+    // resolved at runtime via FindString/RE, not gamedata — see docs/REVERSE_ENGINEERING.md.
   }
 }
