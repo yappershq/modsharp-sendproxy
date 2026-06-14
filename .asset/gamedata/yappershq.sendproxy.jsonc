@@ -33,8 +33,19 @@
     "CFlattenedSerializer::EncodeField": {
       "library": "networksystem",
       "linux": "55 48 89 E5 41 57 49 89 D7 41 56 41 55 41 54 41 BC 01 00 00 00"
+    },
+
+    // CNetworkGameServer::SendClientMessages — engine2 per-tick send loop (Phase 2 per-client anchor).
+    // makesig (tools/GhidraStringSig.java on the "SV:  SendClientMessages" anchor): note the auto-
+    // wildcarded rip-relative lea displacement `48 8D 05 ? ? ? ?` — this is where makesig beats a hand
+    // sig (the 4 disp bytes shift on relink). Ghidra FN_007a7280 (e2proj image base 0 => RVA 0x7a7280).
+    "CNetworkGameServer::SendClientMessages": {
+      "library": "engine",
+      "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 41 56 41 55 41 54 53 89 F3"
     }
-    // SendClientMessages (engine2, "SV:  SendClientMessages") + WriteDeltaEntity_Internal are
-    // resolved at runtime via FindString/RE in the module, not here — see docs/REVERSE_ENGINEERING.md.
+
+    // WriteDeltaEntity_Internal (engine2) is Phase-2-only and deferred: Ghidra's auto-analysis didn't
+    // link its long "%d"-format string xref to a defined function, so the makesig route needs manual
+    // disassembly first. Add it here when Phase 2 (per-client value) lands. See REVERSE_ENGINEERING.md.
   }
 }
