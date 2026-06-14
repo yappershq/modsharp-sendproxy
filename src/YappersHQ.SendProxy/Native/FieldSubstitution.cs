@@ -94,6 +94,12 @@ internal static unsafe class FieldSubstitution
     private static int _logCount;
     private const  int MaxLogCount = 20;
 
+    // Diagnostic: unconditional early log (first 50 value-copy calls in any non-Off mode).
+    // Logs BEFORE _spoofs.TryGetValue so we see every call regardless of match.
+    // Remove once field-index semantics are confirmed.
+    private static int _vcopyDiagCount;
+    private const  int VcopyDiagMax = 50;
+
     // ── Hooks ────────────────────────────────────────────────────────────────
 
     // GetBitRange hook: captures field index (3rd arg) + serializer ptr (from WFL-shim).
@@ -262,13 +268,34 @@ internal static unsafe class FieldSubstitution
 
         try
         {
+            // Resolve serializer name (needed for diag + spoof lookup).
+            var serName = ReadShortAscii(*(nint*) (serPtr + 0x00), 48);
+
             // Resolve field name from serializer + field index.
             var fieldName = ResolveFieldName(serPtr, _currentFieldIndex);
+
+            // ── Unconditional diagnostic (first VcopyDiagMax calls) ────────────
+            // BEFORE any early-exit so we log even when fieldName is empty (index
+            // out-of-range or wrong semantics) and even on non-matching fields.
+            // Remove once field-index semantics are confirmed.
+            {
+                var diagN = Interlocked.Increment(ref _vcopyDiagCount);
+                if (diagN <= VcopyDiagMax && _logger is { } diagLog)
+                {
+                    diagLog.LogInformation(
+                        "VCOPY#{N} tid={Tid} ser=\"{SerName}\" fieldIdx={FieldIdx} name=\"{FieldName}\" bits={Bits} client=0x{Client:X}",
+                        diagN,
+                        Environment.CurrentManagedThreadId,
+                        serName,
+                        _currentFieldIndex,
+                        fieldName,
+                        bitcount,
+                        RecipientCapture.CurrentClient);
+                }
+            }
+
             if (fieldName.Length == 0)
                 goto Passthrough;
-
-            // Resolve serializer name.
-            var serName = ReadShortAscii(*(nint*) (serPtr + 0x00), 48);
 
             // Look up the spoof registry.
             if (!_spoofs.TryGetValue((serName, fieldName), out var fakeValue))
