@@ -78,5 +78,29 @@
       "library": "engine",
       "linux": "55 48 89 E5 41 57 41 56 41 55 41 54 49 89 F4 53 48 81 EC 28 01 00 00"
     }
+
+    // CFlattenedSerializer::WriteFieldList (libnetworksystem) — per-client per-entity field-copy loop.
+    // File-RVA 0x343b60; Ghidra FUN_00443b60 (image-base 0x100000). Called inside
+    // WriteDeltaEntity_Internal for each entity that changed, once per client, on the send thread.
+    //
+    // ABI: 9 args (6 register + 3 stack):
+    //   rdi=CFlattenedSerializer*, rsi=ctx, rdx=encoder-block*, rcx=dst-bf_write*,
+    //   r8=src-pack-buf*, r9=entity-class-idx,
+    //   [rsp+8]=unk, [rsp+10]=changed-field-array*, [rsp+18]=unk.
+    //
+    // This is the SUBSTITUTION POINT for Phase-2 per-client per-field spoofing:
+    //   - Field identity: serializer field array at rdi+0x10 (stride 8), name at field_rec+0x08.
+    //   - Destination bf_write: rcx (per-client, must be patched per substitution).
+    //   - Changed-field list: [rsp+10] (int*) gates which fields are copied this tick.
+    //   The bit-copy primitive FUN_00500b70 called inside the loop has NO field identity,
+    //   so this function's entry is the narrowest clean hook site that exposes both.
+    //
+    // Sig: nosoop makesig, 24 bytes, MATCHES:1 (libnetworksystem, build 2026-06-02).
+    // Bytes 4-7 wildcarded (rip-relative lea disp — shifts on relink; all other bytes stable).
+    ,
+    "CFlattenedSerializer::WriteFieldList": {
+      "library": "networksystem",
+      "linux": "55 48 8D 05 ? ? ? ? 45 31 DB 66 0F EF C0 48 89 E5 41 57 41 56 4C 8D"
+    }
   }
 }

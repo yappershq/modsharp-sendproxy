@@ -24,6 +24,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private nint _intEncoderAddr;    // CFlattenedSerializer::EncodeInt32, resolved via sig on load
     private nint _wdeAddr;           // CNetworkGameServerBase::WriteDeltaEntity_Internal, resolved via sig on load
     private nint _perClientEncodeAddr; // CNetworkGameServer::PerClientEncode, resolved via sig on load
+    private nint _writeFieldListAddr; // CFlattenedSerializer::WriteFieldList, resolved via sig on load
 
     public SendProxyModule(
         ISharedSystem  sharedSystem,
@@ -97,6 +98,18 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.ConVarManager.CreateServerCommand("sp_recipcap_off", OnRecipCapOff,
             "Uninstall the per-client encode entry probe", ConVarFlags.Release);
 
+        // VERIFY-MODE WriteFieldList probe: sp_wflprobe (on) / sp_wflprobe_off (off).
+        // Detours CFlattenedSerializer::WriteFieldList; logs first 30 calls with thread id,
+        // RecipientCapture.CurrentClient, serializer name, first field name, changed-field count,
+        // and dst bf_write ptr.  Pure passthrough — no values modified.
+        // Confirms: (a) the captured client ptr is visible inside WFL, (b) field identity is
+        // readable from param_1 (the CFlattenedSerializer* in rdi), (c) which threads execute WFL.
+        _bridge.ConVarManager.CreateServerCommand("sp_wflprobe", OnWflProbeOn,
+            "Install the VERIFY-MODE WriteFieldList probe (logs first 30 calls: tid + client + serializer + field)",
+            ConVarFlags.Release);
+        _bridge.ConVarManager.CreateServerCommand("sp_wflprobe_off", OnWflProbeOff,
+            "Uninstall the WriteFieldList probe", ConVarFlags.Release);
+
         // Live value spoof: sp_fakehp <value> — makes all clients see fake HP; server keeps real.
         _bridge.ConVarManager.CreateServerCommand("sp_fakehp", OnFakeHp,
             "Spoof m_iHealth for all clients: sp_fakehp <value>", ConVarFlags.Release);
@@ -119,6 +132,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private const string SendClientMessagesKey  = "CNetworkGameServer::SendClientMessages";
     private const string WriteDeltaInternalKey  = "CNetworkGameServerBase::WriteDeltaEntity_Internal";
     private const string PerClientEncodeKey     = "CNetworkGameServer::PerClientEncode";
+    private const string WriteFieldListKey      = "CFlattenedSerializer::WriteFieldList";
 
     /// <summary>
     ///     Resolve the encode-path functions from gamedata (single source of truth — sigs are in
@@ -132,6 +146,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         ResolveFromGameData(SendClientMessagesKey); // Phase-2 anchor; logged for verification only.
         _wdeAddr            = ResolveFromGameData(WriteDeltaInternalKey);
         _perClientEncodeAddr = ResolveFromGameData(PerClientEncodeKey);
+        _writeFieldListAddr = ResolveFromGameData(WriteFieldListKey);
     }
 
     // GetAddress throws KeyNotFoundException if the entry didn't resolve (sig miss / not registered).
@@ -171,6 +186,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         IntEncoderDetour.Uninstall();
         WriteDeltaProbe.Uninstall();
         RecipientCapture.Uninstall();
+        WriteFieldProbe.Uninstall();
         _bridge.EntityManager.RemoveEntityListener(this);
         _bridge.ConVarManager.ReleaseCommand("sp_dump");
         _bridge.ConVarManager.ReleaseCommand("sp_field");
@@ -182,6 +198,8 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.ConVarManager.ReleaseCommand("sp_wdeprobe_off");
         _bridge.ConVarManager.ReleaseCommand("sp_recipcap");
         _bridge.ConVarManager.ReleaseCommand("sp_recipcap_off");
+        _bridge.ConVarManager.ReleaseCommand("sp_wflprobe");
+        _bridge.ConVarManager.ReleaseCommand("sp_wflprobe_off");
         _bridge.ConVarManager.ReleaseCommand("sp_fakehp");
         _bridge.ConVarManager.ReleaseCommand("sp_fakehp_off");
         _manager.Clear();
@@ -319,6 +337,21 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private ECommandAction OnRecipCapOff(StringCommand command)
     {
         RecipientCapture.Uninstall();
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnWflProbeOn(StringCommand command)
+    {
+        if (_writeFieldListAddr == 0)
+            _logger.LogWarning("sp_wflprobe: WriteFieldList address not resolved — cannot install");
+        else
+            WriteFieldProbe.Install(_bridge, _logger, _writeFieldListAddr);
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnWflProbeOff(StringCommand command)
+    {
+        WriteFieldProbe.Uninstall();
         return ECommandAction.Stopped;
     }
 }
