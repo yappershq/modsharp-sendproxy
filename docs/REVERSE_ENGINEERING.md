@@ -246,6 +246,20 @@ objdump -s --start-address=0x3334e0 --stop-address=0x3334fe $SO
 #    -> 55 48 89 E5 41 57 49 89 D7 41 56 41 55 41 54 41 BC 01 00 00 00 53 48 81 EC C8 02 00 00
 ```
 
+Or, canonical/automated — run nosoop's makesig (or the headless Java port in `tools/`) which emits the
+**shortest unique** sig, auto-wildcarding only ADDRESS/DYNAMIC operands. On this build it returns 21
+bytes, zero wildcards (the prologue has no rip-relative/reloc operands), which is the unique prefix of
+the objdump bytes above:
+
+```
+fn entry: 004334e0        # Ghidra addr = file-vaddr 0x3334e0 + 0x100000 image base
+MATCHES: 1
+IDA_SIG: 55 48 89 E5 41 57 49 89 D7 41 56 41 55 41 54 41 BC 01 00 00 00
+```
+
+This 21-byte sig is what ships in the gamedata. makesig's value shows when a prologue references a
+global/string (rip-relative `lea`) — it masks those 4 displacement bytes so the sig survives a relink.
+
 Cold-block layout caveat: `EncodeField` has an early `ret` (~0x33352e) followed by out-of-line blocks
 (spew/error paths, incl. the string xref at 0x3357fb) sharing the frame. Don't mistake that early
 `ret` for the function end when bounding it.
