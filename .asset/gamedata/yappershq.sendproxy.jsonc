@@ -14,13 +14,15 @@
 //   +0xC9  secondary field-offset adjust byte (0xFF = none)
 {
   "Signatures": {
-    // Per-field value encode path. True entry 0x4334d0 (Ghidra's 0x4334e0 was mid-instruction).
-    // Sig is the prologue through the distinctive `and ebx,0x7fffffff` hash mask. Re-derive on
-    // game updates (see docs/REVERSE_ENGINEERING.md §4b). NOTE: live testing showed this is NOT
-    // the per-tick delta encoder (fires 0 with a connected client) — kept for resolution/reference.
+    // CORRECTION: the old 0x4334d0 sig was WRONG — disassembly proved it's a CUtlVector realloc
+    // helper (IMemAlloc Alloc/Realloc/GetSize), not the encoder. The "EncodeField encoder wrote
+    // %d bits" string (vaddr 0x15d580) is actually referenced at 0x3357fb, inside the function at
+    // entry 0x3356dd (Ghidra mis-names it __numpunct_fill_cache — a FID false positive). This sig
+    // targets that real string-referencing function. ⚠️ CANDIDATE — verify dynamically (gdb, real
+    // client) whether it's the per-tick field encoder vs a spew helper. See REVERSE_ENGINEERING.md.
     "CFlattenedSerializer::EncodeField": {
       "library": "networksystem",
-      "linux": "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 83 EC 08 8B 57 04 89 D3 81 E3 FF FF FF 7F"
+      "linux": "55 48 89 E5 53 48 83 EC 38 48 89 7D C8 48 89 75 C0 48 8B 45 C8 48 89 45 E8 48 8B 45 E8 48 89 C7"
     }
     // SendClientMessages (engine2, "SV:  SendClientMessages") + WriteDeltaEntity_Internal are
     // resolved at runtime via FindString/RE, not gamedata — see docs/REVERSE_ENGINEERING.md.

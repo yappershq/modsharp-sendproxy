@@ -78,10 +78,11 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     ///     Logs the resolved addresses. Touches no memory — this is the Phase-1 offset-verification
     ///     groundwork (confirms the string-anchor resolution works on this build before any patch).
     /// </summary>
-    // CFlattenedSerializer::EncodeField prologue (true entry; Ghidra's FUN_004334e0 was 0x10 in,
-    // mid-instruction). Distinctive via the `and ebx,0x7fffffff` hash mask. Build-specific.
+    // Function referencing the "EncodeField encoder wrote %d bits" string (@0x3357fb -> entry
+    // 0x3356dd). The earlier 0x4334d0 sig was WRONG (a CUtlVector realloc helper). Build-specific.
+    // ⚠️ CANDIDATE — verify dynamically it's the per-tick field encoder. See docs/REVERSE_ENGINEERING.md.
     private const string EncodeFieldSig =
-        "55 48 89 E5 41 57 41 56 41 55 41 54 53 48 83 EC 08 8B 57 04 89 D3 81 E3 FF FF FF 7F";
+        "55 48 89 E5 53 48 83 EC 38 48 89 7D C8 48 89 75 C0 48 8B 45 C8 48 89 45 E8 48 8B 45 E8 48 89 C7";
 
     private void ResolveNativeTargets()
     {
