@@ -1,37 +1,40 @@
 // SendProxy gamedata — CS2 flattened-serializer encode path.
 //
 // Reverse-engineered from libnetworksystem.so / libengine2.so (build 2026-06-02).
-// These entries document the hook targets. The `linux` byte signatures below are marked
-// TODO and MUST be extracted + verified against the live binary before the encoder patch is
-// enabled (Native/FlattenedSerializerLayout.cs::EncoderHook.Enabled). Until then the module
-// runs registration-only and never resolves/patches these — so missing sigs are harmless.
+// ModSharp gamedata schema (see engine.games.jsonc): top-level keys are "Addresses",
+// "Offsets", "VFuncs". An address entry takes { library, linux/windows byte-sig (? = wildcard),
+// refs:{strings/cvars/vtable} }. A sig OR a refs-anchor is enough; supplying both = sig is the
+// deterministic primary, the string ref is the update-robust fallback (ModSharp resolves the
+// function that references the anchor string).
 //
-// Offsets used by the hook (struct CNetworkSerializerFieldInfo), NOT resolved here but kept
-// for reference — see Native/FlattenedSerializerLayout.cs:
+// Offsets used by the live hook (struct CNetworkSerializerFieldInfo), kept for reference —
+// see Native/FlattenedSerializerLayout.cs:
 //   +0x28  m_NetworkSendProxyRecipientsFilter (shared_ptr)   — per-client presence (Phase 2)
 //   +0x38  encoder dispatch ptr; **(void***)(field+0x38) = encode fn (slot 0)  — VALUE hook
 //   +0x40  m_nFieldOffset (value offset within entity)
 //   +0xC9  secondary field-offset adjust byte (0xFF = none)
 {
-  "Signatures": {
-    // CORRECTION CHAIN (see REVERSE_ENGINEERING.md for the full derivation):
-    //   1. 0x4334d0 — WRONG: a CUtlVector realloc helper (IMemAlloc Alloc/Realloc/GetSize).
-    //   2. 0x3356dd — WRONG: Ghidra base-offset address landed MID-instruction (live bytes were
-    //      `fe ff ff c6 ...`, not a prologue) — arming it would crash.
-    //   3. 0x3334e0 — CORRECT (objdump file-vaddr). This is the function ENTRY that owns the
-    //      "EncodeField encoder wrote %d bits" string (string @vaddr 0x15d580, referenced by the
-    //      `lea` at 0x3357fb, which sits in a cold/out-of-line block of this function). Confirmed:
-    //      prologue does `sub $0x2c8,%rsp` (712B frame) and `mov %r9,-0x290(%rbp)` @0x33350b — the
-    //      exact -0x290(%rbp) slot the xref site reads back. Sig below is UNIQUE in the binary
-    //      (single match @ file off 0x3324e0 = vaddr 0x3334e0). Build 2026-06-02 libnetworksystem.so.
-    // ⚠️ STILL A CANDIDATE for the *per-tick value* hook — verify dynamically (gdb, real client) that
-    //    this fires per field-encode and which arg carries the value pointer. Safe to arm now (real
-    //    prologue, won't crash). See REVERSE_ENGINEERING.md "Re-deriving EncodeField".
+  "Addresses": {
+    // CFlattenedSerializer::EncodeField — the per-field value encoder (the Source1 m_pProxyFn analog).
+    // CORRECTION CHAIN (full derivation in REVERSE_ENGINEERING.md §8):
+    //   1. 0x4334d0 — WRONG (a CUtlVector realloc helper).
+    //   2. 0x3356dd — WRONG (Ghidra image-base addr; landed mid-instruction, would crash if armed).
+    //   3. 0x3334e0 — CORRECT (objdump file-vaddr). Owns the "EncodeField encoder wrote %d bits"
+    //      string (@0x15d580, xref lea @0x3357fb in a cold block). Prologue `sub $0x2c8,%rsp` +
+    //      `mov %r9,-0x290(%rbp)` matches the xref frame slot. Sig UNIQUE in the binary. The Ghidra
+    //      decomp "FUN_004334e0" is the same fn (Ghidra rebases by 0x100000: 0x4334e0-0x100000).
+    // ⚠️ Candidate for the *per-tick value* hook — pending dynamic gdb confirmation it fires per
+    //    field-encode + which arg carries the value pointer.
     "CFlattenedSerializer::EncodeField": {
       "library": "networksystem",
-      "linux": "55 48 89 E5 41 57 49 89 D7 41 56 41 55 41 54 41 BC 01 00 00 00 53 48 81 EC C8 02 00 00"
+      "linux": "55 48 89 E5 41 57 49 89 D7 41 56 41 55 41 54 41 BC 01 00 00 00 53 48 81 EC C8 02 00 00",
+      "refs": {
+        "strings": [
+          "CFlattenedSerializer::EncodeField encoder wrote %d bits"
+        ]
+      }
     }
     // SendClientMessages (engine2, "SV:  SendClientMessages") + WriteDeltaEntity_Internal are
-    // resolved at runtime via FindString/RE, not gamedata — see docs/REVERSE_ENGINEERING.md.
+    // resolved at runtime via FindString/RE in the module, not here — see docs/REVERSE_ENGINEERING.md.
   }
 }
