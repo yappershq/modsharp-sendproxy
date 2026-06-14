@@ -20,7 +20,8 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private readonly InterfaceBridge _bridge;
     private readonly SendProxyManager _manager;
 
-    private nint _encodeFieldAddr; // CFlattenedSerializer::EncodeField, resolved via sig on load
+    private nint _encodeFieldAddr;  // CFlattenedSerializer::EncodeField, resolved via sig on load
+    private nint _intEncoderAddr;   // CFlattenedSerializer::EncodeInt32, resolved via sig on load
 
     public SendProxyModule(
         ISharedSystem  sharedSystem,
@@ -69,6 +70,13 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.ConVarManager.CreateServerCommand("sp_detour_off", OnDetourOff,
             "Uninstall the EncodeField detour probe", ConVarFlags.Release);
 
+        // Read-only int32 encoder probe: logs the first 12 m_iHealth encodes to reveal which
+        // argument register carries the spoofable value (rdx, rcx, or r8d). No value is modified.
+        _bridge.ConVarManager.CreateServerCommand("sp_encprobe", OnEncProbeOn,
+            "Install the read-only IntEncoder detour probe (logs m_iHealth encodes)", ConVarFlags.Release);
+        _bridge.ConVarManager.CreateServerCommand("sp_encprobe_off", OnEncProbeOff,
+            "Uninstall the IntEncoder detour probe", ConVarFlags.Release);
+
         if (!EncoderHook.Enabled)
             _logger.LogWarning(
                 "SendProxy loaded in REGISTRATION-ONLY mode — the live encoder patch is disabled until "
@@ -78,9 +86,10 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         return true;
     }
 
-    // Gamedata key for the per-field encoder. The sig lives in gamedata/yappershq.sendproxy.jsonc
-    // (makesig-derived, see tools/) — NOT hardcoded here, so a game-update only touches the json.
+    // Gamedata keys. Sigs live in .assets/gamedata/yappershq.sendproxy.jsonc (makesig-derived,
+    // see tools/) — NOT hardcoded here, so a game-update only touches the json.
     private const string EncodeFieldKey       = "CFlattenedSerializer::EncodeField";
+    private const string EncodeInt32Key       = "CFlattenedSerializer::EncodeInt32";
     private const string SendClientMessagesKey = "CNetworkGameServer::SendClientMessages";
 
     /// <summary>
@@ -91,6 +100,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private void ResolveNativeTargets()
     {
         _encodeFieldAddr = ResolveFromGameData(EncodeFieldKey);
+        _intEncoderAddr  = ResolveFromGameData(EncodeInt32Key);
         ResolveFromGameData(SendClientMessagesKey); // Phase-2 anchor; logged for verification only.
         // WriteDeltaEntity_Internal is Phase-2-only and not yet in gamedata (see the json + RE doc).
     }
@@ -129,11 +139,14 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     public void Shutdown()
     {
         EncodeFieldDetour.Uninstall();
+        IntEncoderDetour.Uninstall();
         _bridge.EntityManager.RemoveEntityListener(this);
         _bridge.ConVarManager.ReleaseCommand("sp_dump");
         _bridge.ConVarManager.ReleaseCommand("sp_field");
         _bridge.ConVarManager.ReleaseCommand("sp_detour_on");
         _bridge.ConVarManager.ReleaseCommand("sp_detour_off");
+        _bridge.ConVarManager.ReleaseCommand("sp_encprobe");
+        _bridge.ConVarManager.ReleaseCommand("sp_encprobe_off");
         _manager.Clear();
     }
 
@@ -195,6 +208,21 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private ECommandAction OnDetourOff(StringCommand command)
     {
         EncodeFieldDetour.Uninstall();
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnEncProbeOn(StringCommand command)
+    {
+        if (_intEncoderAddr == 0)
+            _logger.LogWarning("sp_encprobe: EncodeInt32 address not resolved — cannot install");
+        else
+            IntEncoderDetour.Install(_bridge, _logger, _intEncoderAddr);
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnEncProbeOff(StringCommand command)
+    {
+        IntEncoderDetour.Uninstall();
         return ECommandAction.Stopped;
     }
 }

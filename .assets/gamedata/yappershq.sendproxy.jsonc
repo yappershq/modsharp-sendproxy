@@ -44,6 +44,18 @@
       "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 41 56 41 55 41 54 53 89 F3"
     }
 
+    // CFlattenedSerializer::EncodeInt32 — zigzag+varint int32 encoder; slot[6] of the integer
+    // field-type bucket in the encoder function registry. RVA 0x3c8e70 (networksystem.so, build
+    // 2026-06-02). makesig-derived (shortest unique sig, no wildcards). 5 SysV register args
+    // (rdi=bf_write*, rsi=fieldInfo*, rdx, rcx, r8d), no stack args — safe 5-arg cdecl passthrough.
+    // Used by IntEncoderDetour (sp_encprobe / sp_encprobe_off) to identify which arg register
+    // carries the spoofable value for m_iHealth (fieldInfo+0x40 == 728).
+    ,
+    "CFlattenedSerializer::EncodeInt32": {
+      "library": "networksystem",
+      "linux": "48 8B 01 55 48 89 E5 48 8D 34 00"
+    }
+
     // WriteDeltaEntity_Internal (engine2) is Phase-2-only and deferred: Ghidra's auto-analysis didn't
     // link its long "%d"-format string xref to a defined function, so the makesig route needs manual
     // disassembly first. Add it here when Phase 2 (per-client value) lands. See REVERSE_ENGINEERING.md.
