@@ -150,6 +150,22 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
     private ECommandAction OnDetourOn(StringCommand command)
     {
+        // UNSAFE: detouring EncodeField's *entry* CRASHES the server. EncodeField reads stack args
+        // (prologue: mov 0x38(%rbp),...), but this probe is a 6-arg cdecl passthrough — the trampoline
+        // call doesn't preserve the stack args, so the original reads garbage and crashes after a few
+        // calls (confirmed live 2026-06-14, ~8 hits then exit). It already served its purpose: proved
+        // managed interception + revealed the args (b/rsi=0, c/rdx-d/rcx=0x50). The real hook is the
+        // per-field encoder at field+0x38 (5 register args, no stack args) — see README/RE doc.
+        // Gated behind an explicit "force" arg so it can't be tripped accidentally.
+        if (command.ArgCount < 1 || command.GetArg(1) != "force")
+        {
+            _logger.LogWarning(
+                "sp_detour_on is DISABLED — the EncodeField-entry detour crashes the server (stack args "
+                + "not preserved by the 6-arg passthrough). Use 'sp_detour_on force' only on a throwaway "
+                + "server. The real value hook targets field+0x38, not EncodeField's entry.");
+            return ECommandAction.Stopped;
+        }
+
         if (_encodeFieldAddr == 0)
             _logger.LogWarning("sp_detour_on: EncodeField address not resolved — cannot install");
         else
