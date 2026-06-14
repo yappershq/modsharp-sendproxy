@@ -38,8 +38,9 @@ In **`CFlattenedSerializer::EncodeField`** (libnetworksystem.so @ `0x4334e0`, an
 ```
 
 So the per-field encode fn = **vtable slot 0 of the encoder dispatch object at `CNetworkSerializerFieldInfo + 0x38`**.
-- `valuePtr` = the value's address in entity memory (`field+0x40` value offset, with a secondary
-  byte adjust at `field+0xC9` when `!= 0xFF`).
+- `valuePtr` = the value's address in entity memory. ⚠️ **CORRECTION:** an earlier note read this off
+  `field+0x40` — that is wrong (`+0x40` reads `0` in practice; it is NOT `m_nFieldOffset`). See §11.
+  In the working detour the value pointer arrives as the encoder's `rcx` arg (`*(int*)rcx`, §9/§12).
 - Reconstructed signature:
   `void EncodeFieldFn(bf_write* buf, CNetworkSerializerFieldInfo* field, void* valuePtr, void* ctx, uint32 unk)`.
 
@@ -201,10 +202,17 @@ debugger to connect+continue before starting). Pitfalls + the working recipe:
 | `CEntityInstance` vtable slot → `GetNetworkSerializerInfo()` | **0** | SDK |
 | `CNetworkSerializerFieldInfo` encoder dispatch ptr | **+0x38** | RE (EncodeField) |
 | └ encode fn | vtable slot 0 of `*(field+0x38)` | RE |
-| `CNetworkSerializerFieldInfo` value offset (`m_nFieldOffset`) | **+0x40** | RE |
+| flattened `fieldInfo + 0x08` = **field name (`char*`)** | the reliable, inheritance-proof id | RE (encoder hook, **see §11**) |
+| `fieldInfo + 0x28` = recipients filter (`m_NetworkSendProxyRecipientsFilter`) | per-client *presence* | RE |
+| ⚠️ `fieldInfo + 0x40` — **NOT `m_nFieldOffset`** (reads **0**; use name @ +0x08) | corrected; old "value offset" claim was wrong | RE (**see §11**) |
 | └ secondary adjust byte | **+0xC9** (0xFF = none) | RE |
 | `CNetworkSerializerClassInfo` → `m_Fields` (CUtlVector) | after filter+hash+classname | **confirm via dump** |
+| per-class field record (via entity vtable[0]) | OWN fields only, name @ +0x08, type/size @ +0x38, NO encoder | RE (**see §11**) |
 | `CFlattenedSerializer` name / count / field-array | +0x00 / +0x08 / +0x10 (ptr array, stride 8) | RE (WriteFieldList) |
+| **int32 value encoder** (zigzag + varint; Phase-1 detour target) | networksystem `0x3c8e70` | RE (**see §9**) |
+| └ bf_write varint writer | networksystem `0x400890` | RE |
+| **encoder registry table** (8 buckets × 0x80 stride; name @ slot0, fn @ slot6) | networksystem `0x45f360` | RE (**see §10**) |
+| **InitFakeField** (`FUN_0044b980`; copies slots [6,7,1,4,5] → fieldInfo+0x38) | networksystem `0x34b980` | RE (**see §10**) |
 | `SendClientMessages` | engine2 `0x7a7280` | RE |
 | └ per-client SendSnapshot | vtable +0x80 | RE |
 | `WriteDeltaEntity_Internal` | engine2 `0x7d15c0` | RE |
@@ -267,3 +275,156 @@ Cold-block layout caveat: `EncodeField` has an early `ret` (~0x33352e) followed 
 **Still pending:** dynamic confirmation (gdb breakpoint `NS_base + 0x3334e0`, real client doing a
 visible netvar change like `ms_slap`) that this fires per field-encode + which arg register carries
 the value pointer. See `sp_gdb3.py`.
+
+---
+
+## 9. The per-field VALUE encoder — FOUND (the actual detour target)
+
+`EncodeField` (§2) only *dispatches*; the function that actually serializes an integer field's value
+into the bitstream is at **`0x3c8e70`** (libnetworksystem.so, file-vaddr). This is the fn
+`EncodeField` reaches via `*(*(fieldInfo + 0x38))` (vtable slot 0 of the dispatch object) for
+integer-typed fields.
+
+**Body:** canonical signed **zigzag** then **varint**:
+```
+zz = (n << 1) ^ (n >> 63)      // signed zigzag
+bf_write_varint(buf, zz)        // varint writer @ 0x400890
+```
+
+**makesig (build 2026-06-14):**
+```
+48 8B 01 55 48 89 E5 48 8D 34 00
+```
+First instruction is `mov (%rcx),%rax` → the VALUE is read from `(%rcx)`.
+
+**ABI — 5 register args, NO stack args (safe to detour):**
+
+| reg | meaning |
+|---|---|
+| `rdi` | `bf_write*` (the output bitstream) |
+| `rsi` | `fieldInfo` (`CNetworkSerializerFieldInfo*`) |
+| `rdx` | (context, unused for the spoof) |
+| `rcx` | **value pointer** — encoder reads `*(int*)rcx` |
+| `r8d` | uint (flags/count) |
+
+Because all args are in registers, an `IDetourHook` trampoline is safe (no stack-layout fixups).
+
+---
+
+## 10. The encoder registry (how the dispatch ptr gets populated)
+
+The mapping from field encoder-name → encoder fn lives in a static header table at file-vaddr
+**`0x45f360`** (Ghidra `PTR_PTR_0055f360`):
+
+- **8 field-type buckets**, **0x80-byte stride** per entry.
+- Each entry: `slot[0]` = encoder-name string (`char*`); `slot[6]` = encoder fn pointer.
+
+**`FUN_0044b980`** (call it `InitFakeField`, file-vaddr **`0x34b980`**) is what wires a field to its
+encoder: it name-matches a field's encoder name against the registry and copies slots
+**`[6, 7, 1, 4, 5]`** into the dispatch block at `fieldInfo + 0x38`. The important one is
+`slot[6] → dispatch vtable[0]`, i.e. exactly what `EncodeField` later calls.
+
+**Full registry map (file-vaddr):**
+
+| bucket | encoder name | fn |
+|---|---|---|
+| type1 | default (int / varint) | `0x3c8e70` |
+| type1 | fixed32 | `0x3c3b10` |
+| type1 | fixed64 | `0x3c40c0` |
+| type3 | default | `0x3c4d70` |
+| type3 | qangle | `0x3c6220` |
+| type3 | normal | `0x3c5850` |
+| type3 | coord | `0x3cfb40` |
+| type3 | coord_integral | `0x3d0d20` |
+| type3 | qangle_pitch_yaw | `0x3cf320` |
+| type3 | qangle_precise | `0x3c9ed0` |
+
+(The int32 default `0x3c8e70` is the Phase-1 detour target above.)
+
+---
+
+## 11. `fieldInfo` layout — CORRECTED
+
+Two distinct structures were conflated in earlier notes. Keep them separate:
+
+**(a) Flattened-serializer `fieldInfo`** — the argument `EncodeField`/the encoder receives. This is the
+full, flattened field set, carries the encoder dispatch, and is what the detour reads.
+
+- **`fieldInfo + 0x08`** = `char*` **field name** — the reliable identifier. It is
+  **inheritance-proof**: it matches wherever in the `CBaseEntity → … → pawn` chain a field is declared
+  (e.g. `m_iHealth` is present here even though it's a `CBaseEntity` field).
+- **`fieldInfo + 0x38`** = encoder dispatch block (vtable slot 0 = the encoder fn).
+- ⚠️ **`fieldInfo + 0x40` reads `0` in practice — it is NOT `m_nFieldOffset`.** An earlier note
+  (and the old offsets table) claimed `+0x40` was the value offset; that was **wrong**. Do **not**
+  filter fields on `+0x40`. Identify fields by the name at `+0x08` instead.
+
+**(b) Per-class `CNetworkSerializerClassInfo` field records** — reached via entity `vtable[0]`
+(`GetNetworkSerializerInfo`, §3). These are a *different, leaner* record:
+
+- Hold only that class's **OWN** fields (e.g. **61** for `CCSPlayerPawn`), **no inherited fields** —
+  so `m_iHealth` (declared on `CBaseEntity`) is **absent** here.
+- Name @ `+0x08`; packed type/size @ `+0x38`.
+- **No encoder pointer**, no recipients filter.
+
+> Takeaway: the encoder dispatch + the complete flattened field set live on the
+> **flattened-serializer** `fieldInfo` (the encoder's argument), NOT on the per-class records.
+> Resolve via the encoder hook's `rsi`, not via the entity-vtable per-class info, when you need the
+> encoder or an inherited field.
+
+---
+
+## 12. WORKING Phase-1 value spoof (uniform, all clients) — confirmed live
+
+In-process ModSharp `IDetourHook` on the int32 encoder (`0x3c8e70`, §9). In the hook:
+
+```
+1. name = *(char**)(fieldInfo + 0x08)            // rsi + 0x08
+2. if name != target (e.g. "m_iHealth") -> call trampoline unchanged
+3. write the fake value into a stable native scratch int  (long-lived, not stack)
+4. set rcx (arg d, the value pointer) = &scratch
+5. call the trampoline
+```
+
+The encoder writes the fake into the bitstream; **entity memory is never touched** → a true
+SourceMod-style send proxy (real server-side state stays real).
+
+**Confirmed live:** clients saw **1337 HP** while real server-side HP stayed real.
+Implementation: `Native/IntEncoderDetour.cs`, commands `sp_fakehp` / `sp_fakehp_off`.
+
+---
+
+## 13. Tooling / methodology lessons (2026-06-14)
+
+**Live gdb over the slow remote gdbserver link proved unreliable for this work** — the reliable path
+was static Ghidra + the in-process ModSharp detour. Specifics:
+
+- **Never `kill -9` an attached gdb.** It leaves a half-open TCP in `FIN-WAIT-2`; gdbserver is
+  single-client, so the next `target remote` hangs. Always **detach cleanly**.
+- **`catch load <name>` does NOT fire** when `set sysroot /tmp/empty` + `auto-solib-add off` suppress
+  named load events. Use `set stop-on-solib-events 1`, or SIGINT-to-break after boot, instead.
+- **Booting the server *under* gdb over the link is very slow** (>150s → times out).
+- **A `gdb -batch` session can't be introspected** without ending it.
+- **Ghidra 11+/12 dropped bundled Jython** — write **Java** GhidraScripts (see `tools/`), not Python.
+- **`modsharp-deploy` bundles assets from `.assets/` (plural)**, not `.asset/`.
+
+---
+
+## 14. Phase 2 — per-client VALUE (still open)
+
+The blocker is unchanged from §4 but now sharper: **CS2 packs the snapshot ONCE, shared.** The encoder
+(`0x3c8e70`) fires with **`rsi = 0` (no client)** during that shared pack. Only afterwards does
+engine2 **`CNetworkGameServer::SendClientMessages`** (RVA `0x7a7280`, sig in gamedata) loop the
+clients and send from that single shared pack. So at encode time **there is no "current client"** to
+key a per-recipient value on.
+
+Two candidate approaches:
+
+- **(a) Per-client different VALUE (full matrix).** Stash a `thread_local` "current client" inside the
+  `SendClientMessages` per-client loop and read it in the encoder hook to select the per-recipient
+  value. **Caveat:** this requires the encode to actually run *per client*, which the shared pack does
+  **not** do by default. Open problem — may need to force a per-client re-encode, or intercept the
+  per-client delta write instead of the shared encode.
+- **(b) Per-client PRESENCE only** (hide a field from some clients, not change its value): use the
+  native recipients filter at **`fieldInfo + 0x28`** (`m_NetworkSendProxyRecipientsFilter`).
+
+Mark (a) as the next investigation.
