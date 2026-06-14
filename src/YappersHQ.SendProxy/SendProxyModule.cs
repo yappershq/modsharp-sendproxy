@@ -25,6 +25,9 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private nint _wdeAddr;           // CNetworkGameServerBase::WriteDeltaEntity_Internal, resolved via sig on load
     private nint _perClientEncodeAddr; // CNetworkGameServer::PerClientEncode, resolved via sig on load
     private nint _writeFieldListAddr; // CFlattenedSerializer::WriteFieldList, resolved via sig on load
+    private nint _getBitRangeAddr;   // CFlattenedSerializer::GetBitRange, resolved via sig on load
+    private nint _bitCopyAddr;       // FUN_00500b70 (bit-copy primitive), resolved via sig on load
+    private nint _varintWriterAddr;  // FUN_00500890 (zigzag/varint writer), resolved via sig on load
 
     public SendProxyModule(
         ISharedSystem  sharedSystem,
@@ -116,6 +119,20 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.ConVarManager.CreateServerCommand("sp_fakehp_off", OnFakeHpOff,
             "Stop spoofing m_iHealth", ConVarFlags.Release);
 
+        // Phase-2 per-client per-field substitution (WFL-level, bit-stream rewrite).
+        // sp_sub_verify — install all 3 sub-detours + register m_iHealth, mode=Verify (read-only logging).
+        // sp_fakehp2 <value> — set mode=Fake + register m_iHealth→value for all clients.
+        // sp_sub_off — mode=Off + clear registry + uninstall detours.
+        _bridge.ConVarManager.CreateServerCommand("sp_sub_verify", OnSubVerify,
+            "Install Phase-2 sub-detours in VERIFY mode (read-only, logs cursor math for m_iHealth)",
+            ConVarFlags.Release);
+        _bridge.ConVarManager.CreateServerCommand("sp_fakehp2", OnFakeHp2,
+            "Phase-2 per-field spoof: sp_fakehp2 <value> — all clients see fake m_iHealth",
+            ConVarFlags.Release);
+        _bridge.ConVarManager.CreateServerCommand("sp_sub_off", OnSubOff,
+            "Disable Phase-2 field substitution, clear registry, uninstall sub-detours",
+            ConVarFlags.Release);
+
         if (!EncoderHook.Enabled)
             _logger.LogWarning(
                 "SendProxy loaded in REGISTRATION-ONLY mode — the live encoder patch is disabled until "
@@ -133,6 +150,9 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private const string WriteDeltaInternalKey  = "CNetworkGameServerBase::WriteDeltaEntity_Internal";
     private const string PerClientEncodeKey     = "CNetworkGameServer::PerClientEncode";
     private const string WriteFieldListKey      = "CFlattenedSerializer::WriteFieldList";
+    private const string GetBitRangeKey        = "CFlattenedSerializer::GetBitRange";
+    private const string BitCopyKey            = "CFlattenedSerializer::BitCopyPrimitive";
+    private const string VarintWriterKey       = "CFlattenedSerializer::VarintWriter";
 
     /// <summary>
     ///     Resolve the encode-path functions from gamedata (single source of truth — sigs are in
@@ -147,6 +167,9 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _wdeAddr            = ResolveFromGameData(WriteDeltaInternalKey);
         _perClientEncodeAddr = ResolveFromGameData(PerClientEncodeKey);
         _writeFieldListAddr = ResolveFromGameData(WriteFieldListKey);
+        _getBitRangeAddr    = ResolveFromGameData(GetBitRangeKey);
+        _bitCopyAddr        = ResolveFromGameData(BitCopyKey);
+        _varintWriterAddr   = ResolveFromGameData(VarintWriterKey);
     }
 
     // GetAddress throws KeyNotFoundException if the entry didn't resolve (sig miss / not registered).
@@ -187,6 +210,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         WriteDeltaProbe.Uninstall();
         RecipientCapture.Uninstall();
         WriteFieldProbe.Uninstall();
+        FieldSubstitution.Uninstall();
         _bridge.EntityManager.RemoveEntityListener(this);
         _bridge.ConVarManager.ReleaseCommand("sp_dump");
         _bridge.ConVarManager.ReleaseCommand("sp_field");
@@ -202,6 +226,9 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.ConVarManager.ReleaseCommand("sp_wflprobe_off");
         _bridge.ConVarManager.ReleaseCommand("sp_fakehp");
         _bridge.ConVarManager.ReleaseCommand("sp_fakehp_off");
+        _bridge.ConVarManager.ReleaseCommand("sp_sub_verify");
+        _bridge.ConVarManager.ReleaseCommand("sp_fakehp2");
+        _bridge.ConVarManager.ReleaseCommand("sp_sub_off");
         _manager.Clear();
     }
 
@@ -352,6 +379,74 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private ECommandAction OnWflProbeOff(StringCommand command)
     {
         WriteFieldProbe.Uninstall();
+        return ECommandAction.Stopped;
+    }
+
+    // ── Phase-2 field substitution commands ───────────────────────────────────────────────────
+
+    private bool EnsureSubDetours()
+    {
+        if (_getBitRangeAddr == 0 || _bitCopyAddr == 0 || _varintWriterAddr == 0 || _writeFieldListAddr == 0)
+        {
+            _logger.LogWarning(
+                "sp_sub_*: one or more Phase-2 addresses not resolved "
+                + "(GetBitRange={Gbr:X} BitCopy={Bc:X} VarintWriter={Vw:X} WFL={Wfl:X}) — "
+                + "check gamedata sigs match this build",
+                _getBitRangeAddr, _bitCopyAddr, _varintWriterAddr, _writeFieldListAddr);
+            return false;
+        }
+
+        // Populate FieldSubstitution address slots (idempotent — values don't change).
+        FieldSubstitution.GetBitRangeAddr    = _getBitRangeAddr;
+        FieldSubstitution.ValueCopyAddr      = _bitCopyAddr;
+        FieldSubstitution.VarintWriterAddr   = _varintWriterAddr;
+        FieldSubstitution.WriteFieldListAddr = _writeFieldListAddr;
+
+        // Also ensure RecipientCapture is running so CurrentClient is valid during substitution.
+        if (_perClientEncodeAddr != 0)
+            RecipientCapture.Install(_bridge, _logger, _perClientEncodeAddr);
+
+        return FieldSubstitution.Install(_bridge, _logger);
+    }
+
+    private ECommandAction OnSubVerify(StringCommand command)
+    {
+        if (!EnsureSubDetours())
+            return ECommandAction.Stopped;
+
+        // Register m_iHealth on CCSPlayerPawn as the canary field.
+        FieldSubstitution.SetSpoof("CCSPlayerPawn", "m_iHealth", 0 /* ignored in Verify */);
+        FieldSubstitution.Mode = SubstitutionMode.Verify;
+        _logger.LogInformation(
+            "Phase-2 VERIFY mode active — watching CCSPlayerPawn::m_iHealth. "
+            + "Check logs for SUBST-VERIFY lines (cursor math, zero output change).");
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnFakeHp2(StringCommand command)
+    {
+        if (command.ArgCount < 1 || !int.TryParse(command.GetArg(1), out var value))
+        {
+            _logger.LogInformation("usage: sp_fakehp2 <value>");
+            return ECommandAction.Stopped;
+        }
+
+        if (!EnsureSubDetours())
+            return ECommandAction.Stopped;
+
+        FieldSubstitution.SetSpoof("CCSPlayerPawn", "m_iHealth", value);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+        _logger.LogInformation(
+            "Phase-2 FAKE mode: CCSPlayerPawn::m_iHealth → {Value} for all clients (server HP unchanged)",
+            value);
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnSubOff(StringCommand command)
+    {
+        FieldSubstitution.ClearSpoofs();
+        FieldSubstitution.Uninstall();
+        _logger.LogInformation("Phase-2 field substitution OFF — all sub-detours uninstalled");
         return ECommandAction.Stopped;
     }
 }

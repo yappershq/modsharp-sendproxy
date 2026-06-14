@@ -102,5 +102,41 @@
       "library": "networksystem",
       "linux": "55 48 8D 05 ? ? ? ? 45 31 DB 66 0F EF C0 48 89 E5 41 57 41 56 4C 8D"
     }
+
+    // CFlattenedSerializer::GetBitRange (libnetworksystem, file-vaddr 0x326260, Ghidra 0x426260).
+    // Called inside WriteFieldList's per-field loop immediately before the value-copy primitive.
+    // ABI: void(dst_shortbuf*, descriptor*, int fieldIndex) — rdi, rsi, rdx.
+    // The third argument (rdx) is the changed-field index; captured in [ThreadStatic] by the
+    // FieldSubstitution.GetBitRangeHook detour to identify which field is about to be copied.
+    // Sig: 15 bytes, no wildcards, MATCHES:1 (libnetworksystem, build 2026-06-02).
+    ,
+    "CFlattenedSerializer::GetBitRange": {
+      "library": "networksystem",
+      "linux": "55 48 89 E5 53 48 89 FB 48 83 EC 08 83 FA FF 74"
+    }
+
+    // FUN_00500b70 — bit-copy primitive (libnetworksystem, file-vaddr 0x400b70, Ghidra 0x500b70).
+    // Called inside WriteFieldList to copy a field's pre-encoded bits from the shared pack-buffer
+    // into the intermediate value buffer.  ABI: byte(bf_write* dst, bf_read* src, uint bitcount).
+    // bf_write cursor: *(int*)(dst + 0x10).  Detoured by FieldSubstitution to intercept + rewrite
+    // the value bits for proxied fields.  Sig: 14 bytes, no wildcards, MATCHES:1 (2026-06-02).
+    ,
+    "CFlattenedSerializer::BitCopyPrimitive": {
+      "library": "networksystem",
+      "linux": "55 48 89 F0 41 89 D0 48 89 E5 41 57 41 56 41 55"
+    }
+
+    // FUN_00500890 — zigzag/varint writer (libnetworksystem, file-vaddr 0x400890, Ghidra 0x500890).
+    // Called to write a zigzag-encoded int32 into a bf_write.
+    // ABI: void(bf_write* dst, uint32 zigzag) — rdi=dst, rsi=zigzag.
+    // bf_write cursor lives at dst+0x10 (confirmed by disassembly: first insn `mov 0x10(%rdi),%ecx`).
+    // Zigzag encoding: (uint)((v<<1)^(v>>31)).
+    // Used by FieldSubstitution Fake mode to overwrite the rewound dst cursor with our spoofed value.
+    // Sig: 14 bytes, no wildcards, MATCHES:1 (libnetworksystem, build 2026-06-02).
+    ,
+    "CFlattenedSerializer::VarintWriter": {
+      "library": "networksystem",
+      "linux": "8B 4F 10 48 89 F2 8B 47 0C F6 C1 07 75 0B"
+    }
   }
 }
