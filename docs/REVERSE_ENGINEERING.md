@@ -138,6 +138,37 @@ The `EncodeField` byte-signature is build-specific and **will break on engine up
    not Ghidra's mid-function entry — decompiling the wrong entry gives a wrong arg layout, and a detour
    built on it will crash. Confirm arity/types before installing the detour.
 
+## 4c. Remote GDB workflow (pterodactyl GDB_DEBUG_PORT → gdbserver) — WORKS
+
+The server can be launched under `gdbserver --no-disable-randomization :PORT` (waits for a
+debugger to connect+continue before starting). Pitfalls + the working recipe:
+
+- **Single client only.** gdbserver allows ONE debugger. If IDA is attached, a second gdb gets
+  `unrecognized item "timeout" in "qSupported"` + `Remote replied unexpectedly to 'vMustReplyEmpty': timeout`.
+  Use gdb OR IDA, not both.
+- **Kill the slow remote symbol reads** (these froze the server for minutes): set sysroot +
+  debug-file-directory to an empty dir so gdb can't fetch any `.so`/debug over the link:
+  ```
+  set sysroot /tmp/empty
+  set debug-file-directory /tmp/empty
+  set auto-solib-add off
+  set solib-search-path /tmp/empty
+  set remotetimeout 180
+  target remote <ip>:<port>
+  ```
+- **`catch load <lib>` is unreliable** here (didn't stop on the lib). Instead just `continue` to
+  boot, then **SIGINT the gdb process** (`kill -INT <gdbpid>`) to break into the running server.
+- **Get lib bases** from `info proc mappings` (lowest mapping of each `.so`). Then break by
+  `base + RVA` (e.g. EncodeField = libnetworksystem base + 0x4334d0 — verified: prologue
+  `55 48 89 e5 41 57 41 56 ...`).
+- **Encoders only fire for REAL network clients** — bots have no netchan, so they don't trigger
+  the per-client snapshot encode. Need a real player connected to capture `SendClientMessages`/
+  the field encoder hits.
+- Drive it non-interactively with a gdb Python script (`/home/claude/cs2-bins/sp_gdb3.py`):
+  log-only `gdb.Breakpoint` subclasses (`stop()` returns False → log regs + auto-resume, never
+  freeze). The game client connection is independent of the gdb port, so a player can join the
+  game while gdb stays attached.
+
 ## 5. ModSharp resolution tooling (verified live on a server)
 
 - `ILibraryModule.FindString(str)` → `ILibraryModule.FindFunction(nint ptr)` reliably locates a
