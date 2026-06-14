@@ -409,22 +409,38 @@ was static Ghidra + the in-process ModSharp detour. Specifics:
 
 ---
 
-## 14. Phase 2 — per-client VALUE (still open)
+## 14. Phase 2 — per-client VALUE (RESOLVED: send-path hook is impossible)
 
-The blocker is unchanged from §4 but now sharper: **CS2 packs the snapshot ONCE, shared.** The encoder
-(`0x3c8e70`) fires with **`rsi = 0` (no client)** during that shared pack. Only afterwards does
-engine2 **`CNetworkGameServer::SendClientMessages`** (RVA `0x7a7280`, sig in gamedata) loop the
-clients and send from that single shared pack. So at encode time **there is no "current client"** to
-key a per-recipient value on.
+**Verdict (conclusive static RE, 2026-06-14): you cannot inject a per-client VALUE by hooking the
+per-client send path — it copies pre-encoded bits and never re-runs the encoders.**
 
-Two candidate approaches:
+CS2 packs the snapshot ONCE, shared; the encoder (`0x3c8e70`) fires with `rsi = 0` (no client) during
+that pack. The per-client send then deltas/copies from the single packed buffer:
 
-- **(a) Per-client different VALUE (full matrix).** Stash a `thread_local` "current client" inside the
-  `SendClientMessages` per-client loop and read it in the encoder hook to select the per-recipient
-  value. **Caveat:** this requires the encode to actually run *per client*, which the shared pack does
-  **not** do by default. Open problem — may need to force a per-client re-encode, or intercept the
-  per-client delta write instead of the shared encode.
-- **(b) Per-client PRESENCE only** (hide a field from some clients, not change its value): use the
-  native recipients filter at **`fieldInfo + 0x28`** (`m_NetworkSendProxyRecipientsFilter`).
+- **`CNetworkGameServer::SendClientMessages`** (file `0x6a7280` / Ghidra `0x7a7280`; note **e2proj/nsproj
+  Ghidra image base = file-vaddr + 0x100000**) packs once (threaded `CSendClientMessagesJob` /
+  `PackEntities`), then loops clients (array @ `gameServer+0x4b`, count `+0x4a`) calling per-client
+  **`SendSnapshot`** at **client-vtable `+0x80`** (current client *is* in scope here) with a per-client
+  context built via `packedFrame+0x2b0`.
+- **`CNetworkGameServerBase::WriteDeltaEntity_Internal`** (file `0x6d15c0`) operates on already-packed
+  `PackedEntity` objects (`ctx+0x90` from-snap, `ctx+0x98` to-snap). It calls the serialization
+  singleton `DAT_00ac4ae0` (file `0x9c4ae0`): `+0x40` = **CalcDelta** (changed-field count from the
+  packed bit-buffers) and `+0x50` = **WriteFieldList** (blits the selected pre-encoded bit ranges into
+  the client's bitbuf). **No call to `EncodeField` / `0x3c8e70` anywhere in this path** — values are
+  copied, not re-encoded. (Matches the Phase-1 capture: encoders fire once, `rsi=0`.)
 
-Mark (a) as the next investigation.
+So a `thread_local` current-client trick can't work — the encoder is never invoked per client. The
+only NATIVE per-client field mechanism is a **recipients bitmask** (`CFlattenedSerializer::
+GatherSendProxyResults_R` nsys `0x1593d8`; `m_NetworkSendProxyRecipientsFilter` @ `fieldInfo+0x28`),
+which gates *presence* (who receives the field), never its value.
+
+### Options for per-client value (all require forcing the encoder to re-run)
+1. **Per-client re-pack** — true per-client value, but N× encode cost (defeats the shared-pack
+   optimization; brutal at 64p / 10k entities).
+2. **Group-bucket re-pack** *(recommended)* — pack once per *value-group* (e.g. TTT traitor vs innocent),
+   scaling with #groups not #clients. The practical sweet spot for role/team-based spoofing.
+3. **Recipients-mask** — zero-cost but presence-only (hide a field from some clients; value stays uniform).
+
+Next RE step if (1)/(2) is chosen: decompile the threaded pack job (`N16CHLTVServerAsync22CSend
+ClientMessagesJobE` / `PackEntities_Normal`) to find where it can be driven once per group with a
+`thread_local` client/group set, then read in the existing `0x3c8e70` encoder hook.
