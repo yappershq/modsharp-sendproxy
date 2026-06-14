@@ -1,139 +1,69 @@
-// SendProxy gamedata — CS2 flattened-serializer encode path.
+// SendProxy gamedata — CS2 flattened-serializer encode/send path.
 //
-// Reverse-engineered from libnetworksystem.so / libengine2.so (build 2026-06-02).
-// ModSharp gamedata schema (see engine.games.jsonc): top-level keys are "Addresses",
-// "Offsets", "VFuncs". An address entry takes { library, linux/windows byte-sig (? = wildcard),
-// refs:{strings/cvars/vtable} }. A sig OR a refs-anchor is enough; supplying both = sig is the
-// deterministic primary, the string ref is the update-robust fallback (ModSharp resolves the
-// function that references the anchor string).
+// Reverse-engineered from libnetworksystem.so / libengine2.so (CS2 dedicated server, Linux,
+// build 2026-06-02, stripped). ModSharp gamedata schema: top-level "Addresses" / "Offsets" /
+// "VFuncs"; an address entry = { library, linux/windows byte-sig (? = single wildcard byte) }.
+// FindPattern resolves the sig at runtime — sigs are position-independent. Re-derive on engine
+// updates with tools/ (nosoop makesig); full derivation in docs/REVERSE_ENGINEERING.md.
 //
-// Offsets used by the live hook (struct CNetworkSerializerFieldInfo), kept for reference —
-// see Native/FlattenedSerializerLayout.cs:
-//   +0x28  m_NetworkSendProxyRecipientsFilter (shared_ptr)   — per-client presence (Phase 2)
-//   +0x38  encoder dispatch ptr; **(void***)(field+0x38) = encode fn (slot 0)  — VALUE hook
-//   +0x40  m_nFieldOffset (value offset within entity)
-//   +0xC9  secondary field-offset adjust byte (0xFF = none)
+// All addresses below are file-vaddr RVAs (Ghidra image base for these .so = file-vaddr + 0x100000).
 {
   "Addresses": {
-    // CFlattenedSerializer::EncodeField — the per-field value encoder (the Source1 m_pProxyFn analog).
-    // CORRECTION CHAIN (full derivation in REVERSE_ENGINEERING.md §8):
-    //   1. 0x4334d0 — WRONG (a CUtlVector realloc helper).
-    //   2. 0x3356dd — WRONG (Ghidra image-base addr; landed mid-instruction, would crash if armed).
-    //   3. 0x3334e0 — CORRECT (objdump file-vaddr). Owns the "EncodeField encoder wrote %d bits"
-    //      string (@0x15d580, xref lea @0x3357fb in a cold block). Prologue `sub $0x2c8,%rsp` +
-    //      `mov %r9,-0x290(%rbp)` matches the xref frame slot. Sig UNIQUE in the binary. The Ghidra
-    //      decomp "FUN_004334e0" is the same fn (Ghidra rebases by 0x100000: 0x4334e0-0x100000).
-    // DYNAMICALLY CONFIRMED (gdb 2026-06-14): fires per field-encode (8 hits), rsi=0 -> shared encode.
-    // Sig = nosoop makesig canonical shortest-unique (21 bytes, no wildcards).
-    //
-    // NO refs.strings anchor: ModSharp's FindString can't match this build's long "%d"-format strings
-    // (length cap — verified: with the anchor present it logs `Failed to find String "...encoder wrote
-    // %d bits"` then falls back to the sig). The byte sig is the sole, reliable resolver here. To
-    // re-derive on a game update, use tools/ (makesig) — see REVERSE_ENGINEERING.md §8.
+    // ── Phase 1: uniform value spoof (shared snapshot pack) ──────────────────────────────
+    // CFlattenedSerializer::EncodeField — per-field encoder dispatcher (the Source1 m_pProxyFn
+    // analog). RVA 0x3334e0. Fires once during the shared pack (rsi=0, no client).
     "CFlattenedSerializer::EncodeField": {
       "library": "networksystem",
       "linux": "55 48 89 E5 41 57 49 89 D7 41 56 41 55 41 54 41 BC 01 00 00 00"
     },
-
-    // CNetworkGameServer::SendClientMessages — engine2 per-tick send loop (Phase 2 per-client anchor).
-    // makesig (tools/GhidraStringSig.java on the "SV:  SendClientMessages" anchor): note the auto-
-    // wildcarded rip-relative lea displacement `48 8D 05 ? ? ? ?` — this is where makesig beats a hand
-    // sig (the 4 disp bytes shift on relink). Ghidra FN_007a7280 (e2proj image base 0 => RVA 0x7a7280).
-    "CNetworkGameServer::SendClientMessages": {
-      "library": "engine",
-      "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 41 56 41 55 41 54 53 89 F3"
-    }
-
-    // CFlattenedSerializer::EncodeInt32 — zigzag+varint int32 encoder; slot[6] of the integer
-    // field-type bucket in the encoder function registry. RVA 0x3c8e70 (networksystem.so, build
-    // 2026-06-02). makesig-derived (shortest unique sig, no wildcards). 5 SysV register args
-    // (rdi=bf_write*, rsi=fieldInfo*, rdx, rcx, r8d), no stack args — safe 5-arg cdecl passthrough.
-    // Used by IntEncoderDetour (sp_encprobe / sp_encprobe_off) to identify which arg register
-    // carries the spoofable value for m_iHealth (fieldInfo+0x40 == 728).
-    ,
+    // CFlattenedSerializer::EncodeInt32 — zigzag+varint int32 encoder, slot[6] of the integer
+    // field-type bucket in the encoder registry. RVA 0x3c8e70. Value read from rcx.
     "CFlattenedSerializer::EncodeInt32": {
       "library": "networksystem",
       "linux": "48 8B 01 55 48 89 E5 48 8D 34 00"
-    }
+    },
 
-    // CNetworkGameServer::PerClientEncode (engine2) — per-client encode entry, file-RVA 0x8fae40.
-    // CServerSideClient* arrives in rsi (arg2). Called once per client per send tick from the
-    // client loop; internally reaches WriteDeltaEntity_Internal per entity for that client.
-    // Caller thunk at file-RVA 0x6ca7c0. Sig: nosoop makesig, 25 bytes, MATCHES:1 (2026-06-14).
-    // Two wildcarded rip-relative displacements (lea r15/r14 — shift on relink, rest is stable).
-    ,
+    // ── Phase 2: per-client value substitution (engine2 send path) ───────────────────────
+    // CNetworkGameServer::SendClientMessages — per-tick send loop. RVA 0x7a7280.
+    "CNetworkGameServer::SendClientMessages": {
+      "library": "engine",
+      "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 41 56 41 55 41 54 53 89 F3"
+    },
+    // CNetworkGameServer::PerClientEncode — per-client encode entry; CServerSideClient* in rsi.
+    // RVA 0x8fae40. Captured into a [ThreadStatic] recipient for substitution keying.
     "CNetworkGameServer::PerClientEncode": {
       "library": "engine",
       "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 4C 8D BD ? ? ? ? 41 56 4C 8D 35"
-    }
-
-    // CNetworkGameServerBase::WriteDeltaEntity_Internal (engine2) — per-entity delta write, called
-    // serially per-client from SendSnapshot inside SendClientMessages' client loop.
-    // RVA 0x6d15c0 (file-vaddr); Ghidra addr = 0x7d15c0 (e2proj image base 0x100000).
-    // RE (wde.out): rdi=this (CNetworkGameServerBase*), rsi=delta ctx*;
-    //   ctx+0x34 = entityIndex (int), ctx+0x88 = bf_write*, ctx+0x90 = from-snap*, ctx+0x98 = to-snap*.
-    // Sig: nosoop makesig canonical shortest-unique (23 bytes). MATCHES:1 verified via Ghidra headless.
-    ,
+    },
+    // CNetworkGameServerBase::WriteDeltaEntity_Internal — per-entity per-client delta write.
+    // RVA 0x6d15c0. ctx(rsi): +0x34 entIdx, +0x88 bf_write, +0x90 from-snap, +0x98 to-snap.
     "CNetworkGameServerBase::WriteDeltaEntity_Internal": {
       "library": "engine",
       "linux": "55 48 89 E5 41 57 41 56 41 55 41 54 49 89 F4 53 48 81 EC 28 01 00 00"
-    }
-
-    // CFlattenedSerializer::WriteFieldList (libnetworksystem) — per-client per-entity field-copy loop.
-    // File-RVA 0x343b60; Ghidra FUN_00443b60 (image-base 0x100000). Called inside
-    // WriteDeltaEntity_Internal for each entity that changed, once per client, on the send thread.
-    //
-    // ABI: 9 args (6 register + 3 stack):
-    //   rdi=CFlattenedSerializer*, rsi=ctx, rdx=encoder-block*, rcx=dst-bf_write*,
-    //   r8=src-pack-buf*, r9=entity-class-idx,
-    //   [rsp+8]=unk, [rsp+10]=changed-field-array*, [rsp+18]=unk.
-    //
-    // This is the SUBSTITUTION POINT for Phase-2 per-client per-field spoofing:
-    //   - Field identity: serializer field array at rdi+0x10 (stride 8), name at field_rec+0x08.
-    //   - Destination bf_write: rcx (per-client, must be patched per substitution).
-    //   - Changed-field list: [rsp+10] (int*) gates which fields are copied this tick.
-    //   The bit-copy primitive FUN_00500b70 called inside the loop has NO field identity,
-    //   so this function's entry is the narrowest clean hook site that exposes both.
-    //
-    // Sig: nosoop makesig, 24 bytes, MATCHES:1 (libnetworksystem, build 2026-06-02).
-    // Bytes 4-7 wildcarded (rip-relative lea disp — shifts on relink; all other bytes stable).
-    ,
+    },
+    // CFlattenedSerializer::WriteFieldList — per-field copy loop (RVA 0x343b60). rdi=serializer,
+    // rcx=dst bf_write, param_8=changed-field list. 9 args (6 reg + 3 stack). Values accumulate in
+    // an intermediate buffer (appended at end); field-paths stream separately → variable-length
+    // value substitution is safe.
     "CFlattenedSerializer::WriteFieldList": {
       "library": "networksystem",
       "linux": "55 48 8D 05 ? ? ? ? 45 31 DB 66 0F EF C0 48 89 E5 41 57 41 56 4C 8D"
-    }
-
-    // CFlattenedSerializer::GetBitRange (libnetworksystem, file-vaddr 0x326260, Ghidra 0x426260).
-    // Called inside WriteFieldList's per-field loop immediately before the value-copy primitive.
-    // ABI: void(dst_shortbuf*, descriptor*, int fieldIndex) — rdi, rsi, rdx.
-    // The third argument (rdx) is the changed-field index; captured in [ThreadStatic] by the
-    // FieldSubstitution.GetBitRangeHook detour to identify which field is about to be copied.
-    // Sig: 15 bytes, no wildcards, MATCHES:1 (libnetworksystem, build 2026-06-02).
-    ,
+    },
+    // CFlattenedSerializer::GetBitRange — resolves field index → [startBit,endBit) in the source;
+    // fires immediately before each value copy. RVA 0x326260. 3rd arg = field index (captured to
+    // identify the field being copied).
     "CFlattenedSerializer::GetBitRange": {
       "library": "networksystem",
       "linux": "55 48 89 E5 53 48 89 FB 48 83 EC 08 83 FA FF 74"
-    }
-
-    // FUN_00500b70 — bit-copy primitive (libnetworksystem, file-vaddr 0x400b70, Ghidra 0x500b70).
-    // Called inside WriteFieldList to copy a field's pre-encoded bits from the shared pack-buffer
-    // into the intermediate value buffer.  ABI: byte(bf_write* dst, bf_read* src, uint bitcount).
-    // bf_write cursor: *(int*)(dst + 0x10).  Detoured by FieldSubstitution to intercept + rewrite
-    // the value bits for proxied fields.  Sig: 14 bytes, no wildcards, MATCHES:1 (2026-06-02).
-    ,
+    },
+    // CFlattenedSerializer::BitCopyPrimitive — the per-field value bit-copy (the substitution point).
+    // RVA 0x400b70. Sig (bf_write* dst, bf_read* src, uint bitcount). dst+0x10 = bit cursor.
     "CFlattenedSerializer::BitCopyPrimitive": {
       "library": "networksystem",
       "linux": "55 48 89 F0 41 89 D0 48 89 E5 41 57 41 56 41 55"
-    }
-
-    // FUN_00500890 — zigzag/varint writer (libnetworksystem, file-vaddr 0x400890, Ghidra 0x500890).
-    // Called to write a zigzag-encoded int32 into a bf_write.
-    // ABI: void(bf_write* dst, uint32 zigzag) — rdi=dst, rsi=zigzag.
-    // bf_write cursor lives at dst+0x10 (confirmed by disassembly: first insn `mov 0x10(%rdi),%ecx`).
-    // Zigzag encoding: (uint)((v<<1)^(v>>31)).
-    // Used by FieldSubstitution Fake mode to overwrite the rewound dst cursor with our spoofed value.
-    // Sig: 14 bytes, no wildcards, MATCHES:1 (libnetworksystem, build 2026-06-02).
-    ,
+    },
+    // CFlattenedSerializer::VarintWriter — bf_write varint primitive used to emit our substitute
+    // value. RVA 0x400890. Sig (bf_write* dst, uint32 zigzag); zigzag = (v<<1)^(v>>31).
     "CFlattenedSerializer::VarintWriter": {
       "library": "networksystem",
       "linux": "8B 4F 10 48 89 F2 8B 47 0C F6 C1 07 75 0B"
