@@ -20,6 +20,8 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private readonly InterfaceBridge _bridge;
     private readonly SendProxyManager _manager;
 
+    private nint _encodeFieldAddr; // CFlattenedSerializer::EncodeField, resolved via sig on load
+
     public SendProxyModule(
         ISharedSystem  sharedSystem,
         string?        dllPath,
@@ -55,6 +57,12 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
             "Read-only: dump an entity's network serializer layout: sp_dump <entityIndex>",
             ConVarFlags.Release);
 
+        // Read-only EncodeField detour probe (manual on/off — logs the real args of the first calls).
+        _bridge.ConVarManager.CreateServerCommand("sp_detour_on", OnDetourOn,
+            "Install the read-only EncodeField detour probe", ConVarFlags.Release);
+        _bridge.ConVarManager.CreateServerCommand("sp_detour_off", OnDetourOff,
+            "Uninstall the EncodeField detour probe", ConVarFlags.Release);
+
         if (!EncoderHook.Enabled)
             _logger.LogWarning(
                 "SendProxy loaded in REGISTRATION-ONLY mode — the live encoder patch is disabled until "
@@ -84,6 +92,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         try
         {
             var ef = ns.FindPattern(EncodeFieldSig);
+            _encodeFieldAddr = ef;
             _logger.LogInformation("SendProxy resolve EncodeField (sig): fn=0x{Fn:X}", ef);
             if (ef == 0)
                 _logger.LogWarning("SendProxy: EncodeField sig not found (changed this build?)");
@@ -136,8 +145,11 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
     public void Shutdown()
     {
+        EncodeFieldDetour.Uninstall();
         _bridge.EntityManager.RemoveEntityListener(this);
         _bridge.ConVarManager.ReleaseCommand("sp_dump");
+        _bridge.ConVarManager.ReleaseCommand("sp_detour_on");
+        _bridge.ConVarManager.ReleaseCommand("sp_detour_off");
         _manager.Clear();
     }
 
@@ -156,6 +168,21 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         }
 
         SerializerProbe.Dump(_bridge, _logger, idx);
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnDetourOn(StringCommand command)
+    {
+        if (_encodeFieldAddr == 0)
+            _logger.LogWarning("sp_detour_on: EncodeField address not resolved — cannot install");
+        else
+            EncodeFieldDetour.Install(_bridge, _logger, _encodeFieldAddr);
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnDetourOff(StringCommand command)
+    {
+        EncodeFieldDetour.Uninstall();
         return ECommandAction.Stopped;
     }
 }

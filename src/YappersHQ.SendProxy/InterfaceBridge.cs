@@ -21,6 +21,7 @@ internal sealed class InterfaceBridge
     public IEntityManager EntityManager { get; }
     public IClientManager ClientManager { get; }
     public ISchemaManager SchemaManager { get; }
+    public IHookManager HookManager { get; }
     public ILibraryModuleManager LibraryModuleManager { get; }
     public ISharpModuleManager SharpModuleManager { get; }
     public ILoggerFactory LoggerFactory { get; }
@@ -40,6 +41,7 @@ internal sealed class InterfaceBridge
         EntityManager = sharedSystem.GetEntityManager();
         ClientManager = sharedSystem.GetClientManager();
         SchemaManager = sharedSystem.GetSchemaManager();
+        HookManager = sharedSystem.GetHookManager();
         LibraryModuleManager = sharedSystem.GetLibraryModuleManager();
         SharpModuleManager = sharedSystem.GetSharpModuleManager();
         LoggerFactory = sharedSystem.GetLoggerFactory();

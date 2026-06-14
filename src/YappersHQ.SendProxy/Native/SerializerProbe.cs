@@ -84,25 +84,17 @@ internal static class SerializerProbe
             if (fieldArray == 0 || fieldCount <= 0 || fieldCount > 4096)
                 return;
 
-            // Dump the first few field records: their head bytes + ascii (find m_pszFieldName)
-            // and the +0x38 encoder dispatch ptr (and its slot 0 = encode fn).
-            var dump = Math.Min(fieldCount, 3);
-            for (var fi = 0; fi < dump; fi++)
+            // Field record layout is already confirmed (m_FieldNameHash +0x00, m_pszFieldName +0x08,
+            // m_nFieldSize/m_nFieldOffset +0x38). Only read field[0]'s name via the confirmed offset.
+            // NOTE: ANY raw deref of engine memory can hit an unmapped page → AccessViolationException,
+            // which is UNCATCHABLE in .NET and aborts the process. So we do the minimum, no speculative
+            // qword scanning, no multi-field walk (that's what crashed the server before).
+            var rec0 = *(nint*) (fieldArray + 0);
+            if (rec0 != 0)
             {
-                var rec = *(nint*) (fieldArray + fi * 8);
-                if (rec == 0) continue;
-                logger.LogInformation("  --- field[{Fi}] rec=0x{Rec:X} ---", fi, rec);
-                for (var off = 0; off < 0x50; off += 8)
-                {
-                    var q = *(nint*) (rec + off);
-                    var s = TryReadAscii(q);
-                    logger.LogInformation("    rec+0x{Off:X2} = 0x{Q:X}{Str}",
-                        off, q, s.Length > 0 ? $"  \"{s}\"" : string.Empty);
-                }
-
-                var encoder = *(nint*) (rec + 0x38);
-                var encodeFn = encoder != 0 ? *(nint*) encoder : 0;
-                logger.LogInformation("    rec+0x38 encoder=0x{Enc:X} slot0(encodeFn)=0x{Fn:X}", encoder, encodeFn);
+                var nameHash = *(uint*) (rec0 + 0x00);
+                var name = TryReadAscii(*(nint*) (rec0 + 0x08));
+                logger.LogInformation("  field[0] rec=0x{Rec:X} nameHash=0x{H:X} name=\"{Name}\"", rec0, nameHash, name);
             }
         }
         catch (Exception e)
