@@ -132,6 +132,18 @@ internal static class SerializerProbe
                 logger.LogInformation("sp_field: matched class \"{Cls}\" at idx={Idx} (fields={Cnt})",
                     classFilter, i, count);
 
+                // "*" lists every field name+index (so we can discover the real networked name).
+                if (fieldName == "*")
+                {
+                    for (var f = 0; f < count; f++)
+                    {
+                        var r = *(nint*) (arr + f * 8);
+                        if (!PtrLike(r)) continue;
+                        logger.LogInformation("  field[{F}] = \"{Name}\"", f, TryReadAscii(*(nint*) (r + 0x08)));
+                    }
+                    return;
+                }
+
                 for (var f = 0; f < count; f++)
                 {
                     var rec = *(nint*) (arr + f * 8);
