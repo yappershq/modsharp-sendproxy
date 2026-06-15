@@ -63,10 +63,40 @@
       "linux": "55 48 89 F0 41 89 D0 48 89 E5 41 57 41 56 41 55"
     },
     // CFlattenedSerializer::VarintWriter — bf_write varint primitive used to emit our substitute
-    // value. RVA 0x400890. Sig (bf_write* dst, uint32 zigzag); zigzag = (v<<1)^(v>>31).
+    // value. RVA 0x400890. Sig (bf_write* dst, uint64 value); the SAME primitive is used for both
+    // signed (caller pre-zigzags) and unsigned (raw) varints, 32- and 64-bit (rsi is 64-bit).
     "CFlattenedSerializer::VarintWriter": {
       "library": "networksystem",
       "linux": "8B 4F 10 48 89 F2 8B 47 0C F6 C1 07 75 0B"
+    },
+
+    // ── Phase-2b: per-field-type classification (encoder-identity probes) ─────────────────
+    // These addresses are NOT called. They identify which encode-fn the engine's type bucket
+    // installs at fieldInfo->handler[slot6]. FieldSubstitution.Classify() reads the field's encoder
+    // fn ptr ( *( *(fieldInfo+0x38) + 0x30 ) ) and compares against these to decide how to emit
+    // the substitute bits. An unrecognised encoder → Unsupported → passthrough (never corrupt).
+    //
+    // EncodeInt32 (signed integers) is the existing CFlattenedSerializer::EncodeInt32 (RVA 0x3c8e70):
+    //   mov rax,[rcx]; zigzag (lea/sar/xor); call VarintWriter. Serves int8/16/32/64 (signed).
+    //
+    // EncodeUInt32 (unsigned integers, RVA 0x3c8e90): mov rsi,[rcx]; call VarintWriter — raw, no
+    // zigzag. Serves uint8/16/32/64. (12B sig includes the concrete rel32 to VarintWriter for
+    // uniqueness; the thin wrapper body alone is shared by several thunks.)
+    "CFlattenedSerializer::EncodeUInt32": {
+      "library": "networksystem",
+      "linux": "48 8B 31 55 48 89 E5 E8 F4 79 03 00 B8 01 00 00 00 5D"
+    },
+    // EncodeFloat32 (RVA 0x3ce8e0): movsd xmm0,[value]; cvtsd2ss; writes exactly 32 raw bits inline
+    // into the bf_write at dst+0x10 (no varint). We replicate the 32-bit fixed write to substitute.
+    "CFlattenedSerializer::EncodeFloat32": {
+      "library": "networksystem",
+      "linux": "8B 57 0C 48 89 C8 8B 4F 10 89 D6 29 CE 83 FE 1F 7E 76"
+    },
+    // EncodeBool (RVA 0x3c4c00): reads 1 byte from value, writes exactly 1 bit inline into the
+    // bf_write. We replicate the 1-bit fixed write to substitute (bool = value != 0).
+    "CFlattenedSerializer::EncodeBool": {
+      "library": "networksystem",
+      "linux": "48 89 C8 8B 57 0C 8B 4F 10 39 CA 7E 33"
     }
   }
 }

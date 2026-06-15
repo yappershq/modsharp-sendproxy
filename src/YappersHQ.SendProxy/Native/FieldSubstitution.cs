@@ -27,9 +27,19 @@ namespace YappersHQ.SendProxy.Native;
 //    a)  Save dst cursor.
 //    b)  Call original (advances src + dst cursors, writes real bits).
 //    c)  Rewind dst cursor.
-//    d)  Write zigzag-encoded fake value via FUN_00500890 (varint writer):
-//            void FUN_00500890(bf_write* dst, uint32 zigzag)  rdi=dst, rsi=zigzag.
-//            Zigzag: (uint)((v<<1)^(v>>31)).
+//    d)  Re-emit the fake value using the FIELD's real encoder family (see Classify):
+//          - Int32/Int64 — signed zigzag varint via FUN_00500890 (rdi=dst, rsi=zigzag-of-int64).
+//          - UInt32      — raw varint via the same FUN_00500890 (no zigzag).
+//          - Bool        — 1-bit fixed write (WriteUBitLong).
+//          - Float32     — 32-bit fixed write of the IEEE-754 bits (WriteUBitLong).
+//          - Unsupported — PASSTHROUGH (re-call would corrupt; we leave the engine's bits).
+//        FUN_00500890 is the engine's single varint primitive: void(bf_write*, uint64). It handles
+//        both signed (caller pre-zigzags) and unsigned, 32- and 64-bit, in one place.
+//
+//  Type detection (Classify): the leaf field record's +0x00 is CNetworkSerializerFieldInfo*; the
+//  engine dispatches encoding via  *( *(fieldInfo+0x38) + 0x30 )  — fieldInfo+0x38 = type-bucket
+//  handler, slot[6] (+0x30) = encode fn. We compare that fn ptr against encoder identities resolved
+//  from gamedata (EncodeInt32/EncodeUInt32/EncodeFloat32/EncodeBool). Unknown → Unsupported.
 //
 //  CFieldPath header (verified by RE of GetBitRange output buffer):
 //    hdr+0x00..0x0F : inline short[8] indices (or external short[] ptr when read-only flag != 0)
@@ -55,6 +65,17 @@ namespace YappersHQ.SendProxy.Native;
 // ─────────────────────────────────────────────────────────────────────────────
 
 internal enum SubstitutionMode { Off, Verify, Fake }
+
+// Network encoder family for a registered field, decided from the field's encoder-fn identity.
+//   Int32/Int64 — signed integer, EncodeInt32 (zigzag varint). Both share the same encoder; the
+//                 zigzag is computed over the sign-extended 64-bit value so the byte stream is
+//                 identical for an int value that fits 32 bits.
+//   UInt32      — unsigned integer, EncodeUInt32 (raw varint, no zigzag).
+//   Bool        — 1-bit field, EncodeBool.
+//   Float32     — 32-bit IEEE-754, EncodeFloat32 (raw 32-bit inline write).
+//   Unsupported — anything else (quantized float/vector, handle/64-bit-special, string/bytes,
+//                 unresolved encoder). MUST passthrough — never substitute.
+internal enum FieldType { Unsupported = 0, Int32, UInt32, Int64, Bool, Float32 }
 
 internal static unsafe class FieldSubstitution
 {
@@ -127,8 +148,10 @@ internal static unsafe class FieldSubstitution
     private static IDetourHook? _wdeEntityCaptureHook;
     private static nint         _wdeEntityCaptureTrampoline;
 
-    // FUN_00500890 — zigzag/varint writer: void(bf_write* dst, uint32 zigzag)
-    private static delegate* unmanaged[Cdecl]<nint, uint, void> _varintWriter;
+    // FUN_00500890 — varint writer: void(bf_write* dst, uint64 value). The engine uses ONE varint
+    // primitive for signed (caller pre-zigzags) and unsigned, 32- and 64-bit (rsi is 64-bit wide).
+    // We type the value as ulong so Int64/UInt32/UInt64 all route through it correctly.
+    private static delegate* unmanaged[Cdecl]<nint, ulong, void> _varintWriter;
     private static ILogger? _logger;
 
     // ── Addresses (set by SendProxyModule before Install) ────────────────────
@@ -139,6 +162,15 @@ internal static unsafe class FieldSubstitution
     public static nint WriteFieldListAddr; // file-vaddr 0x343b60
     public static nint WdeAddr;            // WriteDeltaEntity_Internal (0 = skip entity-index capture)
 
+    // ── Encoder-identity addresses (set by SendProxyModule before Install) ────────────────────
+    //  Used ONLY to classify a field's network type by comparing against the encoder fn the engine
+    //  installed at  *( *(fieldInfo+0x38) + 0x30 ).  None of these are ever called.  A 0 value
+    //  disables that type (Classify returns Unsupported → passthrough).
+    public static nint EncSignedAddr;      // EncodeInt32 (signed int8/16/32/64, zigzag varint)
+    public static nint EncUInt32Addr;      // EncodeUInt32 (unsigned int8/16/32/64, raw varint)
+    public static nint EncFloat32Addr;     // EncodeFloat32 (raw 32-bit IEEE-754)
+    public static nint EncBoolAddr;        // EncodeBool (1 bit)
+
     // ── Install / Uninstall ──────────────────────────────────────────────────
 
     public static bool Install(InterfaceBridge bridge, ILogger logger)
@@ -148,7 +180,7 @@ internal static unsafe class FieldSubstitution
         if (!ValidateAddresses(logger))
             return false;
 
-        _varintWriter = (delegate* unmanaged[Cdecl]<nint, uint, void>) VarintWriterAddr;
+        _varintWriter = (delegate* unmanaged[Cdecl]<nint, ulong, void>) VarintWriterAddr;
 
         // 1. WFL shim — captures serializer ptr (rdi) into _currentSerializer [ThreadStatic].
         if (_wflShimHook is null)
@@ -320,7 +352,7 @@ internal static unsafe class FieldSubstitution
         try
         {
             var serName   = NativeUtil.ReadShortAscii(*(nint*) (serPtr + 0x00), 48);
-            var fieldName = ResolveFieldName(serPtr, _currentFieldPath);
+            var fieldName = ResolveFieldName(serPtr, _currentFieldPath, out var leafRec);
 
             // Diagnostic: log first MaxDiagCount distinct (ser, leaf) pairs.
             if (fieldName.Length > 0 && _logger is { } diagLog)
@@ -358,6 +390,7 @@ internal static unsafe class FieldSubstitution
 
             var client      = RecipientCapture.CurrentClient;
             var entityIndex = _currentEntityIndex;
+            var fieldType   = Classify(leafRec);
 
             var ln = Interlocked.Increment(ref _logCount);
 
@@ -370,9 +403,9 @@ internal static unsafe class FieldSubstitution
                 if (ln <= MaxLogCount && _logger is { } log)
                 {
                     log.LogInformation(
-                        "SUBST-VERIFY field=\"{Ser}::{Field}\" client=0x{Client:X} ent={Ent} bitcount={Bits} "
+                        "SUBST-VERIFY field=\"{Ser}::{Field}\" type={Type} client=0x{Client:X} ent={Ent} bitcount={Bits} "
                         + "cursorBefore={Before} cursorAfter={After} (fake would be {Fake})",
-                        serName, fieldName, client, entityIndex, bitcount, cursorBefore, cursorAfter, uniformFakeValue);
+                        serName, fieldName, fieldType, client, entityIndex, bitcount, cursorBefore, cursorAfter, uniformFakeValue);
                 }
                 return result;
             }
@@ -412,21 +445,74 @@ internal static unsafe class FieldSubstitution
                 if (!shouldSubstitute)
                     return CallOriginal(dst, src, bitcount);
 
-                // Save cursor, call original (advances src + dst), rewind, write zigzag-encoded fake.
+                // DEFAULT-SAFE: only substitute field types we know how to encode. An unrecognised
+                // (or unresolved) encoder MUST pass through untouched — writing wrong-type bits would
+                // corrupt the entity delta for every client.
+                if (fieldType == FieldType.Unsupported)
+                {
+                    if (ln <= MaxLogCount && _logger is { } skipLog)
+                    {
+                        skipLog.LogWarning(
+                            "SUBST-FAKE field=\"{Ser}::{Field}\" classified Unsupported — passing through "
+                            + "(registered but not a substitutable type)", serName, fieldName);
+                    }
+                    return CallOriginal(dst, src, bitcount);
+                }
+
+                // Save cursor, call original (advances src + dst cursors + writes real bits), then
+                // rewind the dst cursor and re-emit our value with the field's real encoder.
                 int savedCursor     = *(int*) (dst + 0x10);
                 byte originalResult = CallOriginal(dst, src, bitcount);
+                int afterOriginal   = *(int*) (dst + 0x10);
 
                 *(int*) (dst + 0x10) = savedCursor;
 
-                uint zigzag = (uint) ((effectiveFake << 1) ^ (effectiveFake >> 31));
-                _varintWriter(dst, zigzag);
+                switch (fieldType)
+                {
+                    case FieldType.Int32:
+                    case FieldType.Int64:
+                    {
+                        // Signed zigzag varint. Zigzag over the sign-extended 64-bit value so the
+                        // byte stream matches the engine for both int32 and int64 widths.
+                        long  v64    = effectiveFake;                       // sign-extend int → long
+                        ulong zigzag = (ulong) ((v64 << 1) ^ (v64 >> 63));
+                        _varintWriter(dst, zigzag);
+                        break;
+                    }
+                    case FieldType.UInt32:
+                    {
+                        // Raw varint, no zigzag. Mask to 32 bits (callback value is int-shaped).
+                        _varintWriter(dst, (uint) effectiveFake);
+                        break;
+                    }
+                    case FieldType.Bool:
+                    {
+                        WriteUBitLong(dst, effectiveFake != 0 ? 1u : 0u, 1);
+                        break;
+                    }
+                    case FieldType.Float32:
+                    {
+                        // Reinterpret the int payload's bits as the 32-bit IEEE-754 value to emit.
+                        // Callers pass the float via BitConverter.SingleToInt32Bits.
+                        WriteUBitLong(dst, (uint) effectiveFake, 32);
+                        break;
+                    }
+                    default:
+                    {
+                        // Unreachable (Unsupported handled above) — but be defensive: keep the
+                        // engine's own (already-written) output by restoring the post-original
+                        // cursor. Do NOT call the original again (it would re-advance the bf_read).
+                        *(int*) (dst + 0x10) = afterOriginal;
+                        return originalResult;
+                    }
+                }
 
                 if (ln <= MaxLogCount && _logger is { } log)
                 {
                     log.LogInformation(
-                        "SUBST-FAKE field=\"{Ser}::{Field}\" client=0x{Client:X} ent={Ent} bitcount={Bits} "
-                        + "savedCursor={Saved} effectiveFake={Fake} zigzag=0x{Zz:X}",
-                        serName, fieldName, client, entityIndex, bitcount, savedCursor, effectiveFake, zigzag);
+                        "SUBST-FAKE field=\"{Ser}::{Field}\" type={Type} client=0x{Client:X} ent={Ent} bitcount={Bits} "
+                        + "savedCursor={Saved} effectiveFake={Fake}",
+                        serName, fieldName, fieldType, client, entityIndex, bitcount, savedCursor, effectiveFake);
                 }
                 return originalResult;
             }
@@ -459,7 +545,15 @@ internal static unsafe class FieldSubstitution
     ///     All dereferences are NativeUtil.IsUserPtr-gated; function is try/catch-wrapped → "" on fault.
     /// </summary>
     private static string ResolveFieldName(nint serializer, nint hdr)
+        => ResolveFieldName(serializer, hdr, out _);
+
+    /// <param name="leafRec">
+    ///     On success, the resolved leaf field record (stride-0x2E entry whose +0x00 is the
+    ///     CNetworkSerializerFieldInfo*). 0 on any fault. Used by <see cref="Classify"/>.
+    /// </param>
+    private static string ResolveFieldName(nint serializer, nint hdr, out nint leafRec)
     {
+        leafRec = 0;
         if (!NativeUtil.IsUserPtr(serializer) || !NativeUtil.IsUserPtr(hdr))
             return string.Empty;
 
@@ -512,11 +606,105 @@ internal static unsafe class FieldSubstitution
             if (!NativeUtil.IsUserPtr(pInfo))
                 return string.Empty;
 
+            leafRec = rec;
             return NativeUtil.ReadShortAscii(*(nint*) (pInfo + 0x08), 48);
         }
         catch
         {
+            leafRec = 0;
             return string.Empty;
+        }
+    }
+
+    /// <summary>
+    ///     Classify a field's network encoder family from its leaf record.
+    ///
+    ///     The leaf record's +0x00 is the CNetworkSerializerFieldInfo*. The engine dispatches
+    ///     encoding through  encoderFn = *( *(fieldInfo+0x38) + 0x30 )  — fieldInfo+0x38 is the
+    ///     type-bucket handler object, slot[6] (+0x30) is its encode fn. We compare that fn pointer
+    ///     against the known encoder identities resolved from gamedata.
+    ///
+    ///     Verified (CS2 dedicated, 2026-06 build): EncodeInt32 0x3c8e70 (signed, zigzag varint),
+    ///     EncodeUInt32 0x3c8e90 (raw varint), EncodeFloat32 0x3ce8e0 (32-bit inline),
+    ///     EncodeBool 0x3c4c00 (1-bit inline). All dereferences are IsUserPtr-gated; any fault or
+    ///     unrecognised encoder yields Unsupported → caller passes through (never corrupts bits).
+    /// </summary>
+    private static FieldType Classify(nint leafRec)
+    {
+        if (!NativeUtil.IsUserPtr(leafRec))
+            return FieldType.Unsupported;
+
+        try
+        {
+            var fieldInfo = *(nint*) (leafRec + 0x00);
+            if (!NativeUtil.IsUserPtr(fieldInfo))
+                return FieldType.Unsupported;
+
+            var handler = *(nint*) (fieldInfo + 0x38);
+            if (!NativeUtil.IsUserPtr(handler))
+                return FieldType.Unsupported;
+
+            var encoderFn = *(nint*) (handler + 0x30);
+            if (!NativeUtil.IsUserPtr(encoderFn))
+                return FieldType.Unsupported;
+
+            // Compare against resolved identities (0 entries are skipped → that type disabled).
+            if (EncSignedAddr  != 0 && encoderFn == EncSignedAddr)  return FieldType.Int32;
+            if (EncUInt32Addr  != 0 && encoderFn == EncUInt32Addr)  return FieldType.UInt32;
+            if (EncFloat32Addr != 0 && encoderFn == EncFloat32Addr) return FieldType.Float32;
+            if (EncBoolAddr    != 0 && encoderFn == EncBoolAddr)    return FieldType.Bool;
+
+            return FieldType.Unsupported;
+        }
+        catch
+        {
+            return FieldType.Unsupported;
+        }
+    }
+
+    // ── Fixed-width bf_write emit (bool/float32) ──────────────────────────────────────────────
+    //
+    //  Replicates the engine's inline bf_write::WriteUBitLong (little-endian bit packing) verified
+    //  from EncodeFloat32 0x3ce8e0 / EncodeBool 0x3c4c00. bf_write layout:
+    //    [bf+0x00] uint32* data
+    //    [bf+0x0c] int     nMaxBits  (capacity)
+    //    [bf+0x10] int     iCurBit   (cursor)
+    //    [bf+0x20] byte    bOverflow
+    //  Writes the low `numBits` of `value` at the cursor, advancing it. On insufficient room it
+    //  sets the overflow flag exactly as the engine does and writes nothing — matching native
+    //  behaviour so a substitute can never run past the buffer.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static void WriteUBitLong(nint bf, uint value, int numBits)
+    {
+        var data    = *(uint**) (bf + 0x00);
+        var maxBits = *(int*)  (bf + 0x0C);
+        var cur     = *(int*)  (bf + 0x10);
+
+        if (maxBits - cur < numBits)
+        {
+            *(int*)  (bf + 0x10) = maxBits;
+            *(byte*) (bf + 0x20) = 1;
+            return;
+        }
+
+        if (numBits < 32)
+            value &= (1u << numBits) - 1u;
+
+        *(int*) (bf + 0x10) = cur + numBits;
+
+        var idx   = cur >> 5;
+        var shift = cur & 0x1F;
+
+        // Low dword: replace the `numBits` bits starting at `shift` (clamped to this dword).
+        var mask0 = (shift == 0) ? 0xFFFFFFFFu : (0xFFFFFFFFu << shift);
+        data[idx] = (data[idx] & ~mask0) | ((value << shift) & mask0);
+
+        // High dword: only when the field straddles a 32-bit boundary.
+        var bitsInFirst = 32 - shift;
+        if (numBits > bitsInFirst)
+        {
+            var mask1 = (1u << (numBits - bitsInFirst)) - 1u;
+            data[idx + 1] = (data[idx + 1] & ~mask1) | ((value >> bitsInFirst) & mask1);
         }
     }
 

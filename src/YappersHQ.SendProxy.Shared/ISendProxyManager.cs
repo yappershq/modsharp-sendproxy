@@ -32,6 +32,12 @@ public enum SendProxyResult
 //   entityIndex — from WDE ctx+0x34, -1 if not captured
 //   value       — ref int, pre-seeded with the registered uniform spoof value (or 0)
 //   returns     — true → substitute `value`; false → passthrough original
+//
+// The substitution is encoded with the FIELD's real network type (auto-detected): signed int
+// (int8/16/32/64) as zigzag varint, unsigned int as raw varint, bool as 1 bit (value != 0), and
+// float32 as 32 raw bits. For a float field, pass the bits via BitConverter.SingleToInt32Bits(f);
+// for a bool, pass 0/1. If the field's type can't be classified, the hook passes through untouched
+// (it never writes wrong-type bits). The single int carrier keeps the low-level API minimal.
 
 public delegate bool PerClientIntProxy(nint client, int entityIndex, ref int value);
 
