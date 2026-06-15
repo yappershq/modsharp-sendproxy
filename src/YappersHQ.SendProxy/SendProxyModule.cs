@@ -126,6 +126,12 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     int IEntityListener.ListenerVersion  => IEntityListener.ApiVersion;
     int IEntityListener.ListenerPriority => 0;
 
+    // Evict any entity-scoped registration left on an index BOTH when the entity is created and when it
+    // is deleted (mirrors TransmitManager): indices are reused, and a delete+create of the same index in
+    // one frame could otherwise leak a stale spoof onto the new entity for a frame.
+    void IEntityListener.OnEntityCreated(IBaseEntity entity)
+        => _manager.RemoveEntityRegistrations((int) entity.Index);
+
     void IEntityListener.OnEntityDeleted(IBaseEntity entity)
         => _manager.RemoveEntityRegistrations((int) entity.Index);
 
