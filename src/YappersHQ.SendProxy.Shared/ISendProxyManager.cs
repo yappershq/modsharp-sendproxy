@@ -215,4 +215,20 @@ public interface ISendProxyManager
     ///     Use this during plugin shutdown if you registered any callbacks.
     /// </summary>
     void UnhookAllPerClient();
+
+    // ── Uniform (all-entity) spoof helpers ───────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Set a uniform int spoof on (serializerName, fieldName) for ALL entities of that serializer.
+    ///     Every client will see <paramref name="value"/> for this field regardless of the real server value.
+    ///     Installs Phase-2 detours on first use.
+    /// </summary>
+    void SetUniformInt(string serializerName, string fieldName, int value);
+
+    /// <summary>
+    ///     Set a uniform int spoof scoped to a SPECIFIC entity index.
+    ///     Every client will see <paramref name="value"/> for that entity's field; other entities are unaffected.
+    ///     Installs Phase-2 detours on first use.
+    /// </summary>
+    void SetUniformIntForEntity(int entityIndex, string serializerName, string fieldName, int value);
 }

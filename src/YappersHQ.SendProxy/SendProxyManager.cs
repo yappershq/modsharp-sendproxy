@@ -355,6 +355,43 @@ internal sealed class SendProxyManager : ISendProxyManager
         _logger.LogInformation("SendProxy: all per-client registrations cleared, Phase-2 detours uninstalled");
     }
 
+    // ── Uniform spoof helpers ─────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public void SetUniformInt(string serializerName, string fieldName, int value)
+    {
+        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName))
+            return;
+
+        if (!EnsureDetours($"SetUniformInt(\"{serializerName}::{fieldName}\")"))
+            return;
+
+        FieldSubstitution.SetSpoof(serializerName, fieldName, value);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+
+        _logger.LogInformation(
+            "SendProxy: uniform int spoof registered (all entities) \"{Ser}::{Field}\" → {Value}",
+            serializerName, fieldName, value);
+    }
+
+    /// <inheritdoc/>
+    public void SetUniformIntForEntity(int entityIndex, string serializerName, string fieldName, int value)
+    {
+        if (entityIndex < 0) { _logger.LogWarning("SendProxy: SetUniformIntForEntity — entityIndex must be >= 0 (got {Idx})", entityIndex); return; }
+        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName))
+            return;
+
+        if (!EnsureDetours($"SetUniformIntForEntity(ent={entityIndex}, \"{serializerName}::{fieldName}\")"))
+            return;
+
+        FieldSubstitution.SetEntitySpoof(entityIndex, serializerName, fieldName, value);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+
+        _logger.LogInformation(
+            "SendProxy: uniform int spoof registered ent={Ent} \"{Ser}::{Field}\" → {Value}",
+            entityIndex, serializerName, fieldName, value);
+    }
+
     internal void Clear()
     {
         _hooks.Clear();

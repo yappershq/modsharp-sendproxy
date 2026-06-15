@@ -10,9 +10,9 @@ using YappersHQ.SendProxy.Shared;
 namespace YappersHQ.SendProxy.Example;
 
 /// <summary>
-///     Example consumer of <see cref="ISendProxyManager"/>. Demonstrates the SourceMod-style API:
-///     hook an entity's <c>m_iHealth</c> so clients see a fake value while the real health is
-///     unchanged. Console: <c>sp_example_fakehp &lt;entityIndex&gt; &lt;fakeValue&gt;</c>.
+///     Example consumer of <see cref="ISendProxyManager"/>. Demonstrates the full public API:
+///     uniform spoofs, per-entity spoofs, per-client callbacks, and vector hooks.
+///     All test/demo commands live here — Core has none.
 /// </summary>
 public sealed class ExampleModule : IModSharpModule
 {
@@ -53,8 +53,10 @@ public sealed class ExampleModule : IModSharpModule
             return;
         }
 
+        // Uniform spoof for ALL CCSPlayerPawn entities: sp_example_fakehp <value>.
+        // Uses SetUniformInt — every client sees this HP for every player pawn.
         _conVar.CreateServerCommand("sp_example_fakehp", OnFakeHp,
-            "Spoof m_iHealth for an entity (all-entity scope): sp_example_fakehp <entityIndex> <fakeValue>",
+            "Spoof m_iHealth for ALL CCSPlayerPawn entities (uniform, all clients): sp_example_fakehp <value>",
             ConVarFlags.Release);
 
         // Per-entity Phase-2 demo: uniform value for ONE specific entity, all clients see it.
@@ -74,7 +76,6 @@ public sealed class ExampleModule : IModSharpModule
 
         // QAngle demo: hook an eye-angle field on CCSPlayerPawn so every client sees a fixed pitch.
         // "m_angEyeAngles" is the CCSPlayerPawn qangle field that replicates the player's view angles.
-        // Use sp_example_fakeangle_off to remove.
         _conVar.CreateServerCommand("sp_example_fakeangle", OnFakeAngle,
             "Spoof CCSPlayerPawn::m_angEyeAngles for all clients to a fixed pitch: "
             + "sp_example_fakeangle <pitch> <yaw> <roll>",
@@ -82,18 +83,24 @@ public sealed class ExampleModule : IModSharpModule
         _conVar.CreateServerCommand("sp_example_fakeangle_off", OnFakeAngleOff,
             "Remove the per-client eye-angle hook installed by sp_example_fakeangle.",
             ConVarFlags.Release);
+
+        // Master off: remove all per-client registrations and uninstall Phase-2 detours.
+        _conVar.CreateServerCommand("sp_example_off", OnExampleOff,
+            "Remove all example hooks/spoofs and uninstall Phase-2 sub-detours.",
+            ConVarFlags.Release);
     }
 
     public void Shutdown()
     {
         _conVar.ReleaseCommand("sp_example_fakehp");
         _conVar.ReleaseCommand("sp_example_fakehp_entity");
-        // Remove per-client callbacks on shutdown to avoid dangling references.
-        _sendProxy?.UnhookAllPerClient();
         _conVar.ReleaseCommand("sp_example_perclienthp");
         _conVar.ReleaseCommand("sp_example_perclienthp_off");
         _conVar.ReleaseCommand("sp_example_fakeangle");
         _conVar.ReleaseCommand("sp_example_fakeangle_off");
+        _conVar.ReleaseCommand("sp_example_off");
+        // Remove per-client callbacks on shutdown to avoid dangling references.
+        _sendProxy?.UnhookAllPerClient();
     }
 
     private ECommandAction OnFakeHp(StringCommand command)
@@ -101,22 +108,16 @@ public sealed class ExampleModule : IModSharpModule
         if (_sendProxy is null)
             return ECommandAction.Stopped;
 
-        if (command.ArgCount < 2
-            || !int.TryParse(command.GetArg(1), out var entity)
-            || !int.TryParse(command.GetArg(2), out var fake))
+        if (command.ArgCount < 1 || !int.TryParse(command.GetArg(1), out var value))
         {
-            _logger.LogInformation("usage: sp_example_fakehp <entityIndex> <fakeValue>");
+            _logger.LogInformation("usage: sp_example_fakehp <value>");
             return ECommandAction.Stopped;
         }
 
-        // Every client will see `fake` for this entity's health; the real m_iHealth is untouched.
-        var ok = _sendProxy.HookInt(entity, "m_iHealth", (client, ent, prop, element, ref value) =>
-        {
-            value = fake;
-            return SendProxyResult.Changed;
-        });
-
-        _logger.LogInformation("Hooked m_iHealth on entity {Entity} -> {Fake} (registered={Ok})", entity, fake, ok);
+        // Uniform spoof: all clients see this value for every CCSPlayerPawn m_iHealth.
+        // Real server-side health is untouched.
+        _sendProxy.SetUniformInt("CCSPlayerPawn", "m_iHealth", value);
+        _logger.LogInformation("Uniform fakehp: CCSPlayerPawn::m_iHealth → {Value} for all clients (real HP unchanged)", value);
         return ECommandAction.Stopped;
     }
 
@@ -227,6 +228,16 @@ public sealed class ExampleModule : IModSharpModule
 
         _sendProxy.Unhook("CCSPlayerPawn", "m_angEyeAngles");
         _logger.LogInformation("Fake eye-angle hook removed");
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnExampleOff(StringCommand command)
+    {
+        if (_sendProxy is null)
+            return ECommandAction.Stopped;
+
+        _sendProxy.UnhookAllPerClient();
+        _logger.LogInformation("sp_example_off: all example hooks cleared, Phase-2 detours uninstalled");
         return ECommandAction.Stopped;
     }
 }
