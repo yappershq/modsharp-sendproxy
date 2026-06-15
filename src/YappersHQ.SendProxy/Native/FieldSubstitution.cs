@@ -332,6 +332,21 @@ internal static unsafe class FieldSubstitution
         _encodeInt32Addr = encodeInt32Addr;
     }
 
+    /// <summary>
+    ///     Build the encoder type map now (idempotent) so classification is ready — and diagnosable — at
+    ///     load, instead of lazily on first registration. The detours still install lazily.
+    /// </summary>
+    public static void PrebuildEncoderMap(ILogger logger)
+    {
+        if (_encoderTypes is null)
+        {
+            lock (_encoderTypesLock)
+            {
+                _encoderTypes ??= BuildEncoderTypeMap(logger);
+            }
+        }
+    }
+
     public static bool Install(InterfaceBridge bridge, ILogger logger)
     {
         _logger = logger;
@@ -505,7 +520,7 @@ internal static unsafe class FieldSubstitution
     private static void GetBitRangeHook(nint pathOut, nint table, uint registryIndex)
     {
         ((delegate* unmanaged[Cdecl]<nint, nint, uint, void>) _getBitRangeTrampoline)(pathOut, table, registryIndex);
-        _currentFieldPath = pathOut;
+        _currentFieldPath = NativeUtil.IsUserPtr(pathOut) ? pathOut : 0;
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -517,11 +532,22 @@ internal static unsafe class FieldSubstitution
             return CallOriginal(dst, src, bitcount);
         }
 
+        // Consume-once: WriteFieldList buffers the path and value streams separately, so a value-copy is
+        // not guaranteed to be preceded by a matching GetBitRange. Take the captured path and clear it
+        // immediately — a copy without a fresh path passes through rather than reusing a STALE path
+        // (which would resolve against the wrong field and walk into unmapped memory → fatal AV).
+        var pathPtr = _currentFieldPath;
+        _currentFieldPath = 0;
+        if (!NativeUtil.IsUserPtr(pathPtr))
+        {
+            return CallOriginal(dst, src, bitcount);
+        }
+
         try
         {
             var serPtr    = _currentSerializer;
             var serName   = NativeUtil.ReadShortAscii(*(nint*) (serPtr + 0x00), 48);
-            var fieldName = ResolveFieldName(serPtr, _currentFieldPath, out var leafRec);
+            var fieldName = ResolveFieldName(serPtr, pathPtr, out var leafRec);
             if (fieldName.Length == 0)
             {
                 return CallOriginal(dst, src, bitcount);
@@ -828,8 +854,10 @@ internal static unsafe class FieldSubstitution
             return string.Empty;
         }
 
+        // Path levels. CFieldPath is at most 3 deep (§9a); a larger/garbage count means a stale or bogus
+        // path — bail rather than walk it.
         var count = *(short*) (hdr + 0x18);
-        if (count <= 0 || count > 7)
+        if (count < 1 || count > 3)
         {
             return string.Empty;
         }
@@ -848,41 +876,53 @@ internal static unsafe class FieldSubstitution
             idxArr = hdr;
         }
 
-        var idx0 = *(short*) idxArr;
-        if (idx0 == 0x7FFF)
-        {
-            return string.Empty;
-        }
+        var serArr = serializer;
+        var rec    = (nint) 0;
 
-        var arr0 = *(nint*) (serializer + 0x30);
-        if (!NativeUtil.IsUserPtr(arr0))
-        {
-            return string.Empty;
-        }
-
-        var rec = arr0 + idx0 * 0x2E;
-
-        for (var k = 1; k < count; k++)
+        for (var k = 0; k < count; k++)
         {
             var idxK = *(short*) (idxArr + k * 2);
             if (idxK == 0x7FFF)
             {
+                if (k == 0)
+                {
+                    return string.Empty;
+                }
+
                 break;
             }
 
-            var child = *(nint*) (rec + 0x08);
-            if (!NativeUtil.IsUserPtr(child))
+            // For levels > 0, descend into the child serializer of the current record first.
+            if (k > 0)
+            {
+                var child = *(nint*) (rec + 0x08);
+                if (!NativeUtil.IsUserPtr(child))
+                {
+                    return string.Empty;
+                }
+
+                serArr = child;
+            }
+
+            // Bound the index against the serializer's field-array length so a stale/garbage index can
+            // never deref off the array (the fatal-AV path). The length is the CUtlVector size that
+            // precedes the data pointer at +0x30; fall back to a hard cap if it reads implausibly.
+            if (!IndexInBounds(serArr, idxK))
             {
                 return string.Empty;
             }
 
-            var arrK = *(nint*) (child + 0x30);
-            if (!NativeUtil.IsUserPtr(arrK))
+            var arr = *(nint*) (serArr + 0x30);
+            if (!NativeUtil.IsUserPtr(arr))
             {
                 return string.Empty;
             }
 
-            rec = arrK + idxK * 0x2E;
+            rec = arr + idxK * 0x2E;
+            if (!NativeUtil.IsUserPtr(rec))
+            {
+                return string.Empty;
+            }
         }
 
         var pInfo = *(nint*) (rec + 0x00);
@@ -894,6 +934,27 @@ internal static unsafe class FieldSubstitution
         leafRec = rec;
 
         return NativeUtil.ReadShortAscii(*(nint*) (pInfo + 0x08), 48);
+    }
+
+    // Largest plausible field-array index — backstop when the array length reads implausibly. A serializer
+    // never has anywhere near this many fields, and arr + 4096*0x2E (~0x2C000) stays within the array's
+    // mapped region, so a bounded-but-wrong index reads garbage (→ no match → passthrough) instead of
+    // faulting on an unmapped page.
+    private const int MaxFieldArrayIndex = 4096;
+
+    // True if idx is a valid index into serializer's field array. The CUtlVector element count sits just
+    // before the data pointer (count @ serializer+0x28, data @ +0x30); use it when sane, else the cap.
+    private static bool IndexInBounds(nint serializer, short idx)
+    {
+        if (idx < 0)
+        {
+            return false;
+        }
+
+        var count = *(int*) (serializer + 0x28);
+        var limit = (count > 0 && count <= MaxFieldArrayIndex) ? count : MaxFieldArrayIndex;
+
+        return idx < limit;
     }
 
     // Classify the field's encoder family by its live dispatch fn (slot 0 of the dispatch object at
@@ -1007,6 +1068,13 @@ internal static unsafe class FieldSubstitution
             {
                 var bucket  = BucketIndices[i];
                 var handler = _bucketAddrs[i];
+                var rawCount = NativeUtil.IsUserPtr(_registryAddr) ? *(int*) (_registryAddr + bucket * 16 + 0x08) : -1;
+                var name0   = NativeUtil.IsUserPtr(handler) ? NativeUtil.ReadShortAscii(*(nint*) handler, 32) : "<bad>";
+                var fn0     = NativeUtil.IsUserPtr(handler) ? *(nint*) (handler + 0x30) : 0;
+                logger.LogInformation(
+                    "FieldSubstitution diag: bucket={B} handler=0x{H:X} userPtr={U} rawCount={C} entry0.name=\"{N}\" entry0.fn=0x{F:X} (registry=0x{R:X})",
+                    bucket, handler, NativeUtil.IsUserPtr(handler), rawCount, name0, fn0, _registryAddr);
+
                 if (!NativeUtil.IsUserPtr(handler))
                 {
                     continue;

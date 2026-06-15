@@ -103,6 +103,11 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.SharpModuleManager.RegisterSharpModuleInterface<ISendProxyManager>(
             this, ISendProxyManager.Identity, _manager);
 
+        // Build the encoder classification map eagerly at load (resolution was set in Init; the
+        // substitution detours still install lazily on first registration) so classification is ready
+        // and diagnosable from the boot log.
+        FieldSubstitution.PrebuildEncoderMap(_logger);
+
         _bridge.EntityManager.InstallEntityListener(this);
     }
 
