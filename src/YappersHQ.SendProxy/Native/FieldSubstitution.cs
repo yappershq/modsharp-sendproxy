@@ -1012,13 +1012,16 @@ internal static unsafe class FieldSubstitution
             return FieldType.Unsupported;
         }
 
-        var handler = *(nint*) (fieldInfo + 0x38);
-        if (!NativeUtil.IsUserPtr(handler))
+        // The encode fn is vtable SLOT 0 of the dispatch object at fieldInfo+0x38 (= *(*(fieldInfo+0x38))),
+        // the same address UniformEncoderHook keys on and the map is built from. (Reading +0x30 here — the
+        // registry-entry fn offset — was the bug that made every per-client field classify Unsupported.)
+        var dispatch = *(nint*) (fieldInfo + 0x38);
+        if (!NativeUtil.IsUserPtr(dispatch))
         {
             return FieldType.Unsupported;
         }
 
-        var encoderFn = *(nint*) (handler + 0x30);
+        var encoderFn = *(nint*) dispatch;
         if (!NativeUtil.IsUserPtr(encoderFn))
         {
             return FieldType.Unsupported;
