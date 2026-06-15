@@ -19,6 +19,7 @@
 
 using System.Numerics;
 using Sharp.Shared.GameEntities;
+using Sharp.Shared.Objects;
 
 namespace YappersHQ.SendProxy.Shared;
 
@@ -152,6 +153,33 @@ public interface ISendProxyManager
 
     /// <inheritdoc cref="SetUniform(IBaseEntity, string, string, int)"/>
     void SetUniform(IBaseEntity entity, string serializerName, string fieldName, byte[] value);
+
+    // -- SendFake (one-shot push to a single client) ------------------------------------------------
+
+    /// <summary>
+    ///     Push <paramref name="value"/> for <paramref name="serializerName"/>::<paramref name="fieldName"/>
+    ///     on <paramref name="entity"/> to a single <paramref name="client"/> on the next snapshot, then
+    ///     stop — without changing real server state. Unlike <see cref="Hook(IBaseEntity, string, string, PerClientIntProxy)"/>
+    ///     this does not persist: it fires exactly once for that client. The field is force-dirtied so it
+    ///     re-transmits immediately even if its real value did not change, which is the intended use —
+    ///     "send a fake now, optionally <c>Hook</c> afterwards to keep it faked".
+    /// </summary>
+    void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, int value);
+
+    /// <inheritdoc cref="SendFake(IGameClient, IBaseEntity, string, string, int)"/>
+    void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, float value);
+
+    /// <inheritdoc cref="SendFake(IGameClient, IBaseEntity, string, string, int)"/>
+    void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, bool value);
+
+    /// <inheritdoc cref="SendFake(IGameClient, IBaseEntity, string, string, int)"/>
+    void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, Vector3 value);
+
+    /// <inheritdoc cref="SendFake(IGameClient, IBaseEntity, string, string, int)"/>
+    void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, string value);
+
+    /// <inheritdoc cref="SendFake(IGameClient, IBaseEntity, string, string, int)"/>
+    void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, byte[] value);
 
     // -- Removal ------------------------------------------------------------------------------------
 

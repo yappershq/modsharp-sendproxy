@@ -141,6 +141,7 @@ public sealed class ExampleModule : IModSharpModule
             // Presets — common one-liners built on the same API.
             registry.RegisterAdminCommand("sp_fakehp",   OnFakeHp,   [SendProxyPermission]);
             registry.RegisterAdminCommand("sp_fakename", OnFakeName, [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_sendfake", OnSendFake, [SendProxyPermission]);
 
             // One canned real-use demo per encoder bucket (sp_encoder1..7) + a single off switch.
             registry.RegisterAdminCommand("sp_encoder1", OnEncoder1, [SendProxyPermission]);
@@ -339,6 +340,7 @@ public sealed class ExampleModule : IModSharpModule
         Reply(issuer, "  sp_set    <ser> <field> <type> <value...>   uniform (all clients)");
         Reply(issuer, "  sp_setpc  <ser> <field> <type>              per-client (value varies per recipient)");
         Reply(issuer, "  sp_setent <idx> <ser> <field> <type> <val>  scoped to one entity");
+        Reply(issuer, "  sp_sendfake <value>                         one-shot fake HUD HP to you only (force-resend)");
         Reply(issuer, "  sp_unset  <ser> <field>   |   sp_clear   |   sp_help");
         Reply(issuer, "types -> encoder bucket: int=b1  uint=b2  vec=b3(qangle/vector/coord/quantized)  float=b4  string=b5  bytes=b6  bool=b7");
         Reply(issuer, "examples:");
@@ -391,6 +393,39 @@ public sealed class ExampleModule : IModSharpModule
         var name = RestOfArgs(command, 1);
         sp.SetUniform("CCSPlayerController", "m_iszPlayerName", name);
         Reply(issuer, $"all clients now see \"{name}\" as every player's name");
+    }
+
+    // sp_sendfake <n> — one-shot: push fake HUD HP to YOU only, once. Unlike sp_setpc/sp_fakehp this does
+    // not persist — it force-dirties m_iPawnHealth so it re-transmits immediately and fakes that single
+    // send. Use it to push a value before deciding to Hook. Demonstrates the per-client SendFake path.
+    private void OnSendFake(IGameClient? issuer, StringCommand command)
+    {
+        if (_sendProxy is not { } sp)
+        {
+            return;
+        }
+
+        if (issuer is null)
+        {
+            return;
+        }
+
+        if (command.ArgCount < 1 || !int.TryParse(command.GetArg(1), out var value))
+        {
+            Reply(issuer, "usage: sp_sendfake <value>   (one-shot fake HUD HP to you only)");
+
+            return;
+        }
+
+        if (issuer.GetPlayerController() is not { } controller)
+        {
+            Reply(issuer, "sp_sendfake: could not resolve your controller entity");
+
+            return;
+        }
+
+        sp.SendFake(issuer, controller, "CCSPlayerController", "m_iPawnHealth", value);
+        Reply(issuer, $"one-shot: you should see {value} HP on the next update (real HP unchanged, fires once)");
     }
 
     #endregion
