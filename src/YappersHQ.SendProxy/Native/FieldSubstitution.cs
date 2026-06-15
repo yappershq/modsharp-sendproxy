@@ -259,6 +259,20 @@ internal static unsafe class FieldSubstitution
         }
     }
 
+    // True if any registration exists for this field name (any serializer/entity). Diagnostic helper.
+    private static bool IsFieldNameRegistered(string field)
+    {
+        foreach (var key in _registry.Keys)
+        {
+            if (key.field == field)
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
     public static bool IsHooked(string ser, string field)
     {
         foreach (var key in _registry.Keys)
@@ -561,7 +575,19 @@ internal static unsafe class FieldSubstitution
             var client      = RecipientCapture.CurrentClient;
             var entityIndex = _currentEntityIndex;
 
-            if (!TryGetRegistration(serName, fieldName, entityIndex, out var reg))
+            var hasReg = TryGetRegistration(serName, fieldName, entityIndex, out var reg);
+
+            // Diagnostic: for any field whose NAME is registered, log the decision path so a bail between
+            // "field seen" and the emit is visible (reg-key match? classify type? per-client client?).
+            if (_substLogCount < MaxSubstLog && _logger is { } pcd && IsFieldNameRegistered(fieldName))
+            {
+                Interlocked.Increment(ref _substLogCount);
+                pcd.LogInformation(
+                    "PCDIAG ser=\"{S}\" field=\"{F}\" ent={E} client=0x{C:X} hasReg={H} type={T}",
+                    serName, fieldName, entityIndex, client, hasReg, hasReg ? Classify(leafRec) : FieldType.Unsupported);
+            }
+
+            if (!hasReg)
             {
                 return CallOriginal(dst, src, bitcount);
             }
