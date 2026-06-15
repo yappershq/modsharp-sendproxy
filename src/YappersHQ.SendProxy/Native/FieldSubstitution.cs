@@ -94,12 +94,6 @@ internal static unsafe class FieldSubstitution
     private static int _logCount;
     private const  int MaxLogCount = 20;
 
-    // Diagnostic: unconditional early log (first 50 value-copy calls in any non-Off mode).
-    // Logs BEFORE _spoofs.TryGetValue so we see every call regardless of match.
-    // Remove once field-index semantics are confirmed.
-    private static int _vcopyDiagCount;
-    private const  int VcopyDiagMax = 50;
-
     // ── Hooks ────────────────────────────────────────────────────────────────
 
     // GetBitRange hook: captures field index (3rd arg) + serializer ptr (from WFL-shim).
@@ -275,27 +269,6 @@ internal static unsafe class FieldSubstitution
             var token = _currentFieldIndex;
             DecodeToken(token, out var i0, out var i1, out var i2);
             var fieldName = ResolveFieldName(serPtr, token, i0, i1, i2);
-
-            // ── Unconditional diagnostic (first VcopyDiagMax calls) ────────────
-            // BEFORE any early-exit so we see every call regardless of match.
-            // Logs token, decoded path, and resolved leaf name for verification.
-            // Remove once field-index semantics are confirmed.
-            {
-                var diagN = Interlocked.Increment(ref _vcopyDiagCount);
-                if (diagN <= VcopyDiagMax && _logger is { } diagLog)
-                {
-                    diagLog.LogInformation(
-                        "VCOPY#{N} tid={Tid} ser=\"{SerName}\" token=0x{Token:X} path=[{I0},{I1},{I2}] name=\"{FieldName}\" bits={Bits} client=0x{Client:X}",
-                        diagN,
-                        Environment.CurrentManagedThreadId,
-                        serName,
-                        token,
-                        i0, i1, i2,
-                        fieldName,
-                        bitcount,
-                        RecipientCapture.CurrentClient);
-                }
-            }
 
             if (fieldName.Length == 0)
                 goto Passthrough;

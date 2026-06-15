@@ -444,3 +444,126 @@ which gates *presence* (who receives the field), never its value.
 Next RE step if (1)/(2) is chosen: decompile the threaded pack job (`N16CHLTVServerAsync22CSend
 ClientMessagesJobE` / `PackEntities_Normal`) to find where it can be driven once per group with a
 `thread_local` client/group set, then read in the existing `0x3c8e70` encoder hook.
+
+---
+
+## 15. Phase 2 — per-client VALUE (REVISES §14: substitution at the per-field copy WORKS)
+
+> **§14's "impossible" verdict was about re-running the *encoder*** — that remains true (the per-client
+> send copies pre-encoded bits, it never invokes `EncodeField`/`0x3c8e70`). But you do **not** need the
+> encoder to re-run. The per-field bit-**copy** in the send loop both (a) runs once **per client** and
+> (b) knows the field identity — so a per-client value can be injected by **substituting at the copy**,
+> not by re-encoding. This is the working Phase-2 mechanism; verified end-to-end in verify mode
+> (recipient captured, `m_iHealth` resolved, cursor math correct, zero corruption).
+
+All RVAs are **file-vaddr**; Ghidra image base = file-vaddr + 0x100000. Raw decompiles in
+`re-dumps/` (esp. `sp_wfl.out`, `sp_bitprims.out`, `wde.out`/`wde.asm`, `perclient.out`); Ghidra
+scripts in `ghidra_scripts/` (`SendProxyWDE.java`, `SendProxyPerClient.java`, `SPWriteFieldList.java`,
+`SPBitPrims.java`, etc.).
+
+### 15a. The per-client send path
+
+| Function | RVA (file) | Role |
+|---|---|---|
+| `CNetworkGameServer::SendClientMessages` | engine2 `0x7a7280` | Pack the snapshot **once** (shared), then loop clients. |
+| `CNetworkGameServer::PerClientEncode` | engine2 `0x8fae40` | The per-client encode entry. **`CServerSideClient*` in `rsi`** = the recipient. |
+| `CNetworkGameServerBase::WriteDeltaEntity_Internal` | engine2 `0x6d15c0` | Per-client, per-entity delta write. **Parallel across ~6 worker threads.** |
+| `CFlattenedSerializer::WriteFieldList` | nsys `0x343b60` | The per-field copy loop. |
+
+- **`SendClientMessages`** packs all entities once into the shared `CFrameSnapshot`, then writes each
+  client's delta from that single packed buffer. The encode happened during the shared pack
+  (`EncodeField` with `rsi=0`) — it is **not** re-run per client.
+- **`PerClientEncode`** (`0x8fae40`) is the per-client entry; the recipient `CServerSideClient*` arrives
+  in **`rsi`**. We detour it and stash the recipient into a **`[ThreadStatic]`** (`RecipientCapture.cs`),
+  cleared on exit. Everything that runs downstream on that worker thread (including `WriteFieldList` and
+  the bit-copy) can read it without threading the client through every call frame.
+- **`WriteDeltaEntity_Internal`** (`0x6d15c0`) is confirmed **per-client and parallel**: the
+  `sp_wdeprobe` capture saw the same entity written once per client into distinct ctx/`bf_write` objects,
+  across ~6 worker threads (tid 18–23). ctx (`rsi`): `+0x34` entIdx, `+0x88` `bf_write`, `+0x90`
+  from-snap, `+0x98` to-snap. **Implication:** per-client value substitution belongs in *this* path —
+  it rides the existing per-client write, so there is **no N× re-pack**. Thread-safety comes from
+  per-call **locals** (never the shared Phase-1 `_scratch`, which breaks under 6 threads); only the
+  captured client is `[ThreadStatic]`, and the serializer config is read-only.
+
+**Why per-client VALUE can't be done by re-pack and IS done at the per-field copy:** the snapshot is a
+single shared, entity-keyed pack produced by parallel worker threads; forcing it to vary per client
+means re-running the encoders N× (§14 options 1/2). Substituting at the per-field **copy** avoids all of
+that — the copy already runs per client, already has the recipient (via `PerClientEncode`/`rsi`), and
+already has field identity (below). We rewrite that one field's bits in the client's own stream.
+
+### 15b. The substitution mechanism (inside `WriteFieldList`)
+
+`WriteFieldList` has a **two-stream layout**: field values are buffered into an intermediate
+`bf_write` separately from the field-path stream, and the value buffer is appended at the end. Because
+the value stream is decoupled from the path stream, a **variable-length** substitution (e.g. a varint
+whose byte width differs from the original) is **safe** — it shifts only within the value buffer.
+
+Per changed field the loop calls two functions back-to-back:
+
+| Function | RVA (file) | Role |
+|---|---|---|
+| `GetBitRange` | nsys `0x326260` | Resolves the changed-field index → `[startBit,endBit)` in the source. **3rd arg = the field token.** Fires immediately before each copy → the detour captures the token. |
+| `BitCopyPrimitive` (`FUN_00500b70`) | nsys `0x400b70` | **The per-field copy primitive — the hook point.** `byte copy(bf_write* dst, bf_read* src, uint bitcount)`; rdi=dst, rsi=src, rdx=bitcount. The `bf_write` bit cursor is at **`*(int*)(dst + 0x10)`**. It is a pure bulk copy — **no field identity of its own**, which is why identity must come from `GetBitRange`'s captured token + the serializer on the `WriteFieldList` entry. |
+| `VarintWriter` (`FUN_00500890`) | nsys `0x400890` | The varint primitive used to emit our substitute. `void write(bf_write* dst, uint32 zigzag)`; rdi=dst, rsi=zigzag. **Self-zigzag**: `zigzag = (uint)((v<<1)^(v>>31))`. |
+
+**The save-cursor / call-original / rewind / write sequence** (in the `BitCopyPrimitive` detour, Fake
+mode):
+
+1. Save the dst cursor: `savedCursor = *(int*)(dst + 0x10)`.
+2. Call the original copy (advances both src and dst cursors, writes the real bits).
+3. Rewind: `*(int*)(dst + 0x10) = savedCursor`.
+4. Emit our value: `VarintWriter(dst, zigzag(fake))` — overwriting the just-copied real bits with the
+   substitute starting at the saved cursor.
+
+In **Verify** mode the original is called normally (no rewind) and only the cursor math is logged
+(`cursorBefore`/`cursorAfter`), proving field detection + cursor reads with zero output change. Three
+detours cooperate: a `WriteFieldList`-entry shim stashes the serializer (`rdi`), `GetBitRange` captures
+the field token, and `BitCopyPrimitive` performs the substitution — all driven off the `[ThreadStatic]`
+recipient from `PerClientEncode`.
+
+### 15c. The `CFieldPath` token
+
+`GetBitRange`'s 3rd argument is a packed **`CFieldPath`** — a 3-level nested path with a **−1 bias** per
+level and an `0x7FF` mask:
+
+```
+token = ((i0+1) << 22) | ((i1+1) << 11) | (i2+1)        // pack
+i0 = ((token >> 22) & 0x7FF) - 1                          // decode
+i1 = ((token >> 11) & 0x7FF) - 1
+i2 = ( token        & 0x7FF) - 1                          // -1 ⇒ level absent
+```
+
+Examples: `0x02810008` decodes to `[9, 31, 7]`; `0x01400000` decodes to `[4]` (i1 = i2 = −1, absent).
+`0xFFFFFFFF` is the root sentinel (skip); `0` is "all absent" (skip).
+
+### 15d. The flattened-serializer field-array layout (walking the path)
+
+To resolve a token to a leaf field name, walk the serializer's field array (distinct from the per-class
+`CNetworkSerializerClassInfo` records `sp_dump` reads via the entity vtable — see §11(b)):
+
+- **array base** = `*(serializer + 0x30)` (a pointer stored at `+0x30`; deref once).
+- **records are INLINE**, stride **`0x2E`** bytes (not a pointer array): `record_i = base + i*0x2E`.
+- `record + 0x00` = `CNetworkSerializerFieldInfo*` (the **leaf** fieldInfo).
+- `record + 0x08` = child `CFlattenedSerializer*` (for **descent** into a nested level).
+- **leaf name** = `*(*(record + 0x00) + 0x08)` → `char*` (the `fieldInfo+0x08` name from §11).
+
+Descent: at level 0 take `rec = base + i0*0x2E`; if `i1 ≥ 0`, `child = *(rec+0x08)`,
+`base = *(child+0x30)`, `rec = base + i1*0x2E`; same again for `i2`. The leaf's name is read off
+`*(rec+0x00)+0x08`. (Source: `encodefield.out` field-array refs; impl in `FieldSubstitution.cs`.)
+
+### 15e. Known limit
+
+**Nested-path descent still resolves empty for some fields** — when `i1`/`i2 ≥ 0`, the child-serializer
+descent (`*(rec+0x08)` / `*(child+0x30)`) does not yet land on the right record for every field
+(observed ~43/50 nested value-copies resolving to an empty name). **Top-level fields resolve cleanly**
+(`m_iHealth`, `m_ArmorValue`, `m_nTickBase`), which is why those are the working Phase-1/Phase-2 targets.
+The descent offsets need more RE before nested fields can be substituted reliably.
+
+### 15f. Status & artifacts
+
+Verify mode is confirmed (`SUBST-VERIFY` fired 8× for `CCSPlayerPawn::m_iHealth`: recipient captured,
+`before=0`/`after=16`, `bitcount=16`, no desync). The live **Fake** confirmation (`sp_fakehp2` actually
+changing displayed HP per client) is still pending. Implementation:
+`Native/FieldSubstitution.cs` (+ `RecipientCapture.cs`, `WriteFieldProbe.cs`); commands `sp_sub_verify`
+/ `sp_fakehp2` / `sp_sub_off`. Raw decompiles preserved in `re-dumps/` (`sp_wfl.out` is the key
+`WriteFieldList` reference); Ghidra scripts in `ghidra_scripts/`.
