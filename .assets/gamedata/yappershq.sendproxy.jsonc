@@ -88,8 +88,10 @@
     // → absolute address of the table (confirmed unique in networksystem, resolves 0x45f360).
     "CFlattenedSerializer::EncoderRegistry": {
       "library": "networksystem",
-      "linux": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28",
-      "factory": "+3 r"
+      "linux": {
+        "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28",
+        "factory": "+3 r"
+      }
     }
   }
 }
