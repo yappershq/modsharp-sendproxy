@@ -40,6 +40,7 @@
   <PropertyGroup Condition="'$(IsModuleProject)' == 'true'">
     <OutputPath>$(MSBuildThisFileDirectory)..\.build\modules\$(MSBuildProjectName)\</OutputPath>
     <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <EnableDynamicLoading>true</EnableDynamicLoading>
   </PropertyGroup>
 
   <ItemGroup>

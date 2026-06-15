@@ -6,84 +6,73 @@
 // FindPattern resolves the sig at runtime — sigs are position-independent. Re-derive on engine
 // updates with tools/ (nosoop makesig); full derivation in docs/REVERSE_ENGINEERING.md.
 //
+// An entry may instead declare "base" + a "factory" op-chain to derive its address from another
+// resolved entry. The engine factory ops (Engine/src/gamedata.cpp): "r" rip-relative resolve,
+// "d" dereference, "+N"/"-N" pointer arithmetic, composed left-to-right. This is how each encoder
+// bucket handler below is derived declaratively from the resolved EncoderRegistry table base —
+// classification compares against these gamedata-resolved addresses, not against runtime strings.
+//
 // All addresses below are file-vaddr RVAs (Ghidra image base for these .so = file-vaddr + 0x100000).
 {
   "Addresses": {
-    // ── Phase 1: uniform value spoof (shared snapshot pack) ──────────────────────────────
-    // CFlattenedSerializer::EncodeField — per-field encoder dispatcher (the Source1 m_pProxyFn
-    // analog). RVA 0x3334e0. Fires once during the shared pack (rsi=0, no client).
     "CFlattenedSerializer::EncodeField": {
       "library": "networksystem",
       "linux": "55 48 89 E5 41 57 49 89 D7 41 56 41 55 41 54 41 BC 01 00 00 00"
     },
-    // CFlattenedSerializer::EncodeInt32 — zigzag+varint int32 encoder, slot[6] of the integer
-    // field-type bucket in the encoder registry. RVA 0x3c8e70. Value read from rcx.
     "CFlattenedSerializer::EncodeInt32": {
       "library": "networksystem",
       "linux": "48 8B 01 55 48 89 E5 48 8D 34 00"
     },
 
-    // ── Phase 2: per-client value substitution (engine2 send path) ───────────────────────
-    // CNetworkGameServer::SendClientMessages — per-tick send loop. RVA 0x7a7280.
     "CNetworkGameServer::SendClientMessages": {
       "library": "engine",
       "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 41 56 41 55 41 54 53 89 F3"
     },
-    // CNetworkGameServer::PerClientEncode — per-client encode entry; CServerSideClient* in rsi.
-    // RVA 0x8fae40. Captured into a [ThreadStatic] recipient for substitution keying.
     "CNetworkGameServer::PerClientEncode": {
       "library": "engine",
       "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 4C 8D BD ? ? ? ? 41 56 4C 8D 35"
     },
-    // CNetworkGameServerBase::WriteDeltaEntity_Internal — per-entity per-client delta write.
-    // RVA 0x6d15c0. ctx(rsi): +0x34 entIdx, +0x88 bf_write, +0x90 from-snap, +0x98 to-snap.
     "CNetworkGameServerBase::WriteDeltaEntity_Internal": {
       "library": "engine",
       "linux": "55 48 89 E5 41 57 41 56 41 55 41 54 49 89 F4 53 48 81 EC 28 01 00 00"
     },
-    // CFlattenedSerializer::WriteFieldList — per-field copy loop (RVA 0x343b60). rdi=serializer,
-    // rcx=dst bf_write, param_8=changed-field list. 9 args (6 reg + 3 stack). Values accumulate in
-    // an intermediate buffer (appended at end); field-paths stream separately → variable-length
-    // value substitution is safe.
     "CFlattenedSerializer::WriteFieldList": {
       "library": "networksystem",
       "linux": "55 48 8D 05 ? ? ? ? 45 31 DB 66 0F EF C0 48 89 E5 41 57 41 56 4C 8D"
     },
-    // CFlattenedSerializer::GetBitRange — resolves field index → [startBit,endBit) in the source;
-    // fires immediately before each value copy. RVA 0x326260. 3rd arg = field index (captured to
-    // identify the field being copied).
     "CFlattenedSerializer::GetBitRange": {
       "library": "networksystem",
       "linux": "55 48 89 E5 53 48 89 FB 48 83 EC 08 83 FA FF 74"
     },
-    // CFlattenedSerializer::BitCopyPrimitive — the per-field value bit-copy (the substitution point).
-    // RVA 0x400b70. Sig (bf_write* dst, bf_read* src, uint bitcount). dst+0x10 = bit cursor.
     "CFlattenedSerializer::BitCopyPrimitive": {
       "library": "networksystem",
       "linux": "55 48 89 F0 41 89 D0 48 89 E5 41 57 41 56 41 55"
     },
-    // ── Phase-2b: encoder registry table (runtime classification) ────────────────────────
-    // CFlattenedSerializer::EncoderRegistry — the 8-bucket descriptor table in networksystem's
-    // .data section (file-vaddr 0x45f360). Layout: 8 × 16-byte buckets {handler*(+0x00), int count(+0x08)}.
-    // Each handler → array of `count` encoder entries (stride 0x80):
-    //   slot[0] (+0x00) = char* encoder-name
-    //   slot[6] (+0x30) = encode fn ptr
-    // At runtime, FieldSubstitution walks this table once (lazy, on Install) to build a
-    // fn→FieldType dictionary. Classify() then does a single dict lookup instead of hardcoded comparisons.
-    //
-    // Sig is the table-load lea in the registry initialiser:
-    //   lea rax, [rip+disp32]   ; rax = &table
-    //   add rax, rdx            ; rdx = bucket index * 16
-    //   movsxd r12, [rax+0x08] ; count = *(int*)(bucket+8)
-    //   mov r13, [rax]          ; handler = *(nint*)(bucket)
-    // factory "+3 r" skips the 3-byte opcode (48 8D 05) to the rel32 displacement, then RIP-resolves
-    // → absolute address of the table (confirmed unique in networksystem, resolves 0x45f360).
+
+    // Encoder registry table base — the 8-bucket descriptor table in networksystem's .data section.
+    // Layout: 8 x 16-byte buckets { handler*(+0x00), int count(+0x08) }. Each handler points at an
+    // array of encoder entries (stride 0x80): entry+0x00 = char* name, entry+0x30 = encode fn ptr.
+    // Sig is the table-load lea in the registry initialiser; factory "+3 r" skips the lea opcode and
+    // RIP-resolves the rel32 displacement to the table's absolute address.
     "CFlattenedSerializer::EncoderRegistry": {
       "library": "networksystem",
       "linux": {
         "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28",
         "factory": "+3 r"
       }
-    }
+    },
+
+    // Per-bucket handler array base addresses, derived declaratively from EncoderRegistry:
+    //   handler[b] = *(EncoderRegistry + b*16)
+    // factory "+{b*16} d": offset to bucket b's 16-byte slot, then dereference the handler pointer.
+    // FieldSubstitution uses these gamedata-resolved bases to anchor its one-time encoder enumeration
+    // (instead of an in-C# RegistryAddr + b*16 stride assumption) and to map each discovered encoder
+    // entry to its FieldType by bucket. Bucket semantics (see docs/REVERSE_ENGINEERING.md §10):
+    // b1 signed int, b2 unsigned int, b3 qangle/vector/quantized-float family, b4 float32, b7 bool.
+    "CFlattenedSerializer::EncoderBucket1": { "base": "CFlattenedSerializer::EncoderRegistry", "linux": { "factory": "+16 d" } },
+    "CFlattenedSerializer::EncoderBucket2": { "base": "CFlattenedSerializer::EncoderRegistry", "linux": { "factory": "+32 d" } },
+    "CFlattenedSerializer::EncoderBucket3": { "base": "CFlattenedSerializer::EncoderRegistry", "linux": { "factory": "+48 d" } },
+    "CFlattenedSerializer::EncoderBucket4": { "base": "CFlattenedSerializer::EncoderRegistry", "linux": { "factory": "+64 d" } },
+    "CFlattenedSerializer::EncoderBucket7": { "base": "CFlattenedSerializer::EncoderRegistry", "linux": { "factory": "+112 d" } }
   }
 }

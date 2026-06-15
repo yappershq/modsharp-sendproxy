@@ -324,6 +324,17 @@ encoder: it name-matches a field's encoder name against the registry and copies 
 **`[6, 7, 1, 4, 5]`** into the dispatch block at `fieldInfo + 0x38`. The important one is
 `slot[6] → dispatch vtable[0]`, i.e. exactly what `EncodeField` later calls.
 
+**How the library uses this (gamedata-resolved classification).** Rather than hard-coding the table
+address and walking `RegistryAddr + b*16` in C#, the gamedata file declares the registry table base
+(`CFlattenedSerializer::EncoderRegistry`, sig + `+3 r` factory) and derives each per-bucket handler
+base from it declaratively with the factory op-chain — `"base": "…EncoderRegistry", "factory": "+{b*16} d"`
+(`+N` offset then `d` dereference; ops are defined in `Engine/src/gamedata.cpp`). At install the library
+enumerates each resolved bucket handler's entries once (stride `0x80`, fn at `+0x30`), maps `(bucket,
+encoder-name) → FieldType`, and cross-checks the bucket-1 `default` fn against the standalone
+`CFlattenedSerializer::EncodeInt32` signature (warns on mismatch). The per-field hot path
+(`FieldSubstitution.Classify`) is then a single dictionary lookup of the field's live dispatch fn
+(`*(*(fieldInfo+0x38)+0x30)`) — no runtime string scraping of the registry on the send path.
+
 **Full registry map (file-vaddr):**
 
 | bucket | encoder name | fn |
@@ -562,8 +573,11 @@ The descent offsets need more RE before nested fields can be substituted reliabl
 ### 15f. Status & artifacts
 
 Verify mode is confirmed (`SUBST-VERIFY` fired 8× for `CCSPlayerPawn::m_iHealth`: recipient captured,
-`before=0`/`after=16`, `bitcount=16`, no desync). The live **Fake** confirmation (`sp_fakehp2` actually
-changing displayed HP per client) is still pending. Implementation:
-`Native/FieldSubstitution.cs` (+ `RecipientCapture.cs`, `WriteFieldProbe.cs`); commands `sp_sub_verify`
-/ `sp_fakehp2` / `sp_sub_off`. Raw decompiles preserved in `re-dumps/` (`sp_wfl.out` is the key
-`WriteFieldList` reference); Ghidra scripts in `ghidra_scripts/`.
+`before=0`/`after=16`, `bitcount=16`, no desync). Implementation lives entirely in the core library's
+`Native/FieldSubstitution.cs` (+ `Native/RecipientCapture.cs`); the engine addresses and encoder
+identities are resolved from `.assets/gamedata/yappershq.sendproxy.jsonc`. The core library exposes the
+mechanism only through `ISendProxyManager` and ships **no commands**. The example module
+(`YappersHQ.SendProxy.Example`) drives it through AdminManager-gated commands (`sp_example_*`) and
+carries the read-only serializer probe (`sp_probe_scan` / `sp_probe_dump` / `sp_probe_field`,
+`SerializerProbe.cs`) used during this RE work. Raw decompiles preserved in `re-dumps/` (`sp_wfl.out`
+is the key `WriteFieldList` reference); Ghidra scripts in `ghidra_scripts/`.

@@ -1,5 +1,22 @@
-using System.IO;
-using Microsoft.Extensions.Logging;
+/*
+ * SendProxy for ModSharp (CS2)
+ * Copyright (C) 2026 YappersHQ. All Rights Reserved.
+ *
+ * This file is part of SendProxy for ModSharp.
+ * SendProxy is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * SendProxy is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with SendProxy. If not, see <https://www.gnu.org/licenses/>.
+ */
+
 using Sharp.Shared;
 using Sharp.Shared.Managers;
 using Sharp.Shared.Objects;
@@ -8,42 +25,16 @@ namespace YappersHQ.SendProxy;
 
 internal sealed class InterfaceBridge
 {
-    public static InterfaceBridge Instance { get; private set; } = null!;
+    public IGameData            GameData           { get; }
+    public IEntityManager       EntityManager      { get; }
+    public IHookManager         HookManager        { get; }
+    public ISharpModuleManager  SharpModuleManager { get; }
 
-    public SendProxyModule Module { get; }
-    public string SharpPath { get; }
-    public string DllPath { get; }
-    public string ModuleIdentity { get; }
-
-    public IModSharp ModSharp { get; }
-    public IGameData GameData { get; }
-    public IConVarManager ConVarManager { get; }
-    public IEntityManager EntityManager { get; }
-    public IClientManager ClientManager { get; }
-    public ISchemaManager SchemaManager { get; }
-    public IHookManager HookManager { get; }
-    public ILibraryModuleManager LibraryModuleManager { get; }
-    public ISharpModuleManager SharpModuleManager { get; }
-    public ILoggerFactory LoggerFactory { get; }
-
-    public InterfaceBridge(SendProxyModule module, ISharedSystem sharedSystem, string sharpPath)
+    public InterfaceBridge(ISharedSystem sharedSystem)
     {
-        Instance = this;
-        Module = module;
-
-        SharpPath = sharpPath;
-        DllPath = Path.GetFullPath(Path.Combine(sharpPath, "modules", "YappersHQ.SendProxy"));
-        ModuleIdentity = Path.GetFileNameWithoutExtension(DllPath);
-
-        ModSharp = sharedSystem.GetModSharp();
-        GameData = sharedSystem.GetModSharp().GetGameData();
-        ConVarManager = sharedSystem.GetConVarManager();
-        EntityManager = sharedSystem.GetEntityManager();
-        ClientManager = sharedSystem.GetClientManager();
-        SchemaManager = sharedSystem.GetSchemaManager();
-        HookManager = sharedSystem.GetHookManager();
-        LibraryModuleManager = sharedSystem.GetLibraryModuleManager();
+        GameData           = sharedSystem.GetModSharp().GetGameData();
+        EntityManager      = sharedSystem.GetEntityManager();
+        HookManager        = sharedSystem.GetHookManager();
         SharpModuleManager = sharedSystem.GetSharpModuleManager();
-        LoggerFactory = sharedSystem.GetLoggerFactory();
     }
 }

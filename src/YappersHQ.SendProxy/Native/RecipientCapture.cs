@@ -1,3 +1,22 @@
+/*
+ * SendProxy for ModSharp (CS2)
+ * Copyright (C) 2026 YappersHQ. All Rights Reserved.
+ *
+ * This file is part of SendProxy for ModSharp.
+ * SendProxy is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * SendProxy is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with SendProxy. If not, see <https://www.gnu.org/licenses/>.
+ */
+
 using System;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
@@ -8,20 +27,16 @@ using Sharp.Shared.Hooks;
 namespace YappersHQ.SendProxy.Native;
 
 /// <summary>
-///     Detour on CNetworkGameServer::PerClientEncode (engine2, file-RVA 0x8fae40).
-///     ABI: rdi=CNetworkGameServer*, rsi=CServerSideClient*.
-///     Captures rsi into <see cref="CurrentClient"/> [ThreadStatic] before calling the trampoline,
-///     clears it after — so CurrentClient is non-zero only while this client's encode chain executes
-///     on this thread (WriteDeltaEntity_Internal, EncodeInt32, etc. run synchronously inside).
-///     Phase-2 value-encode hooks read CurrentClient to key per-recipient spoofs.
-///     Also logs the first 30 calls (tid + client ptr) for verification.
+///     Detour on CNetworkGameServer::PerClientEncode (rsi = CServerSideClient*). Captures the recipient
+///     into a [ThreadStatic] for the duration of that client's encode chain on this thread, so the
+///     downstream substitution hooks can key per-recipient spoofs. Cleared on exit.
 /// </summary>
 internal static unsafe class RecipientCapture
 {
     [ThreadStatic]
     private static nint _currentClient;
 
-    /// <summary>CServerSideClient* for the client being encoded on this thread. Zero on all other threads.</summary>
+    /// <summary>CServerSideClient* for the client being encoded on this thread; zero on all other threads.</summary>
     public static nint CurrentClient => _currentClient;
 
     private static IDetourHook? _hook;
@@ -34,11 +49,14 @@ internal static unsafe class RecipientCapture
         if (_hook is not null)
         {
             logger.LogInformation("RecipientCapture: already installed");
+
             return true;
         }
+
         if (perClientEncodeAddr == 0)
         {
             logger.LogWarning("RecipientCapture: null target address — cannot install");
+
             return false;
         }
 
@@ -48,9 +66,11 @@ internal static unsafe class RecipientCapture
         var hook   = bridge.HookManager.CreateDetourHook();
         var hookFn = (nint) (delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nint, nint, nint>) &Hook;
         hook.Prepare(perClientEncodeAddr, hookFn);
+
         if (!hook.Install())
         {
             logger.LogWarning("RecipientCapture: IDetourHook.Install() failed");
+
             return false;
         }
 
@@ -58,6 +78,7 @@ internal static unsafe class RecipientCapture
         _trampoline = hook.Trampoline;
         logger.LogInformation("RecipientCapture installed @ 0x{Addr:X} (trampoline=0x{Tr:X})",
             perClientEncodeAddr, _trampoline);
+
         return true;
     }
 
@@ -71,12 +92,12 @@ internal static unsafe class RecipientCapture
         _logger = null;
     }
 
-    // 6-arg passthrough (rdi=server, rsi=client, rdx..r9=c..f — 6 args for ABI correctness).
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static nint Hook(nint a, nint b, nint c, nint d, nint e, nint f)
     {
         _currentClient = b;
         nint result;
+
         try
         {
             var n = Interlocked.Increment(ref _count);
@@ -87,7 +108,10 @@ internal static unsafe class RecipientCapture
                     log.LogInformation("RECIP#{N} tid={Tid} server=0x{A:X} client=0x{B:X}",
                         n, Environment.CurrentManagedThreadId, a, b);
                 }
-                catch { }
+                catch
+                {
+                    // Diagnostics only — never let logging faults escape the hook.
+                }
             }
 
             result = ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nint, nint, nint>) _trampoline)(a, b, c, d, e, f);
@@ -96,6 +120,7 @@ internal static unsafe class RecipientCapture
         {
             _currentClient = 0;
         }
+
         return result;
     }
 }

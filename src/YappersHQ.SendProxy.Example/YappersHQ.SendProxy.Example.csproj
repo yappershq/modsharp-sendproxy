@@ -1,5 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
-    <ProjectReference Include="..\YappersHQ.SendProxy.Shared\YappersHQ.SendProxy.Shared.csproj" Private="false" />
+    <ProjectReference Include="..\YappersHQ.SendProxy.Shared\YappersHQ.SendProxy.Shared.csproj" Private="false" ExcludeAssets="runtime" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="ModSharp.Sharp.Modules.AdminManager.Shared" Version="2.1.123" Private="false" ExcludeAssets="runtime" />
   </ItemGroup>
 </Project>

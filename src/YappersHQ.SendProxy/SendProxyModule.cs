@@ -1,11 +1,28 @@
+/*
+ * SendProxy for ModSharp (CS2)
+ * Copyright (C) 2026 YappersHQ. All Rights Reserved.
+ *
+ * This file is part of SendProxy for ModSharp.
+ * SendProxy is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU Affero General Public License as
+ * published by the Free Software Foundation, either version 3 of the
+ * License, or (at your option) any later version.
+ *
+ * SendProxy is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU Affero General Public License for more details.
+ *
+ * You should have received a copy of the GNU Affero General Public License
+ * along with SendProxy. If not, see <https://www.gnu.org/licenses/>.
+ */
+
 using System;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Sharp.Shared;
-using Sharp.Shared.Enums;
 using Sharp.Shared.GameEntities;
 using Sharp.Shared.Listeners;
-using Sharp.Shared.Types;
 using YappersHQ.SendProxy.Native;
 using YappersHQ.SendProxy.Shared;
 
@@ -13,37 +30,56 @@ namespace YappersHQ.SendProxy;
 
 public sealed class SendProxyModule : IModSharpModule, IEntityListener
 {
-    public string DisplayName   => "SendProxy";
-    public string DisplayAuthor => "Prefix";
+    private const string SendClientMessagesKey = "CNetworkGameServer::SendClientMessages";
+    private const string WriteDeltaInternalKey = "CNetworkGameServerBase::WriteDeltaEntity_Internal";
+    private const string PerClientEncodeKey    = "CNetworkGameServer::PerClientEncode";
+    private const string WriteFieldListKey     = "CFlattenedSerializer::WriteFieldList";
+    private const string GetBitRangeKey        = "CFlattenedSerializer::GetBitRange";
+    private const string BitCopyKey            = "CFlattenedSerializer::BitCopyPrimitive";
+    private const string EncoderRegistryKey    = "CFlattenedSerializer::EncoderRegistry";
+    private const string EncodeInt32Key        = "CFlattenedSerializer::EncodeInt32";
+
+    private static readonly string[] EncoderBucketKeys =
+    {
+        "CFlattenedSerializer::EncoderBucket1",
+        "CFlattenedSerializer::EncoderBucket2",
+        "CFlattenedSerializer::EncoderBucket3",
+        "CFlattenedSerializer::EncoderBucket4",
+        "CFlattenedSerializer::EncoderBucket7",
+    };
 
     private readonly ILogger<SendProxyModule> _logger;
-    private readonly InterfaceBridge _bridge;
-    private readonly SendProxyManager _manager;
+    private readonly InterfaceBridge          _bridge;
+    private readonly SendProxyManager         _manager;
 
-    private nint _wdeAddr;             // CNetworkGameServerBase::WriteDeltaEntity_Internal
-    private nint _perClientEncodeAddr; // CNetworkGameServer::PerClientEncode
-    private nint _writeFieldListAddr;  // CFlattenedSerializer::WriteFieldList
-    private nint _getBitRangeAddr;     // CFlattenedSerializer::GetBitRange
-    private nint _bitCopyAddr;         // FUN_00500b70 (bit-copy primitive)
-    private nint _registryAddr;        // CFlattenedSerializer::EncoderRegistry table base
+    private nint _wdeAddr;
+    private nint _perClientEncodeAddr;
+    private nint _writeFieldListAddr;
+    private nint _getBitRangeAddr;
+    private nint _bitCopyAddr;
+    private nint _registryAddr;
+    private nint _encodeInt32Addr;
 
     public SendProxyModule(
-        ISharedSystem  sharedSystem,
-        string?        dllPath,
-        string?        sharpPath,
-        Version?       version,
+        ISharedSystem   sharedSystem,
+        string?         dllPath,
+        string?         sharpPath,
+        Version?        version,
         IConfiguration? coreConfiguration,
-        bool           hotReload)
+        bool            hotReload)
     {
-        _logger = sharedSystem.GetLoggerFactory().CreateLogger<SendProxyModule>();
-        _bridge = new InterfaceBridge(this, sharedSystem, sharpPath ?? string.Empty);
+        _logger  = sharedSystem.GetLoggerFactory().CreateLogger<SendProxyModule>();
+        _bridge  = new InterfaceBridge(sharedSystem);
         _manager = new SendProxyManager(_logger);
     }
 
+    public string DisplayName   => "SendProxy";
+    public string DisplayAuthor => "YappersHQ";
+
+    #region IModSharpModule
+
     public bool Init()
     {
-        // Loads gamedata/yappershq.sendproxy.jsonc (encode-path sigs). Non-fatal: a missing/invalid
-        // gamedata must not block module load — ResolveNativeTargets handles per-key failures.
         try
         {
             _bridge.GameData.Register("yappershq.sendproxy");
@@ -55,51 +91,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
         ResolveNativeTargets();
 
-        // Read-only diagnostics: dump serializer layout + field record windows.
-        _bridge.ConVarManager.CreateServerCommand("sp_dump", OnDumpCommand,
-            "Dump an entity's network serializer layout: sp_dump <entityIndex>",
-            ConVarFlags.Release);
-        _bridge.ConVarManager.CreateServerCommand("sp_field", OnFieldCommand,
-            "Dump a serializer field record: sp_field <class> <fieldName>",
-            ConVarFlags.Release);
-
         return true;
-    }
-
-    // Gamedata keys — sigs live in .assets/gamedata/yappershq.sendproxy.jsonc.
-    private const string SendClientMessagesKey  = "CNetworkGameServer::SendClientMessages";
-    private const string WriteDeltaInternalKey  = "CNetworkGameServerBase::WriteDeltaEntity_Internal";
-    private const string PerClientEncodeKey     = "CNetworkGameServer::PerClientEncode";
-    private const string WriteFieldListKey      = "CFlattenedSerializer::WriteFieldList";
-    private const string GetBitRangeKey        = "CFlattenedSerializer::GetBitRange";
-    private const string BitCopyKey            = "CFlattenedSerializer::BitCopyPrimitive";
-    private const string EncoderRegistryKey    = "CFlattenedSerializer::EncoderRegistry";
-
-    private void ResolveNativeTargets()
-    {
-        ResolveFromGameData(SendClientMessagesKey); // Phase-2 anchor; logged for verification.
-        _wdeAddr            = ResolveFromGameData(WriteDeltaInternalKey);
-        _perClientEncodeAddr = ResolveFromGameData(PerClientEncodeKey);
-        _writeFieldListAddr = ResolveFromGameData(WriteFieldListKey);
-        _getBitRangeAddr    = ResolveFromGameData(GetBitRangeKey);
-        _bitCopyAddr        = ResolveFromGameData(BitCopyKey);
-        // Encoder registry table base — walked once at Install to build fn→FieldType map.
-        _registryAddr       = ResolveFromGameData(EncoderRegistryKey);
-    }
-
-    private nint ResolveFromGameData(string key)
-    {
-        try
-        {
-            var addr = _bridge.GameData.GetAddress(key);
-            _logger.LogInformation("SendProxy resolve {Key}: fn=0x{Fn:X}", key, addr);
-            return addr;
-        }
-        catch (Exception e)
-        {
-            _logger.LogWarning("SendProxy: {Key} not resolved: {Msg}", key, e.Message);
-            return 0;
-        }
     }
 
     public void PostInit()
@@ -112,76 +104,90 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.EntityManager.InstallEntityListener(this);
     }
 
-    int IEntityListener.ListenerVersion  => IEntityListener.ApiVersion;
-    int IEntityListener.ListenerPriority => 0;
-    void IEntityListener.OnEntityDeleted(IBaseEntity entity) => _manager.RemoveEntityHooks((int) entity.Index);
-
     public void Shutdown()
     {
         RecipientCapture.Uninstall();
         FieldSubstitution.Uninstall();
         _bridge.EntityManager.RemoveEntityListener(this);
-        _bridge.ConVarManager.ReleaseCommand("sp_dump");
-        _bridge.ConVarManager.ReleaseCommand("sp_field");
         _manager.Clear();
     }
 
-    private ECommandAction OnDumpCommand(StringCommand command)
+    #endregion
+
+    #region IEntityListener
+
+    int IEntityListener.ListenerVersion  => IEntityListener.ApiVersion;
+    int IEntityListener.ListenerPriority => 0;
+
+    void IEntityListener.OnEntityDeleted(IBaseEntity entity)
+        => _manager.RemoveEntityHooks((int) entity.Index);
+
+    #endregion
+
+    #region Native resolution
+
+    private void ResolveNativeTargets()
     {
-        if (command.ArgCount < 1)
+        ResolveFromGameData(SendClientMessagesKey);
+        _wdeAddr             = ResolveFromGameData(WriteDeltaInternalKey);
+        _perClientEncodeAddr = ResolveFromGameData(PerClientEncodeKey);
+        _writeFieldListAddr  = ResolveFromGameData(WriteFieldListKey);
+        _getBitRangeAddr     = ResolveFromGameData(GetBitRangeKey);
+        _bitCopyAddr         = ResolveFromGameData(BitCopyKey);
+        _registryAddr        = ResolveFromGameData(EncoderRegistryKey);
+        _encodeInt32Addr     = ResolveFromGameData(EncodeInt32Key);
+
+        var bucketAddrs = new nint[EncoderBucketKeys.Length];
+        for (var i = 0; i < EncoderBucketKeys.Length; i++)
         {
-            SerializerProbe.Scan(_bridge, _logger);
-            return ECommandAction.Stopped;
+            bucketAddrs[i] = ResolveFromGameData(EncoderBucketKeys[i]);
         }
 
-        if (!int.TryParse(command.GetArg(1), out var idx))
-        {
-            _logger.LogInformation("usage: sp_dump [entityIndex]  (no arg = scan)");
-            return ECommandAction.Stopped;
-        }
-
-        SerializerProbe.Dump(_bridge, _logger, idx);
-        return ECommandAction.Stopped;
+        FieldSubstitution.SetEncoderResolution(_registryAddr, bucketAddrs, _encodeInt32Addr);
     }
 
-    private ECommandAction OnFieldCommand(StringCommand command)
+    private nint ResolveFromGameData(string key)
     {
-        if (command.ArgCount < 2)
+        try
         {
-            _logger.LogInformation("usage: sp_field <serializerClass> <fieldName>");
-            return ECommandAction.Stopped;
+            var addr = _bridge.GameData.GetAddress(key);
+            _logger.LogInformation("SendProxy resolve {Key}: addr=0x{Addr:X}", key, addr);
+
+            return addr;
         }
+        catch (Exception e)
+        {
+            _logger.LogWarning("SendProxy: {Key} not resolved: {Msg}", key, e.Message);
 
-        SerializerProbe.DumpField(_bridge, _logger, command.GetArg(1), command.GetArg(2));
-        return ECommandAction.Stopped;
+            return 0;
+        }
     }
-
-    // ── Phase-2 field substitution ────────────────────────────────────────────
 
     private bool EnsureSubDetours()
     {
         if (_getBitRangeAddr == 0 || _bitCopyAddr == 0 || _writeFieldListAddr == 0)
         {
             _logger.LogWarning(
-                "SendProxy: one or more Phase-2 addresses not resolved "
-                + "(GetBitRange={Gbr:X} BitCopy={Bc:X} WFL={Wfl:X}) — "
+                "SendProxy: one or more substitution addresses not resolved "
+                + "(GetBitRange=0x{Gbr:X} BitCopy=0x{Bc:X} WriteFieldList=0x{Wfl:X}) — "
                 + "check gamedata sigs match this build",
                 _getBitRangeAddr, _bitCopyAddr, _writeFieldListAddr);
+
             return false;
         }
 
         FieldSubstitution.GetBitRangeAddr    = _getBitRangeAddr;
         FieldSubstitution.ValueCopyAddr      = _bitCopyAddr;
         FieldSubstitution.WriteFieldListAddr = _writeFieldListAddr;
-        // WDE address for entity-index capture (0 = skip; entityIndex in callbacks will be -1).
         FieldSubstitution.WdeAddr            = _wdeAddr;
-        // Registry table base for runtime fn→FieldType classification. 0 → Classify always returns
-        // Unsupported (all substitutions pass through — safe but inert).
-        FieldSubstitution.RegistryAddr       = _registryAddr;
 
         if (_perClientEncodeAddr != 0)
+        {
             RecipientCapture.Install(_bridge, _logger, _perClientEncodeAddr);
+        }
 
         return FieldSubstitution.Install(_bridge, _logger);
     }
+
+    #endregion
 }

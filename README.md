@@ -38,6 +38,14 @@ each snapshot is encoded. Three targeting modes:
 If a field's type can't be classified, the hook passes through untouched — it never writes
 wrong-type bits, so an unsupported field is a no-op, not corruption.
 
+Field classification is anchored on **gamedata-resolved encoder identities**: the encoder-registry
+table and its per-bucket handler bases are declared in `yappershq.sendproxy.jsonc` (the per-bucket
+entries derive their address from the table base via the gamedata factory op-chain, `base` + `+N`/`d`).
+The library enumerates the encoder functions once at install from those resolved bases (cross-checking
+the int32 encoder against its own standalone signature) and builds a fn-pointer → type map; the
+per-field hot path is then a single dictionary lookup of the field's live dispatch fn. There is no
+heuristic runtime registry walk on the send path.
+
 ## Consumer API — `ISendProxyManager`
 
 ### Resolving the interface
@@ -140,8 +148,12 @@ references.
 
 ## Example plugin
 
-`YappersHQ.SendProxy.Example` is a working consumer of the interface. It registers these server
-commands (each exercises one part of the API):
+`YappersHQ.SendProxy.Example` is a working consumer of the interface. The core library itself ships
+**no commands** — all demo/diagnostic commands live in the example and are registered through ModSharp's
+**AdminManager** (admin-gated, dispatched from chat `!cmd` / `sm_cmd`, the server console and RCON).
+They require the `sendproxy:example` permission; grant it (or `*`) via your admin source. The example
+resolves AdminManager in `OnAllModulesLoaded` and retries in `OnLibraryConnected` (so it survives
+CommandCenter loading late); AdminManager auto-unregisters the commands on disconnect.
 
 | Command | Demonstrates |
 |---|---|
@@ -151,7 +163,10 @@ commands (each exercises one part of the API):
 | `sp_example_perclienthp_off` | `UnhookInt` — remove that per-client callback |
 | `sp_example_fakeangle <pitch> <yaw> <roll>` | **Vector/QAngle** callback — `HookVector` on `m_angEyeAngles`, fixed angles for all clients |
 | `sp_example_fakeangle_off` | `Unhook` — remove the eye-angle callback |
-| `sp_example_off` | `UnhookAllPerClient` — clear everything, uninstall Phase-2 detours |
+| `sp_example_off` | `UnhookAllPerClient` — clear everything, uninstall the substitution detours |
+| `sp_probe_scan` | Read-only serializer probe — list live entities + classes, dump the first |
+| `sp_probe_dump <entityIndex>` | Read-only — dump one entity's serializer class info / field[0] |
+| `sp_probe_field <serializerClass> <fieldName>` | Read-only — dump a field record's qword window (RE aid) |
 
 ## Build / deploy
 
@@ -163,7 +178,8 @@ commands (each exercises one part of the API):
 Deploy:
 - module DLL → `<sharp>/modules/YappersHQ.SendProxy/`
 - Shared DLL → `<sharp>/shared/YappersHQ.SendProxy.Shared/`
-- example (optional) → `<sharp>/modules/YappersHQ.SendProxy.Example/`
+- example (optional) → `<sharp>/modules/YappersHQ.SendProxy.Example/` (requires the **AdminManager**
+  module to be installed — its commands are admin-gated and dispatched through CommandCenter)
 - gamedata → `<sharp>/gamedata/yappershq.sendproxy.jsonc`
 
 The gamedata source is `.assets/gamedata/yappershq.sendproxy.jsonc`. `GameData.Register("yappershq.sendproxy")`
