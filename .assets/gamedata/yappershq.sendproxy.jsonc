@@ -6,11 +6,11 @@
 // FindPattern resolves the sig at runtime — sigs are position-independent. Re-derive on engine
 // updates with tools/ (nosoop makesig); full derivation in docs/REVERSE_ENGINEERING.md.
 //
-// An entry may instead declare "base" + a "factory" op-chain to derive its address from another
-// resolved entry. The engine factory ops (Engine/src/gamedata.cpp): "r" rip-relative resolve,
-// "d" dereference, "+N"/"-N" pointer arithmetic, composed left-to-right. This is how each encoder
-// bucket handler below is derived declaratively from the resolved EncoderRegistry table base —
-// classification compares against these gamedata-resolved addresses, not against runtime strings.
+// An entry may carry a "factory" op-chain to transform its resolved address. The engine factory ops
+// (Engine/src/gamedata.cpp): "r" rip-relative resolve, "d" dereference, "+N"/"-N" pointer arithmetic,
+// composed left-to-right. This is how each encoder bucket handler below is derived declaratively from
+// the registry table-load lea — classification compares the live per-field encoder fn against these
+// gamedata-resolved addresses, not against runtime strings.
 //
 // All addresses below are file-vaddr RVAs (Ghidra image base for these .so = file-vaddr + 0x100000).
 {
@@ -62,17 +62,20 @@
       }
     },
 
-    // Per-bucket handler array base addresses, derived declaratively from EncoderRegistry:
-    //   handler[b] = *(EncoderRegistry + b*16)
-    // factory "+{b*16} d": offset to bucket b's 16-byte slot, then dereference the handler pointer.
+    // Per-bucket handler array base addresses: handler[b] = *(EncoderRegistry + b*16).
+    // Each resolves standalone from the registry table-load lea, with a full factory op-chain
+    // (Engine/src/gamedata.cpp): "+3 r" skips the lea opcode and RIP-resolves the rel32 to the table
+    // base; "+{b*16}" offsets to bucket b's 16-byte slot; "d" dereferences the handler pointer.
+    // (A "base" reference to EncoderRegistry would be cleaner, but ParseAddresses drops any entry with
+    // no signature and no refs — gamedata.cpp:840 — so each bucket carries the registry signature.)
     // FieldSubstitution uses these gamedata-resolved bases to anchor its one-time encoder enumeration
-    // (instead of an in-C# RegistryAddr + b*16 stride assumption) and to map each discovered encoder
-    // entry to its FieldType by bucket. Bucket semantics (see docs/REVERSE_ENGINEERING.md §10):
-    // b1 signed int, b2 unsigned int, b3 qangle/vector/quantized-float family, b4 float32, b7 bool.
-    "CFlattenedSerializer::EncoderBucket1": { "base": "CFlattenedSerializer::EncoderRegistry", "linux": { "factory": "+16 d" } },
-    "CFlattenedSerializer::EncoderBucket2": { "base": "CFlattenedSerializer::EncoderRegistry", "linux": { "factory": "+32 d" } },
-    "CFlattenedSerializer::EncoderBucket3": { "base": "CFlattenedSerializer::EncoderRegistry", "linux": { "factory": "+48 d" } },
-    "CFlattenedSerializer::EncoderBucket4": { "base": "CFlattenedSerializer::EncoderRegistry", "linux": { "factory": "+64 d" } },
-    "CFlattenedSerializer::EncoderBucket7": { "base": "CFlattenedSerializer::EncoderRegistry", "linux": { "factory": "+112 d" } }
+    // and map each discovered encoder entry to its FieldType by bucket. Bucket semantics
+    // (see docs/REVERSE_ENGINEERING.md §6): b1 signed int, b2 unsigned int,
+    // b3 qangle/vector/quantized-float family, b4 float32, b7 bool.
+    "CFlattenedSerializer::EncoderBucket1": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +16 d" } },
+    "CFlattenedSerializer::EncoderBucket2": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +32 d" } },
+    "CFlattenedSerializer::EncoderBucket3": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +48 d" } },
+    "CFlattenedSerializer::EncoderBucket4": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +64 d" } },
+    "CFlattenedSerializer::EncoderBucket7": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +112 d" } }
   }
 }

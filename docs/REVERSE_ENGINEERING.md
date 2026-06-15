@@ -154,9 +154,10 @@ Field encoder-name → encoder fn is wired by a static descriptor table in `libn
   encoder-name `char*`, entry `+0x30` = encode fn pointer.
 
 The gamedata file declares the table base (`CFlattenedSerializer::EncoderRegistry`, byte-sig +
-`+3 r` factory) and derives each per-bucket handler base from it declaratively with the factory
-op-chain (`"base": "…EncoderRegistry", "linux": { "factory": "+{b*16} d" }` — `+N` offset then `d`
-dereference; ops defined in `Engine/src/gamedata.cpp`). At install the library enumerates each
+`+3 r` factory) and each per-bucket handler base as a standalone entry carrying the same registry
+signature plus a full factory op-chain (`"factory": "+3 r +{b*16} d"` — `+3 r` RIP-resolves the table
+base, `+{b*16}` offsets to bucket *b*'s slot, `d` dereferences the handler; ops defined in
+`Engine/src/gamedata.cpp`). At install the library enumerates each
 resolved bucket handler's entries once and maps `(bucket, encoder-name) → FieldType`, cross-checking
 the bucket-1 `default` fn against the standalone `CFlattenedSerializer::EncodeInt32` signature. The
 per-field hot path is then a single dictionary lookup of the live dispatch fn
