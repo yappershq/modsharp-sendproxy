@@ -33,8 +33,9 @@ namespace YappersHQ.SendProxy.Native;
 //          ABI (System V): encoder(rdi=bf_write*, rsi=fieldInfo*, rdx=paramsPtr, rcx=valuePtr, r8d=0)
 //          paramsPtr: byte off = *(byte*)(fieldInfo+0xC9);
 //                     paramsPtr = (off==0xFF) ? 0 : *(nint*)(fieldInfo+0x40) + off;
-//          valuePtr: stackalloc scratch holding the fake value in the engine's native layout.
-//          Unsupported fields (quantized/coord/normal/string/array/handle) PASSTHROUGH — never substitute.
+//          valuePtr: stackalloc scratch — either synthesized (scalar/vector) or a copy of the live
+//                    entity value struct with patched float components (quantized-float path).
+//          String/array/handle fields PASSTHROUGH (follow-up work needed for string-callback API).
 //
 //  Type detection (Classify): the leaf field record's +0x00 is CNetworkSerializerFieldInfo*; the
 //  engine dispatches encoding via  *( *(fieldInfo+0x38) + 0x30 )  — fieldInfo+0x38 = type-bucket
@@ -67,18 +68,32 @@ namespace YappersHQ.SendProxy.Native;
 internal enum SubstitutionMode { Off, Verify, Fake }
 
 // Network encoder family for a registered field, decided by walking the encoder registry table.
-//   Int32Signed — bucket 1 "default" (signed int8/16/32/64, zigzag varint).
-//   UInt32      — bucket 2 "default" (unsigned int8/16/32/64, raw varint, no zigzag).
-//   Fixed32     — bucket 1 or 2 "fixed32" (raw 32-bit write, no varint).
-//   Fixed64     — bucket 1 or 2 "fixed64" (raw 64-bit write, no varint).
-//   Bool        — bucket 7 "default" (1-bit fixed write).
-//   Float32     — bucket 4 "default" (raw 32-bit IEEE-754 inline write).
-//   Int64       — alias of Int32Signed (same encoder, value is sign-extended before zigzag).
-//   QAngle3     — bucket 3 "qangle" (3×float32 scratch, encoder uses paramsPtr for mode/bits).
-//   Vector3     — bucket 3 "vector3" (same 3×float32 scratch layout as QAngle3).
-//   Unsupported — anything else (quantized float coord/normal/integral, handle, string/bytes, arrays,
-//                 bucket 0 no-op stub, unresolved table). MUST passthrough — never substitute.
-internal enum FieldType { Unsupported = 0, Int32, UInt32, Int64, Bool, Float32, Fixed32, Fixed64, QAngle3, Vector3 }
+//   Int32Signed    — bucket 1 "default" (signed int8/16/32/64, zigzag varint).
+//   UInt32         — bucket 2 "default" (unsigned int8/16/32/64, raw varint, no zigzag).
+//   Fixed32        — bucket 1 or 2 "fixed32" (raw 32-bit write, no varint).
+//   Fixed64        — bucket 1 or 2 "fixed64" (raw 64-bit write, no varint).
+//   Bool           — bucket 7 "default" (1-bit fixed write).
+//   Float32        — bucket 4 "default" (raw 32-bit IEEE-754 inline write).
+//   Int64          — alias of Int32Signed (same encoder, value is sign-extended before zigzag).
+//   QAngle3        — bucket 3 "qangle" (3×float32 scratch, encoder uses paramsPtr for mode/bits).
+//   Vector3        — bucket 3 "vector3" (same 3×float32 scratch layout as QAngle3).
+//
+//   The following REQUIRE a live-struct read from the entity snapshot (Option B path):
+//   Coord3         — bucket 3 "coord": reads float[3] at valuePtr+0/+4/+8 plus [valuePtr+0x28] mode.
+//   Normal3        — bucket 3 "normal": reads float[3] at valuePtr+0/+4/+8.
+//   CoordIntegral3 — bucket 3 "coord_integral": reads float[count] at valuePtr+i*4, count at +0x28.
+//   QuantizedFloat — bucket 3 "quantized" (default): reads float[count] at valuePtr+i*4, count at +0x28.
+//
+//   Unsupported    — anything else (handle, string/bytes, arrays, bucket 0 no-op stub, unresolved).
+//                    Also used as fallback when live valuePtr cannot be resolved. MUST passthrough.
+internal enum FieldType
+{
+    Unsupported    = 0,
+    Int32, UInt32, Int64, Bool, Float32, Fixed32, Fixed64,
+    QAngle3, Vector3,
+    // Live-struct family — substitutable only when _currentSnapshotPtr is valid.
+    Coord3, Normal3, CoordIntegral3, QuantizedFloat
+}
 
 // Discriminated union tag for which typed callback is stored in a SpoofEntry.
 internal enum CallbackKind { None = 0, Int, Float, Bool, Vector }
@@ -253,6 +268,15 @@ internal static unsafe class FieldSubstitution
 
     // Filled in WDE entity-index capture — *(int*)(ctx+0x34). -1 if not captured.
     [ThreadStatic] private static int _currentEntityIndex;
+
+    // Filled in WDE entity hook alongside entity index.
+    // *(nint*)(ctx+0x90) = pointer to the "to-snapshot" CFrameSnapshotEntry for this entity.
+    // The entity data-region pointer array lives at snapshotPtr+0x30 (stride 8 per regionId).
+    // Used by the live-struct path to reconstruct the valuePtr for quantized-float encoders:
+    //   dataRegionBase = *(nint*)(snapshotPtr + 0x30 + regionId * 8)
+    //   valuePtr       = dataRegionBase + *(ushort*)(fieldInfo + 0x20)
+    // Zero when WDE hook is not installed or ctx+0x90 is not a valid user pointer.
+    [ThreadStatic] private static nint _currentSnapshotPtr;
 
     // Diagnostic: log first N distinct (ser, leaf) pairs seen.
     private static int _diagCount;
@@ -436,14 +460,28 @@ internal static unsafe class FieldSubstitution
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static nint WdeEntityCaptureHook(nint a, nint b, nint c, nint d, nint e, nint f)
     {
-        var entityIndex = -1;
+        var entityIndex  = -1;
+        var snapshotPtr  = (nint) 0;
+
         if (NativeUtil.IsUserPtr(b))
         {
             try { entityIndex = *(int*) (b + 0x34); }
             catch { }
+
+            // Capture per-entity snapshot pointer for the live-struct (quantized-float) path.
+            // ctx+0x90 = nint* → to-snapshot CFrameSnapshotEntry; data regions at snapshotPtr+0x30.
+            // RE evidence: wde.out line 67: local_80 = *(long*)(param_2+0x90) + 0x30.
+            try
+            {
+                var raw = *(nint*) (b + 0x90);
+                if (NativeUtil.IsUserPtr(raw))
+                    snapshotPtr = raw;
+            }
+            catch { }
         }
 
         _currentEntityIndex = entityIndex;
+        _currentSnapshotPtr = snapshotPtr;
         nint result;
         try
         {
@@ -453,6 +491,7 @@ internal static unsafe class FieldSubstitution
         finally
         {
             _currentEntityIndex = -1;
+            _currentSnapshotPtr = 0;
         }
         return result;
     }
@@ -665,6 +704,140 @@ internal static unsafe class FieldSubstitution
                             + "(registered but not a substitutable type)", serName, fieldName);
                     }
                     return CallOriginal(dst, src, bitcount);
+                }
+
+                // Live-struct path: quantized-float encoders read quant params from fieldInfo's
+                // paramsPtr (rdx), but the float VALUE(s) come from the entity's real value struct
+                // at valuePtr (rcx). We cannot synthesize a correct valuePtr from scalars — instead
+                // we read the live struct from the entity snapshot, patch only the float component(s)
+                // the callback modifies, and preserve all other bytes (especially [+0x28] = count).
+                //
+                // Safety: if the live valuePtr cannot be resolved (WDE hook absent, snapshot ptr
+                // invalid, region/offset out of bounds) → fall through to Unsupported passthrough.
+                bool isLiveStructType =
+                    fieldType == FieldType.Coord3        ||
+                    fieldType == FieldType.Normal3       ||
+                    fieldType == FieldType.CoordIntegral3 ||
+                    fieldType == FieldType.QuantizedFloat;
+
+                if (isLiveStructType)
+                {
+                    // Vector callback drives x/y/z substitution. Float callback drives component-0
+                    // only (single-component fields e.g. QuantizedFloat). Int/Bool callbacks are
+                    // not meaningful for float-valued fields — passthrough to avoid misinterpretation.
+                    bool hasCompatibleCallback =
+                        !reg.HasCallback ||
+                        reg.CallbackType == CallbackKind.Vector ||
+                        reg.CallbackType == CallbackKind.Float;
+
+                    if (!hasCompatibleCallback)
+                    {
+                        // Int/Bool callback on a quantized-float field — unsupported combination.
+                        if (ln <= MaxLogCount && _logger is { } cbWarnLog)
+                        {
+                            cbWarnLog.LogWarning(
+                                "SUBST-FAKE field=\"{Ser}::{Field}\" live-struct type={Type} "
+                                + "but callback={CbKind} is not Vector/Float — passing through",
+                                serName, fieldName, fieldType, reg.CallbackType);
+                        }
+                        return CallOriginal(dst, src, bitcount);
+                    }
+
+                    if (!TryGetLiveValuePtr(leafRec, out var liveValuePtr))
+                    {
+                        // Snapshot ptr not available or pointer derivation failed — passthrough.
+                        if (ln <= MaxLogCount && _logger is { } noVpLog)
+                        {
+                            noVpLog.LogWarning(
+                                "SUBST-FAKE field=\"{Ser}::{Field}\" live-struct type={Type} "
+                                + "— live valuePtr unavailable (WDE hook absent or snapshot invalid) "
+                                + "— passing through", serName, fieldName, fieldType);
+                        }
+                        return CallOriginal(dst, src, bitcount);
+                    }
+
+                    // Read the live struct into a fixed-size stack scratch.  Use the scratch for
+                    // the encoder call — this preserves ALL bytes including [+0x28] (count),
+                    // [+0x1c]/[+0x1d]/[+0x1e] flags (irrelevant here; quant params are in paramsPtr),
+                    // and any padding the encoder might touch.
+                    var liveScratch = stackalloc byte[LiveScratchSize];
+
+                    // Zero first so any padding bytes the encoder reads but we didn't copy are safe.
+                    for (var bi = 0; bi < LiveScratchSize; bi++)
+                        liveScratch[bi] = 0;
+
+                    // Copy LiveScratchSize bytes from the live valuePtr.
+                    // Each byte copy is individually try/catch-unable but the outer try/catch on the
+                    // whole hook covers any access fault — we proceed with partial data or fall back.
+                    for (var bi = 0; bi < LiveScratchSize; bi++)
+                        liveScratch[bi] = *(byte*) (liveValuePtr + bi);
+
+                    // Patch the float component(s) in the scratch with the callback's output values.
+                    // Layout (RE-verified):
+                    //   Coord3 / Normal3: [+0]=x, [+4]=y, [+8]=z (standard Vector3 layout).
+                    //   CoordIntegral3  : same layout, count at [+0x28].
+                    //   QuantizedFloat  : float[count] at [+i*4], count at [+0x28].
+                    // For a Float callback we treat it as single-component (patch +0 only with vx=fval).
+                    switch (reg.CallbackType)
+                    {
+                        case CallbackKind.Vector:
+                            ((float*) liveScratch)[0] = vx;
+                            ((float*) liveScratch)[1] = vy;
+                            ((float*) liveScratch)[2] = vz;
+                            break;
+                        case CallbackKind.Float:
+                            // Float callback → single-component field; patch component 0 only.
+                            ((float*) liveScratch)[0] =
+                                BitConverter.Int32BitsToSingle(effectiveFake);
+                            break;
+                        default:
+                            // No callback (uniform spoof) — the spoof value was an int; reinterpret
+                            // as IEEE-754 float bits and patch component 0.
+                            ((float*) liveScratch)[0] =
+                                BitConverter.Int32BitsToSingle(effectiveFake);
+                            break;
+                    }
+                    // [liveScratch+0x28] (count) is preserved from the live struct — not patched.
+
+                    // Now invoke the encoder via the same path as the scalar/vector cases below.
+                    var liveFi       = *(nint*) (leafRec + 0x00);
+                    var liveDispatch = *(nint*) (liveFi + 0x38);
+                    var liveEncFn    = NativeUtil.IsUserPtr(liveDispatch) ? *(nint*) liveDispatch : 0;
+                    byte liveParamOff = *(byte*) (liveFi + 0xC9);
+                    var liveParamsPtr = (liveParamOff == 0xFF) ? 0 : (*(nint*) (liveFi + 0x40) + liveParamOff);
+
+                    if (!NativeUtil.IsUserPtr(liveEncFn))
+                    {
+                        // Encoder fn unresolvable — should not happen for classified types.
+                        goto Passthrough;
+                    }
+
+                    int liveSavedCursor = *(int*) (dst + 0x10);
+                    byte liveOrigResult = CallOriginal(dst, src, bitcount);
+                    int liveAfterCursor = *(int*) (dst + 0x10);
+                    *(int*) (dst + 0x10) = liveSavedCursor;
+
+                    try
+                    {
+                        ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, uint, void>)
+                            liveEncFn)(dst, liveFi, liveParamsPtr, (nint) liveScratch, 0u);
+                    }
+                    catch
+                    {
+                        *(int*) (dst + 0x10) = liveAfterCursor;
+                        return liveOrigResult;
+                    }
+
+                    if (ln <= MaxLogCount && _logger is { } liveLog)
+                    {
+                        liveLog.LogInformation(
+                            "SUBST-FAKE(live) field=\"{Ser}::{Field}\" type={Type} "
+                            + "client=0x{Client:X} ent={Ent} bitcount={Bits} savedCursor={Saved} "
+                            + "vx={Vx} vy={Vy} vz={Vz}",
+                            serName, fieldName, fieldType, client, entityIndex, bitcount,
+                            liveSavedCursor, vx, vy, vz);
+                    }
+                    return liveOrigResult;
                 }
 
                 // Save cursor, call original (advances src + dst cursors + writes real bits), then
@@ -903,6 +1076,84 @@ internal static unsafe class FieldSubstitution
         }
     }
 
+    // Live-struct scratch size: 0x30 bytes covers the largest quantized value struct layout
+    // observed in RE (coord mode-2 reads up to [valuePtr+0x18], quantized-default with up to
+    // 8 floats = 0x20 + 0x08 header ≤ 0x30, normal reads [+0] through [+8]).
+    private const int LiveScratchSize = 0x30;
+
+    // Region index upper bound: auStack_150 in EncodeField is 120 bytes = 15 pointers, so the
+    // data-region array at snapshotPtr+0x30 has at most 15 entries. Cap the regionId to prevent
+    // runaway offsets when the snapshot layout differs from the compiled assumption.
+    private const int MaxRegionId = 14;
+
+    /// <summary>
+    ///     Attempt to reconstruct the live entity valuePtr for a quantized-float field.
+    ///
+    ///     RE evidence (from encodefield.out lines 228-234, wde.out lines 67-72):
+    ///     <list type="bullet">
+    ///       <item>EncodeField derives the valuePtr as:
+    ///         <c>regionBase[regionId] + fieldOffset</c> where
+    ///         <c>regionBase[i] = *(nint*)(puStack_160 + i*8)</c> (line 232),
+    ///         <c>fieldOffset   = *(ushort*)(fieldInfo + 0x20)</c> (line 234),
+    ///         <c>regionId      = *(byte*)(record + 0x2c)</c> (line 232, record = stride-0x2E field entry).
+    ///       </item>
+    ///       <item>WDE (wde.out line 67): <c>local_80 = *(nint*)(ctx+0x90) + 0x30</c>.
+    ///         So <c>*(nint*)(ctx+0x90)</c> is the snapshot struct pointer, and
+    ///         its data-region array starts at <c>snapshotPtr + 0x30</c>.
+    ///         We capture <c>snapshotPtr = *(nint*)(ctx+0x90)</c> in WdeEntityCaptureHook into
+    ///         <see cref="_currentSnapshotPtr"/> [ThreadStatic].
+    ///       </item>
+    ///     </list>
+    ///
+    ///     All pointer dereferences are IsUserPtr-gated. Returns false (caller passhthroughs) on
+    ///     any validation failure or access exception. Never throws.
+    /// </summary>
+    private static bool TryGetLiveValuePtr(nint leafRec, out nint valuePtr)
+    {
+        valuePtr = 0;
+
+        var snapshotPtr = _currentSnapshotPtr;
+        if (!NativeUtil.IsUserPtr(snapshotPtr))
+            return false;
+
+        try
+        {
+            var fieldInfo = *(nint*) (leafRec + 0x00);
+            if (!NativeUtil.IsUserPtr(fieldInfo))
+                return false;
+
+            // regionId: byte at stride-0x2E record offset +0x2c.
+            // RE: *(byte*)((long)plVar40 + 0x2c)  (EncodeField line 232)
+            var regionId = (uint) *(byte*) (leafRec + 0x2C);
+            if (regionId > MaxRegionId)
+                return false;
+
+            // fieldOffset: ushort at fieldInfo+0x20.
+            // RE: *(ushort*)(lVar16 + 0x20)  (EncodeField line 234)
+            var fieldOffset = (uint) *(ushort*) (fieldInfo + 0x20);
+
+            // Data-region array starts at snapshotPtr+0x30.
+            var regionArrayPtr = snapshotPtr + 0x30 + (nint)(regionId * 8);
+            if (!NativeUtil.IsUserPtr(regionArrayPtr))
+                return false;
+
+            var dataRegionBase = *(nint*) regionArrayPtr;
+            if (!NativeUtil.IsUserPtr(dataRegionBase))
+                return false;
+
+            var candidate = dataRegionBase + (nint) fieldOffset;
+            if (!NativeUtil.IsUserPtr(candidate))
+                return false;
+
+            valuePtr = candidate;
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
     /// <summary>
     ///     Walk the 8-bucket encoder-registry table at <see cref="RegistryAddr"/> and build a
     ///     fn-pointer → FieldType dictionary.
@@ -922,7 +1173,10 @@ internal static unsafe class FieldSubstitution
     ///           fixed32 = raw 32-bit write               → Fixed32
     ///           fixed64 = raw 64-bit write               → Fixed64
     ///       b3  qangle  = 3-float qangle/vector3          → QAngle3 / Vector3
-    ///           others  = quantized (coord/normal/etc)   → Unsupported (read quant state from value struct)
+    ///           coord   = quantized coord (3-comp)       → Coord3 (live-struct path)
+    ///           normal  = quantized normal (3-comp)      → Normal3 (live-struct path)
+    ///           coord_integral = coord integer (3-comp)  → CoordIntegral3 (live-struct path)
+    ///           quantized = default quantized float      → QuantizedFloat (live-struct path)
     ///       b4  default = raw 32-bit IEEE-754            → Float32
     ///       b5  all     = uint64/handle/string           → Unsupported
     ///       b6  all     = array                          → Unsupported
@@ -1018,13 +1272,18 @@ internal static unsafe class FieldSubstitution
                 if (name == "default") return FieldType.Bool;
                 return FieldType.Unsupported;
 
-            case 3: // qangle / vector3 bucket
-                // The qangle encoder (0x3c6220) reads 3 contiguous float32 from the scratch plus uses
-                // paramsPtr for its mode/bit-count — synthesizable.
-                // All other bucket-3 entries (coord, normal, coord_integral, quantized-default) read
-                // quantization state from the value struct, NOT from scratch alone — Unsupported.
-                if (name == "qangle") return FieldType.QAngle3;
-                if (name == "vector3") return FieldType.Vector3;
+            case 3: // qangle / vector3 / quantized-float bucket
+                // The qangle and vector3 encoders read 3 contiguous float32 from a synthesized scratch
+                // (no live-struct needed). The quantized-float family (coord, normal, coord_integral,
+                // quantized-default) requires reading the real value struct from the entity snapshot
+                // so the encoder's internal quant logic sees the true float — these use the live-struct
+                // (Option B) path in ValueCopyHook. See RE evidence in comments for TryGetLiveValuePtr.
+                if (name == "qangle")          return FieldType.QAngle3;
+                if (name == "vector3")         return FieldType.Vector3;
+                if (name == "coord")           return FieldType.Coord3;
+                if (name == "normal")          return FieldType.Normal3;
+                if (name == "coord_integral")  return FieldType.CoordIntegral3;
+                if (name == "quantized")       return FieldType.QuantizedFloat;
                 return FieldType.Unsupported;
 
             default:
