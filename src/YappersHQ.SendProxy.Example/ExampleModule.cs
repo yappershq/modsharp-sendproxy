@@ -403,11 +403,12 @@ public sealed class ExampleModule : IModSharpModule
         Reply(issuer, "enc1 (int b1): CCSPlayerPawn::m_iHealth = 1337 for all clients");
     }
 
-    // bucket 2 — unsigned int — m_unCurrentEquipmentValue: hide every player's loadout worth.
+    // bucket 2 — unsigned int — m_iTeamNum (uint8): every player shows as CT to all clients (radar
+    // colour / outline flip — very visible). Real use: disguise team membership.
     private void OnEncoder2(IGameClient? issuer, StringCommand command)
     {
-        _sendProxy?.SetUniform("CCSPlayerPawn", "m_unCurrentEquipmentValue", 16000);
-        Reply(issuer, "enc2 (uint b2): CCSPlayerPawn::m_unCurrentEquipmentValue = 16000 for all clients");
+        _sendProxy?.SetUniform("CCSPlayerPawn", "m_iTeamNum", 3);
+        Reply(issuer, "enc2 (uint b2): CCSPlayerPawn::m_iTeamNum = 3 (CT) — all players appear CT to every client (radar/outline)");
     }
 
     // bucket 3 — qangle/vector — m_angEyeAngles: every player appears to look backwards.
@@ -454,7 +455,7 @@ public sealed class ExampleModule : IModSharpModule
         }
 
         sp.Unhook("CCSPlayerPawn", "m_iHealth");
-        sp.Unhook("CCSPlayerPawn", "m_unCurrentEquipmentValue");
+        sp.Unhook("CCSPlayerPawn", "m_iTeamNum");
         sp.Unhook("CCSPlayerPawn", "m_angEyeAngles");
         sp.Unhook("CCSPlayerPawn", "m_flVelocityModifier");
         sp.Unhook("CCSPlayerController", "m_iszPlayerName");

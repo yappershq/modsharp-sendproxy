@@ -184,7 +184,7 @@ floats; `string` takes free text; `bytes` takes a contiguous hex string (e.g. `D
 | `sp_help` | Print the matrix + ready-to-paste examples |
 | `sp_fakehp <value>` | Preset — `SetUniform("CCSPlayerPawn","m_iHealth", value)` |
 | `sp_fakename <text>` | Preset — `SetUniform("CCSPlayerController","m_iszPlayerName", text)` (b5 string) |
-| `sp_encoder1`..`sp_encoder7` | One canned real-use demo per encoder bucket on a real field — 1 int `m_iHealth`=1337, 2 uint `m_unCurrentEquipmentValue`, 3 qangle `m_angEyeAngles`, 4 float `m_flVelocityModifier`, 5 string `m_iszPlayerName`, 6 bytes (none common — guidance), 7 bool `m_bIsScoped` |
+| `sp_encoder1`..`sp_encoder7` | One canned real-use demo per encoder bucket on a real field — 1 int `m_iHealth`=1337, 2 uint `m_iTeamNum` (all appear CT — radar/outline flip), 3 qangle `m_angEyeAngles`, 4 float `m_flVelocityModifier`, 5 string `m_iszPlayerName`, 6 bytes (none common — guidance), 7 bool `m_bIsScoped` |
 | `sp_encoders_off` | Revert all `sp_encoder1..7` demos |
 | `sp_probe_scan` | Read-only serializer probe — list live entities + classes, dump the first |
 | `sp_probe_dump <entityIndex>` | Read-only — dump one entity's serializer class info / field[0] |
