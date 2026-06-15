@@ -54,7 +54,13 @@ public sealed class ExampleModule : IModSharpModule
         }
 
         _conVar.CreateServerCommand("sp_example_fakehp", OnFakeHp,
-            "Spoof m_iHealth for an entity: sp_example_fakehp <entityIndex> <fakeValue>",
+            "Spoof m_iHealth for an entity (all-entity scope): sp_example_fakehp <entityIndex> <fakeValue>",
+            ConVarFlags.Release);
+
+        // Per-entity Phase-2 demo: uniform value for ONE specific entity, all clients see it.
+        _conVar.CreateServerCommand("sp_example_fakehp_entity", OnFakeHpEntity,
+            "Spoof m_iHealth for a SPECIFIC entity only (per-entity Phase-2 scope): "
+            + "sp_example_fakehp_entity <entityIndex> <fakeValue>",
             ConVarFlags.Release);
 
         // Per-client demo: different fake HP per recipient.
@@ -70,6 +76,7 @@ public sealed class ExampleModule : IModSharpModule
     public void Shutdown()
     {
         _conVar.ReleaseCommand("sp_example_fakehp");
+        _conVar.ReleaseCommand("sp_example_fakehp_entity");
         // Remove per-client callback on shutdown to avoid dangling references.
         _sendProxy?.UnhookAllPerClient();
         _conVar.ReleaseCommand("sp_example_perclienthp");
@@ -97,6 +104,30 @@ public sealed class ExampleModule : IModSharpModule
         });
 
         _logger.LogInformation("Hooked m_iHealth on entity {Entity} -> {Fake} (registered={Ok})", entity, fake, ok);
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnFakeHpEntity(StringCommand command)
+    {
+        if (_sendProxy is null)
+            return ECommandAction.Stopped;
+
+        if (command.ArgCount < 2
+            || !int.TryParse(command.GetArg(1), out var entity)
+            || !int.TryParse(command.GetArg(2), out var fake))
+        {
+            _logger.LogInformation("usage: sp_example_fakehp_entity <entityIndex> <fakeValue>");
+            return ECommandAction.Stopped;
+        }
+
+        // Scoped to entityIndex only — other players' CCSPlayerPawn m_iHealth is untouched.
+        // Every client receives `fake` when reading this specific entity's health.
+        // The Phase-2 WDE entity-index capture (_currentEntityIndex == entityIndex) gates substitution.
+        _sendProxy.SetEntitySpoof(entity, "CCSPlayerPawn", "m_iHealth", fake);
+
+        _logger.LogInformation(
+            "Per-entity m_iHealth spoof installed: ent={Entity} → {Fake} (all other entities unaffected)",
+            entity, fake);
         return ECommandAction.Stopped;
     }
 

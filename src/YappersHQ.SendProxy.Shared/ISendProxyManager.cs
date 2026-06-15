@@ -101,18 +101,42 @@ public interface ISendProxyManager
 
     /// <summary>
     ///     Register a per-client int substitution callback for (serializerName, fieldName).
-    ///     Replaces any existing callback for the same key. Installs Phase-2 detours on first use.
+    ///     Fires for ALL entities of that serializer (entityIndex == -1 scope).
+    ///     Replaces any existing global callback for the same key. Installs Phase-2 detours on first use.
     /// </summary>
     void HookInt(string serializerName, string fieldName, PerClientIntProxy callback);
 
     /// <summary>
-    ///     Remove the per-client callback for (serializerName, fieldName).
+    ///     Register a per-client int substitution callback scoped to a SPECIFIC entity index.
+    ///     When both a per-entity and a global (-1) registration exist for the same (ser, field),
+    ///     the per-entity registration wins for that entity's delta sends.
+    ///     Installs Phase-2 detours on first use.
+    /// </summary>
+    void HookEntityInt(int entityIndex, string serializerName, string fieldName, PerClientIntProxy callback);
+
+    /// <summary>
+    ///     Register a uniform (same value for every client) int spoof scoped to a SPECIFIC entity index.
+    ///     Convenience alternative to <see cref="HookEntityInt"/> when no per-client logic is needed.
+    ///     Installs Phase-2 detours on first use.
+    /// </summary>
+    void SetEntitySpoof(int entityIndex, string serializerName, string fieldName, int value);
+
+    /// <summary>
+    ///     Remove the entity-specific registration for (entityIndex, serializerName, fieldName).
+    ///     Does NOT affect the global (-1) registration for the same field.
+    ///     Does NOT uninstall Phase-2 detours.
+    /// </summary>
+    void UnhookEntity(int entityIndex, string serializerName, string fieldName);
+
+    /// <summary>
+    ///     Remove the global per-client callback for (serializerName, fieldName).
     ///     Does NOT uninstall Phase-2 detours (call <c>UnhookAllPerClient</c> for that).
     /// </summary>
     void UnhookInt(string serializerName, string fieldName);
 
     /// <summary>
-    ///     Remove ALL registered per-client callbacks and uninstall the Phase-2 sub-detours.
+    ///     Remove ALL registered per-client callbacks and entity-specific spoofs/callbacks,
+    ///     then uninstall the Phase-2 sub-detours.
     ///     Use this during plugin shutdown if you registered any callbacks.
     /// </summary>
     void UnhookAllPerClient();

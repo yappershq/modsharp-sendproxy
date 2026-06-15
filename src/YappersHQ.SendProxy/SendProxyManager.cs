@@ -142,38 +142,81 @@ internal sealed class SendProxyManager : ISendProxyManager
 
     // ── Phase-2 per-client raw callback API ──────────────────────────────────
 
+    /// <summary>Shared installer check — ensures Phase-2 sub-detours are up before registering anything.</summary>
+    private bool EnsureDetours(string context)
+    {
+        if (_ensureSubDetours is { } installer)
+        {
+            if (!installer()) { _logger.LogWarning("SendProxy: {Ctx} — Phase-2 sub-detours failed", context); return false; }
+            return true;
+        }
+        _logger.LogWarning("SendProxy: {Ctx} — Phase-2 installer not wired yet", context);
+        return false;
+    }
+
     /// <inheritdoc/>
     public void HookInt(string serializerName, string fieldName, PerClientIntProxy callback)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null)
             return;
 
-        if (_ensureSubDetours is { } installer)
-        {
-            if (!installer())
-            {
-                _logger.LogWarning(
-                    "SendProxy: HookInt(ser, field, callback) — Phase-2 sub-detours failed; "
-                    + "callback for \"{Ser}::{Field}\" NOT registered",
-                    serializerName, fieldName);
-                return;
-            }
-        }
-        else
-        {
-            _logger.LogWarning(
-                "SendProxy: HookInt(ser, field, callback) — Phase-2 installer not wired yet; "
-                + "callback for \"{Ser}::{Field}\" NOT registered",
-                serializerName, fieldName);
+        if (!EnsureDetours($"HookInt(\"{serializerName}::{fieldName}\")"))
             return;
-        }
 
         FieldSubstitution.SetCallback(serializerName, fieldName, callback);
         FieldSubstitution.Mode = SubstitutionMode.Fake;
 
         _logger.LogInformation(
-            "SendProxy: per-client callback registered for \"{Ser}::{Field}\"",
+            "SendProxy: per-client callback (all entities) registered for \"{Ser}::{Field}\"",
             serializerName, fieldName);
+    }
+
+    /// <inheritdoc/>
+    public void HookEntityInt(int entityIndex, string serializerName, string fieldName, PerClientIntProxy callback)
+    {
+        if (entityIndex < 0) { _logger.LogWarning("SendProxy: HookEntityInt — entityIndex must be >= 0 (got {Idx}); use HookInt for all-entity scope", entityIndex); return; }
+        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null)
+            return;
+
+        if (!EnsureDetours($"HookEntityInt(ent={entityIndex}, \"{serializerName}::{fieldName}\")"))
+            return;
+
+        FieldSubstitution.SetEntityCallback(entityIndex, serializerName, fieldName, callback);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+
+        _logger.LogInformation(
+            "SendProxy: per-client callback registered for ent={Ent} \"{Ser}::{Field}\"",
+            entityIndex, serializerName, fieldName);
+    }
+
+    /// <inheritdoc/>
+    public void SetEntitySpoof(int entityIndex, string serializerName, string fieldName, int value)
+    {
+        if (entityIndex < 0) { _logger.LogWarning("SendProxy: SetEntitySpoof — entityIndex must be >= 0 (got {Idx})", entityIndex); return; }
+        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName))
+            return;
+
+        if (!EnsureDetours($"SetEntitySpoof(ent={entityIndex}, \"{serializerName}::{fieldName}\")"))
+            return;
+
+        FieldSubstitution.SetEntitySpoof(entityIndex, serializerName, fieldName, value);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+
+        _logger.LogInformation(
+            "SendProxy: entity spoof registered ent={Ent} \"{Ser}::{Field}\" → {Value}",
+            entityIndex, serializerName, fieldName, value);
+    }
+
+    /// <inheritdoc/>
+    public void UnhookEntity(int entityIndex, string serializerName, string fieldName)
+    {
+        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName))
+            return;
+
+        FieldSubstitution.ClearEntityRegistration(entityIndex, serializerName, fieldName);
+        _logger.LogInformation(
+            "SendProxy: entity-specific registration removed for ent={Ent} \"{Ser}::{Field}\"",
+            entityIndex, serializerName, fieldName);
     }
 
     /// <inheritdoc/>
@@ -184,17 +227,17 @@ internal sealed class SendProxyManager : ISendProxyManager
 
         FieldSubstitution.ClearCallback(serializerName, fieldName);
         _logger.LogInformation(
-            "SendProxy: per-client callback removed for \"{Ser}::{Field}\"",
+            "SendProxy: global per-client callback removed for \"{Ser}::{Field}\"",
             serializerName, fieldName);
     }
 
     /// <inheritdoc/>
     public void UnhookAllPerClient()
     {
-        FieldSubstitution.ClearCallbacks();
-        if (!FieldSubstitution.HasSpoofs)
-            FieldSubstitution.Uninstall();
-        _logger.LogInformation("SendProxy: all per-client callbacks removed");
+        // Clear the entire registry (global + entity-specific) and uninstall detours.
+        FieldSubstitution.ClearAll();
+        FieldSubstitution.Uninstall();
+        _logger.LogInformation("SendProxy: all per-client registrations cleared, Phase-2 detours uninstalled");
     }
 
     internal void Clear()

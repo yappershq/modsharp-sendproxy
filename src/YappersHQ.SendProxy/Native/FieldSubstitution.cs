@@ -90,34 +90,100 @@ internal static unsafe class FieldSubstitution
         set => Interlocked.Exchange(ref _mode, (int) value);
     }
 
-    // ── Spoof registry ───────────────────────────────────────────────────────
+    // ── Unified registration record ──────────────────────────────────────────
+    //
+    //  A single registration holds an optional uniform spoof value and/or a per-client callback.
+    //  entityIndex in the dict key: -1 = all entities (global scope), >= 0 = specific entity.
+    //
+    //  Lookup in ValueCopyHook is a two-step probe:
+    //    1. (ser, field, _currentEntityIndex)  — entity-specific wins.
+    //    2. (ser, field, -1)                   — global fallback.
+    //  Both steps are plain ConcurrentDictionary.TryGetValue — no lock on hot path.
 
-    // Key: (serializerName, fieldName) → fake int32 value.
-    private static readonly ConcurrentDictionary<(string ser, string field), int> _spoofs = new();
+    private readonly struct SpoofEntry
+    {
+        public readonly bool             HasSpoof;
+        public readonly int              SpoofValue;
+        public readonly PerClientIntProxy? Callback;
+
+        public SpoofEntry(int spoofValue) : this()
+        {
+            HasSpoof   = true;
+            SpoofValue = spoofValue;
+        }
+
+        public SpoofEntry(PerClientIntProxy callback) : this()
+        {
+            Callback = callback;
+        }
+
+        public SpoofEntry(int spoofValue, PerClientIntProxy? callback) : this()
+        {
+            HasSpoof   = true;
+            SpoofValue = spoofValue;
+            Callback   = callback;
+        }
+    }
+
+    // Key: (ser, field, entityIndex) — entityIndex -1 = all entities.
+    private static readonly ConcurrentDictionary<(string ser, string field, int entityIndex), SpoofEntry> _registry = new();
+
+    // ── Global (all-entity) spoof / callback helpers ─────────────────────────
 
     public static void SetSpoof(string serializerName, string fieldName, int value)
-        => _spoofs[(serializerName, fieldName)] = value;
-
-    public static void ClearSpoofs() => _spoofs.Clear();
-    public static bool HasSpoofs    => !_spoofs.IsEmpty;
-
-    // ── Per-client callback registry ─────────────────────────────────────────
-    //
-    //  Key: (serializerName, fieldName) → PerClientIntProxy.
-    //  Callback receives: client (CServerSideClient*, 0 if not captured), entityIndex (-1 if unknown),
-    //  value (ref int, pre-seeded with uniform spoof or 0). Returns true → substitute; false → passthrough.
-    //  MUST be thread-safe and non-blocking. Throwing callbacks are caught → passthrough.
-
-    private static readonly ConcurrentDictionary<(string ser, string field), PerClientIntProxy> _callbacks = new();
+        => _registry[(serializerName, fieldName, -1)] = new SpoofEntry(value);
 
     public static void SetCallback(string serializerName, string fieldName, PerClientIntProxy callback)
-        => _callbacks[(serializerName, fieldName)] = callback;
+        => _registry[(serializerName, fieldName, -1)] = new SpoofEntry(callback);
 
     public static void ClearCallback(string serializerName, string fieldName)
-        => _callbacks.TryRemove((serializerName, fieldName), out _);
+        => _registry.TryRemove((serializerName, fieldName, -1), out _);
 
-    public static void ClearCallbacks() => _callbacks.Clear();
-    public static bool HasCallbacks     => !_callbacks.IsEmpty;
+    public static void ClearCallbacks()
+    {
+        // Remove only global (-1) callback entries; leave entity-specific spoofs.
+        foreach (var key in _registry.Keys)
+        {
+            if (key.entityIndex == -1 && _registry.TryGetValue(key, out var e) && e.Callback is not null)
+                _registry.TryRemove(key, out _);
+        }
+    }
+
+    public static void ClearSpoofs()
+    {
+        foreach (var key in _registry.Keys)
+        {
+            if (key.entityIndex == -1 && _registry.TryGetValue(key, out var e) && e.HasSpoof && e.Callback is null)
+                _registry.TryRemove(key, out _);
+        }
+    }
+
+    public static bool HasSpoofs    => !_registry.IsEmpty && HasEntriesMatching(static e => e.HasSpoof && e.Callback is null);
+    public static bool HasCallbacks => !_registry.IsEmpty && HasEntriesMatching(static e => e.Callback is not null);
+
+    private static bool HasEntriesMatching(Func<SpoofEntry, bool> pred)
+    {
+        foreach (var kv in _registry)
+            if (pred(kv.Value)) return true;
+        return false;
+    }
+
+    // ── Per-entity spoof / callback helpers ──────────────────────────────────
+
+    /// <summary>Register a uniform-value spoof for a specific entity index only.</summary>
+    public static void SetEntitySpoof(int entityIndex, string serializerName, string fieldName, int value)
+        => _registry[(serializerName, fieldName, entityIndex)] = new SpoofEntry(value);
+
+    /// <summary>Register a per-client callback scoped to a specific entity index only.</summary>
+    public static void SetEntityCallback(int entityIndex, string serializerName, string fieldName, PerClientIntProxy callback)
+        => _registry[(serializerName, fieldName, entityIndex)] = new SpoofEntry(callback);
+
+    /// <summary>Remove the entity-specific registration for (entityIndex, ser, field). Does not touch the global -1 entry.</summary>
+    public static void ClearEntityRegistration(int entityIndex, string serializerName, string fieldName)
+        => _registry.TryRemove((serializerName, fieldName, entityIndex), out _);
+
+    /// <summary>Remove ALL registrations (global + entity-specific). Called from UnhookAllPerClient before Uninstall.</summary>
+    public static void ClearAll() => _registry.Clear();
 
     // ── [ThreadStatic] per-call context ─────────────────────────────────────
 
@@ -399,17 +465,46 @@ internal static unsafe class FieldSubstitution
             if (fieldName.Length == 0)
                 goto Passthrough;
 
-            _spoofs.TryGetValue((serName, fieldName), out var uniformFakeValue);
-            _callbacks.TryGetValue((serName, fieldName), out var clientCallback);
-
-            if (clientCallback is null && !_spoofs.ContainsKey((serName, fieldName)))
-                goto Passthrough;
-
             var client      = RecipientCapture.CurrentClient;
             var entityIndex = _currentEntityIndex;
-            var fieldType   = Classify(leafRec);
+
+            // Two-step probe: entity-specific entry wins over the global (-1) fallback.
+            // Both lookups are lock-free ConcurrentDictionary.TryGetValue.
+            SpoofEntry reg;
+            bool hasReg;
+            if (entityIndex >= 0 && _registry.TryGetValue((serName, fieldName, entityIndex), out reg))
+            {
+                hasReg = true;
+            }
+            else if (_registry.TryGetValue((serName, fieldName, -1), out reg))
+            {
+                hasReg = true;
+            }
+            else
+            {
+                hasReg = false;
+            }
+
+            if (!hasReg)
+                goto Passthrough;
+
+            var fieldType = Classify(leafRec);
 
             var ln = Interlocked.Increment(ref _logCount);
+
+            // Diagnostic: log first MaxLogCount substitution matches with entity-targeting info.
+            if (ln <= MaxLogCount && _logger is { } diagSubstLog)
+            {
+                try
+                {
+                    var regEntIdx = _registry.TryGetValue((serName, fieldName, entityIndex), out _) && entityIndex >= 0
+                        ? entityIndex : -1;
+                    diagSubstLog.LogInformation(
+                        "SUBST ent={CurEnt} ser=\"{Ser}\" field=\"{Field}\" client=0x{Client:X} target={RegEnt}",
+                        entityIndex, serName, fieldName, client, regEntIdx);
+                }
+                catch { }
+            }
 
             if (mode == SubstitutionMode.Verify)
             {
@@ -422,25 +517,25 @@ internal static unsafe class FieldSubstitution
                     log.LogInformation(
                         "SUBST-VERIFY field=\"{Ser}::{Field}\" type={Type} client=0x{Client:X} ent={Ent} bitcount={Bits} "
                         + "cursorBefore={Before} cursorAfter={After} (fake would be {Fake})",
-                        serName, fieldName, fieldType, client, entityIndex, bitcount, cursorBefore, cursorAfter, uniformFakeValue);
+                        serName, fieldName, fieldType, client, entityIndex, bitcount, cursorBefore, cursorAfter, reg.SpoofValue);
                 }
                 return result;
             }
             else  // Fake
             {
                 // Determine effective fake value:
-                //   1. Start with the uniform spoof (0 if none).
-                //   2. Invoke per-client callback — may overwrite value and return true (substitute) or false (passthrough).
+                //   1. Start with the registered spoof value (0 if HasSpoof is false).
+                //   2. Invoke per-client callback if present — may overwrite value, returns true → substitute, false → passthrough.
                 // A throwing callback is caught → passthrough for this field/client.
 
-                int effectiveFake    = uniformFakeValue;
-                bool shouldSubstitute = clientCallback is null;
+                int  effectiveFake   = reg.HasSpoof ? reg.SpoofValue : 0;
+                bool shouldSubstitute = reg.Callback is null; // no callback → uniform spoof, always substitute
 
-                if (clientCallback is not null)
+                if (reg.Callback is not null)
                 {
                     try
                     {
-                        shouldSubstitute = clientCallback(client, entityIndex, ref effectiveFake);
+                        shouldSubstitute = reg.Callback(client, entityIndex, ref effectiveFake);
                     }
                     catch (Exception ex)
                     {
@@ -542,9 +637,9 @@ internal static unsafe class FieldSubstitution
                     }
                 }
 
-                if (ln <= MaxLogCount && _logger is { } log)
+                if (ln <= MaxLogCount && _logger is { } fakeLog)
                 {
-                    log.LogInformation(
+                    fakeLog.LogInformation(
                         "SUBST-FAKE field=\"{Ser}::{Field}\" type={Type} client=0x{Client:X} ent={Ent} bitcount={Bits} "
                         + "savedCursor={Saved} effectiveFake={Fake}",
                         serName, fieldName, fieldType, client, entityIndex, bitcount, savedCursor, effectiveFake);
