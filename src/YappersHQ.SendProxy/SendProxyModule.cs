@@ -20,14 +20,14 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private readonly InterfaceBridge _bridge;
     private readonly SendProxyManager _manager;
 
-    private nint _encodeFieldAddr;    // CFlattenedSerializer::EncodeField, resolved via sig on load
-    private nint _intEncoderAddr;    // CFlattenedSerializer::EncodeInt32, resolved via sig on load
-    private nint _wdeAddr;           // CNetworkGameServerBase::WriteDeltaEntity_Internal, resolved via sig on load
-    private nint _perClientEncodeAddr; // CNetworkGameServer::PerClientEncode, resolved via sig on load
-    private nint _writeFieldListAddr; // CFlattenedSerializer::WriteFieldList, resolved via sig on load
-    private nint _getBitRangeAddr;   // CFlattenedSerializer::GetBitRange, resolved via sig on load
-    private nint _bitCopyAddr;       // FUN_00500b70 (bit-copy primitive), resolved via sig on load
-    private nint _varintWriterAddr;  // FUN_00500890 (zigzag/varint writer), resolved via sig on load
+    private nint _encodeFieldAddr;     // CFlattenedSerializer::EncodeField
+    private nint _intEncoderAddr;      // CFlattenedSerializer::EncodeInt32
+    private nint _wdeAddr;             // CNetworkGameServerBase::WriteDeltaEntity_Internal
+    private nint _perClientEncodeAddr; // CNetworkGameServer::PerClientEncode
+    private nint _writeFieldListAddr;  // CFlattenedSerializer::WriteFieldList
+    private nint _getBitRangeAddr;     // CFlattenedSerializer::GetBitRange
+    private nint _bitCopyAddr;         // FUN_00500b70 (bit-copy primitive)
+    private nint _varintWriterAddr;    // FUN_00500890 (zigzag/varint writer)
 
     public SendProxyModule(
         ISharedSystem  sharedSystem,
@@ -44,9 +44,8 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
     public bool Init()
     {
-        // Loads gamedata/yappershq.sendproxy.jsonc (encode-path offsets/sigs). Non-fatal: the
-        // string-anchor resolution below doesn't depend on it, so a missing/invalid gamedata
-        // must not block module load.
+        // Loads gamedata/yappershq.sendproxy.jsonc (encode-path sigs). Non-fatal: a missing/invalid
+        // gamedata must not block module load — ResolveNativeTargets handles per-key failures.
         try
         {
             _bridge.GameData.Register("yappershq.sendproxy");
@@ -58,71 +57,48 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
         ResolveNativeTargets();
 
-        // Read-only diagnostic: dump an entity's serializer layout (entity vtable[0] ->
-        // CNetworkSerializerClassInfo) to confirm runtime offsets before the patch is wired.
+        // Read-only diagnostics: dump serializer layout + field record windows.
         _bridge.ConVarManager.CreateServerCommand("sp_dump", OnDumpCommand,
-            "Read-only: dump an entity's network serializer layout: sp_dump <entityIndex>",
+            "Dump an entity's network serializer layout: sp_dump <entityIndex>",
+            ConVarFlags.Release);
+        _bridge.ConVarManager.CreateServerCommand("sp_field", OnFieldCommand,
+            "Dump a serializer field record: sp_field <class> <fieldName>",
             ConVarFlags.Release);
 
-        // Read-only field-record dumper: sp_field <serializerClass> <fieldName>. Walks a live entity's
-        // serializer field array, dumps the qword window around the target field (resolves the field+0x38
-        // encoder-vs-offset question before any swap). e.g. sp_field CCSPlayerPawn m_iHealth
-        _bridge.ConVarManager.CreateServerCommand("sp_field", OnFieldCommand,
-            "Read-only: dump a serializer field record: sp_field <class> <fieldName>", ConVarFlags.Release);
-
-        // Read-only EncodeField detour probe (manual on/off — logs the real args of the first calls).
-        _bridge.ConVarManager.CreateServerCommand("sp_detour_on", OnDetourOn,
-            "Install the read-only EncodeField detour probe", ConVarFlags.Release);
-        _bridge.ConVarManager.CreateServerCommand("sp_detour_off", OnDetourOff,
-            "Uninstall the EncodeField detour probe", ConVarFlags.Release);
-
-        // Read-only int32 encoder probe: logs the first 12 m_iHealth encodes to reveal which
-        // argument register carries the spoofable value (rdx, rcx, or r8d). No value is modified.
+        // Probes (read-only, install/uninstall pairs).
         _bridge.ConVarManager.CreateServerCommand("sp_encprobe", OnEncProbeOn,
-            "Install the read-only IntEncoder detour probe (logs m_iHealth encodes)", ConVarFlags.Release);
+            "Install the read-only IntEncoder detour probe (logs m_iHealth encodes)",
+            ConVarFlags.Release);
         _bridge.ConVarManager.CreateServerCommand("sp_encprobe_off", OnEncProbeOff,
             "Uninstall the IntEncoder detour probe", ConVarFlags.Release);
 
-        // Read-only WriteDeltaEntity_Internal probe: logs first 40 calls (thread id + arg layout)
-        // to confirm serial per-client execution and reveal ctx field offsets for Phase-2 per-client spoofing.
         _bridge.ConVarManager.CreateServerCommand("sp_wdeprobe", OnWdeProbeOn,
-            "Install the read-only WriteDeltaEntity_Internal detour probe (logs first 40 calls with thread id + ctx fields)",
+            "Install the read-only WriteDeltaEntity_Internal probe (logs first 40 calls)",
             ConVarFlags.Release);
         _bridge.ConVarManager.CreateServerCommand("sp_wdeprobe_off", OnWdeProbeOff,
-            "Uninstall the WriteDeltaEntity_Internal detour probe", ConVarFlags.Release);
+            "Uninstall the WriteDeltaEntity_Internal probe", ConVarFlags.Release);
 
-        // Per-client encode entry probe: sp_recipcap (on) / sp_recipcap_off (off).
-        // Detours CNetworkGameServer::PerClientEncode; captures rsi (CServerSideClient*) into a
-        // [ThreadStatic] and logs the first 30 calls to confirm: one call per client, on worker
-        // threads, with a stable non-null pointer. Pure passthrough — no values modified.
+        // RecipientCapture: detours PerClientEncode; captures CServerSideClient* per send thread.
         _bridge.ConVarManager.CreateServerCommand("sp_recipcap", OnRecipCapOn,
             "Install the per-client encode entry probe (logs first 30 calls: tid + client ptr)",
             ConVarFlags.Release);
         _bridge.ConVarManager.CreateServerCommand("sp_recipcap_off", OnRecipCapOff,
             "Uninstall the per-client encode entry probe", ConVarFlags.Release);
 
-        // VERIFY-MODE WriteFieldList probe: sp_wflprobe (on) / sp_wflprobe_off (off).
-        // Detours CFlattenedSerializer::WriteFieldList; logs first 30 calls with thread id,
-        // RecipientCapture.CurrentClient, serializer name, first field name, changed-field count,
-        // and dst bf_write ptr.  Pure passthrough — no values modified.
-        // Confirms: (a) the captured client ptr is visible inside WFL, (b) field identity is
-        // readable from param_1 (the CFlattenedSerializer* in rdi), (c) which threads execute WFL.
+        // WriteFieldList probe: verifies client ptr + serializer identity inside WFL.
         _bridge.ConVarManager.CreateServerCommand("sp_wflprobe", OnWflProbeOn,
-            "Install the VERIFY-MODE WriteFieldList probe (logs first 30 calls: tid + client + serializer + field)",
+            "Install the WriteFieldList probe (logs first 30 calls: tid + client + serializer + field)",
             ConVarFlags.Release);
         _bridge.ConVarManager.CreateServerCommand("sp_wflprobe_off", OnWflProbeOff,
             "Uninstall the WriteFieldList probe", ConVarFlags.Release);
 
-        // Live value spoof: sp_fakehp <value> — makes all clients see fake HP; server keeps real.
+        // Phase-1 uniform spoof via IntEncoderDetour (all clients, field name keyed).
         _bridge.ConVarManager.CreateServerCommand("sp_fakehp", OnFakeHp,
             "Spoof m_iHealth for all clients: sp_fakehp <value>", ConVarFlags.Release);
         _bridge.ConVarManager.CreateServerCommand("sp_fakehp_off", OnFakeHpOff,
             "Stop spoofing m_iHealth", ConVarFlags.Release);
 
-        // Phase-2 per-client per-field substitution (WFL-level, bit-stream rewrite).
-        // sp_sub_verify — install all 3 sub-detours + register m_iHealth, mode=Verify (read-only logging).
-        // sp_fakehp2 <value> — set mode=Fake + register m_iHealth→value for all clients.
-        // sp_sub_off — mode=Off + clear registry + uninstall detours.
+        // Phase-2 per-client WFL-level substitution.
         _bridge.ConVarManager.CreateServerCommand("sp_sub_verify", OnSubVerify,
             "Install Phase-2 sub-detours in VERIFY mode (read-only, logs cursor math for m_iHealth)",
             ConVarFlags.Release);
@@ -133,17 +109,10 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
             "Disable Phase-2 field substitution, clear registry, uninstall sub-detours",
             ConVarFlags.Release);
 
-        if (!EncoderHook.Enabled)
-            _logger.LogWarning(
-                "SendProxy loaded in REGISTRATION-ONLY mode — the live encoder patch is disabled until "
-                + "the flattened-serializer offsets are verified on this build. Hooks register but values "
-                + "are not yet substituted. See README.");
-
         return true;
     }
 
-    // Gamedata keys. Sigs live in .assets/gamedata/yappershq.sendproxy.jsonc (makesig-derived,
-    // see tools/) — NOT hardcoded here, so a game-update only touches the json.
+    // Gamedata keys — sigs live in .assets/gamedata/yappershq.sendproxy.jsonc.
     private const string EncodeFieldKey        = "CFlattenedSerializer::EncodeField";
     private const string EncodeInt32Key        = "CFlattenedSerializer::EncodeInt32";
     private const string SendClientMessagesKey  = "CNetworkGameServer::SendClientMessages";
@@ -154,16 +123,11 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private const string BitCopyKey            = "CFlattenedSerializer::BitCopyPrimitive";
     private const string VarintWriterKey       = "CFlattenedSerializer::VarintWriter";
 
-    /// <summary>
-    ///     Resolve the encode-path functions from gamedata (single source of truth — sigs are in
-    ///     <c>gamedata/yappershq.sendproxy.jsonc</c>, generated with the makesig tooling in <c>tools/</c>).
-    ///     Touches no memory; just records addresses for the Phase-1 detour probe.
-    /// </summary>
     private void ResolveNativeTargets()
     {
         _encodeFieldAddr    = ResolveFromGameData(EncodeFieldKey);
         _intEncoderAddr     = ResolveFromGameData(EncodeInt32Key);
-        ResolveFromGameData(SendClientMessagesKey); // Phase-2 anchor; logged for verification only.
+        ResolveFromGameData(SendClientMessagesKey); // Phase-2 anchor; logged for verification.
         _wdeAddr            = ResolveFromGameData(WriteDeltaInternalKey);
         _perClientEncodeAddr = ResolveFromGameData(PerClientEncodeKey);
         _writeFieldListAddr = ResolveFromGameData(WriteFieldListKey);
@@ -172,44 +136,37 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _varintWriterAddr   = ResolveFromGameData(VarintWriterKey);
     }
 
-    // GetAddress throws KeyNotFoundException if the entry didn't resolve (sig miss / not registered).
-    // Isolate it so a single miss doesn't abort load — this is read-only groundwork.
     private nint ResolveFromGameData(string key)
     {
         try
         {
             var addr = _bridge.GameData.GetAddress(key);
-            _logger.LogInformation("SendProxy resolve {Key} (gamedata): fn=0x{Fn:X}", key, addr);
+            _logger.LogInformation("SendProxy resolve {Key}: fn=0x{Fn:X}", key, addr);
             return addr;
         }
         catch (Exception e)
         {
-            _logger.LogWarning("SendProxy: {Key} not resolved from gamedata: {Msg}", key, e.Message);
+            _logger.LogWarning("SendProxy: {Key} not resolved: {Msg}", key, e.Message);
             return 0;
         }
     }
 
     public void PostInit()
     {
-        // Wire the Phase-2 detour installer into SendProxyManager so HookInt(ser,field,cb) can
-        // lazily install sub-detours without needing a direct reference to SendProxyModule.
         _manager.SetSubDetourInstaller(EnsureSubDetours);
 
         _bridge.SharpModuleManager.RegisterSharpModuleInterface<ISendProxyManager>(
             this, ISendProxyManager.Identity, _manager);
 
-        // Drop hooks when an entity is deleted — its index gets reused (flaw #2 fix).
         _bridge.EntityManager.InstallEntityListener(this);
     }
 
-    // IEntityListener (other members use the interface's default no-op impls).
-    int IEntityListener.ListenerVersion => IEntityListener.ApiVersion;
+    int IEntityListener.ListenerVersion  => IEntityListener.ApiVersion;
     int IEntityListener.ListenerPriority => 0;
     void IEntityListener.OnEntityDeleted(IBaseEntity entity) => _manager.RemoveEntityHooks((int) entity.Index);
 
     public void Shutdown()
     {
-        EncodeFieldDetour.Uninstall();
         IntEncoderDetour.Uninstall();
         WriteDeltaProbe.Uninstall();
         RecipientCapture.Uninstall();
@@ -218,8 +175,6 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.EntityManager.RemoveEntityListener(this);
         _bridge.ConVarManager.ReleaseCommand("sp_dump");
         _bridge.ConVarManager.ReleaseCommand("sp_field");
-        _bridge.ConVarManager.ReleaseCommand("sp_detour_on");
-        _bridge.ConVarManager.ReleaseCommand("sp_detour_off");
         _bridge.ConVarManager.ReleaseCommand("sp_encprobe");
         _bridge.ConVarManager.ReleaseCommand("sp_encprobe_off");
         _bridge.ConVarManager.ReleaseCommand("sp_wdeprobe");
@@ -240,7 +195,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     {
         if (command.ArgCount < 1)
         {
-            SerializerProbe.Scan(_bridge, _logger); // no arg → scan for live entities + dump the first
+            SerializerProbe.Scan(_bridge, _logger);
             return ECommandAction.Stopped;
         }
 
@@ -258,42 +213,11 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     {
         if (command.ArgCount < 2)
         {
-            _logger.LogInformation("usage: sp_field <serializerClass> <fieldName>  (e.g. sp_field CCSPlayerPawn m_iHealth)");
+            _logger.LogInformation("usage: sp_field <serializerClass> <fieldName>");
             return ECommandAction.Stopped;
         }
 
         SerializerProbe.DumpField(_bridge, _logger, command.GetArg(1), command.GetArg(2));
-        return ECommandAction.Stopped;
-    }
-
-    private ECommandAction OnDetourOn(StringCommand command)
-    {
-        // UNSAFE: detouring EncodeField's *entry* CRASHES the server. EncodeField reads stack args
-        // (prologue: mov 0x38(%rbp),...), but this probe is a 6-arg cdecl passthrough — the trampoline
-        // call doesn't preserve the stack args, so the original reads garbage and crashes after a few
-        // calls (confirmed live 2026-06-14, ~8 hits then exit). It already served its purpose: proved
-        // managed interception + revealed the args (b/rsi=0, c/rdx-d/rcx=0x50). The real hook is the
-        // per-field encoder at field+0x38 (5 register args, no stack args) — see README/RE doc.
-        // Gated behind an explicit "force" arg so it can't be tripped accidentally.
-        if (command.ArgCount < 1 || command.GetArg(1) != "force")
-        {
-            _logger.LogWarning(
-                "sp_detour_on is DISABLED — the EncodeField-entry detour crashes the server (stack args "
-                + "not preserved by the 6-arg passthrough). Use 'sp_detour_on force' only on a throwaway "
-                + "server. The real value hook targets field+0x38, not EncodeField's entry.");
-            return ECommandAction.Stopped;
-        }
-
-        if (_encodeFieldAddr == 0)
-            _logger.LogWarning("sp_detour_on: EncodeField address not resolved — cannot install");
-        else
-            EncodeFieldDetour.Install(_bridge, _logger, _encodeFieldAddr);
-        return ECommandAction.Stopped;
-    }
-
-    private ECommandAction OnDetourOff(StringCommand command)
-    {
-        EncodeFieldDetour.Uninstall();
         return ECommandAction.Stopped;
     }
 
@@ -386,7 +310,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         return ECommandAction.Stopped;
     }
 
-    // ── Phase-2 field substitution commands ───────────────────────────────────────────────────
+    // ── Phase-2 field substitution ────────────────────────────────────────────
 
     private bool EnsureSubDetours()
     {
@@ -400,15 +324,13 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
             return false;
         }
 
-        // Populate FieldSubstitution address slots (idempotent — values don't change).
         FieldSubstitution.GetBitRangeAddr    = _getBitRangeAddr;
         FieldSubstitution.ValueCopyAddr      = _bitCopyAddr;
         FieldSubstitution.VarintWriterAddr   = _varintWriterAddr;
         FieldSubstitution.WriteFieldListAddr = _writeFieldListAddr;
-        // WDE address for entity-index capture (optional; 0 = skip, entityIndex in callbacks will be -1).
+        // WDE address for entity-index capture (0 = skip; entityIndex in callbacks will be -1).
         FieldSubstitution.WdeAddr            = _wdeAddr;
 
-        // Also ensure RecipientCapture is running so CurrentClient is valid during substitution.
         if (_perClientEncodeAddr != 0)
             RecipientCapture.Install(_bridge, _logger, _perClientEncodeAddr);
 
@@ -420,12 +342,11 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         if (!EnsureSubDetours())
             return ECommandAction.Stopped;
 
-        // Register m_iHealth on CCSPlayerPawn as the canary field.
-        FieldSubstitution.SetSpoof("CCSPlayerPawn", "m_iHealth", 0 /* ignored in Verify */);
+        FieldSubstitution.SetSpoof("CCSPlayerPawn", "m_iHealth", 0);
         FieldSubstitution.Mode = SubstitutionMode.Verify;
         _logger.LogInformation(
             "Phase-2 VERIFY mode active — watching CCSPlayerPawn::m_iHealth. "
-            + "Check logs for SUBST-VERIFY lines (cursor math, zero output change).");
+            + "Check logs for SUBST-VERIFY lines.");
         return ECommandAction.Stopped;
     }
 
@@ -453,7 +374,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         FieldSubstitution.ClearSpoofs();
         FieldSubstitution.ClearCallbacks();
         FieldSubstitution.Uninstall();
-        _logger.LogInformation("Phase-2 field substitution OFF — all sub-detours uninstalled");
+        _logger.LogInformation("Phase-2 field substitution OFF");
         return ECommandAction.Stopped;
     }
 }

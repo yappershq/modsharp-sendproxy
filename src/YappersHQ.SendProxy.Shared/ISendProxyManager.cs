@@ -27,27 +27,15 @@ public enum SendProxyResult
 
 // ── Per-client raw callback (Phase-2 low-level API) ──────────────────────────────
 //
-// PerClientIntProxy is the low-level per-field callback used by FieldSubstitution.
-// It fires on engine send threads (~6 workers) — MUST be thread-safe and non-blocking.
-//
-// Parameters:
-//   client      — raw CServerSideClient* (0 if RecipientCapture is not active)
-//   entityIndex — entity being encoded (from WDE ctx+0x34), -1 if not captured
-//   value       — ref int, pre-seeded with the registered uniform spoof value (or 0);
-//                 the callback may overwrite this with any desired value
-//
-// Returns:
-//   true  — substitute `value` into the encoded stream for this client
-//   false — leave the original value unchanged (passthrough)
-//
-// Exception safety: a throwing callback is caught by FieldSubstitution → passthrough.
+// PerClientIntProxy fires on engine send threads (~6 workers) — MUST be thread-safe and non-blocking.
+//   client      — CServerSideClient* (0 if RecipientCapture not active)
+//   entityIndex — from WDE ctx+0x34, -1 if not captured
+//   value       — ref int, pre-seeded with the registered uniform spoof value (or 0)
+//   returns     — true → substitute `value`; false → passthrough original
 
 public delegate bool PerClientIntProxy(nint client, int entityIndex, ref int value);
 
 // ── Proxy callbacks (per-type, value passed by ref) ──────────────────────────────
-// `client` is the recipient the field is being encoded for. It is null for a uniform
-// (all-clients) encode pass; non-null when per-client encoding is active (Phase 2).
-// `entity` is the entity index, `element` the array element (0 for scalar fields).
 
 public delegate SendProxyResult SendProxyIntCallback(IGameClient? client, int entity, string prop, int element, ref int value);
 
@@ -99,22 +87,15 @@ public interface ISendProxyManager
 
     // ── Phase-2 per-client raw callback API ──────────────────────────────────────────────────
     //
-    // HookInt(serializerName, fieldName, callback) registers a per-client callback on the named
-    // (serializer, field) pair at the FieldSubstitution level — bypassing the entity/hook
-    // bookkeeping used by HookInt(entity, prop, ...).  This is the Phase-2 substitution path
-    // that fires per client, per frame, for every entity that has the named field changed.
-    //
-    // This installs the Phase-2 sub-detours (WFL shim, GetBitRange, value-copy, WDE capture)
-    // and sets mode = Fake.  The uniform spoof (if any) for the same key is used as the
-    // initial `value` seed passed to the callback.
-    //
-    // Thread safety: callback runs on ~6 engine send threads — must be thread-safe + fast.
+    // Registers a callback on the raw (serializer, field) pair via FieldSubstitution — bypasses
+    // entity/hook bookkeeping. Installs Phase-2 sub-detours (WFL shim, GetBitRange, value-copy,
+    // WDE entity-index capture) on first use and switches to Fake mode.
+    // Thread safety: callback runs on ~6 engine send threads — must be thread-safe and fast.
     // Exception safety: a throwing callback is caught → passthrough for that field/client.
 
     /// <summary>
-    ///     Register a per-client int substitution callback for a raw (serializerName, fieldName)
-    ///     pair.  Replaces any existing callback for the same key.  Installs Phase-2 detours
-    ///     and switches to Fake mode if not already active.
+    ///     Register a per-client int substitution callback for (serializerName, fieldName).
+    ///     Replaces any existing callback for the same key. Installs Phase-2 detours on first use.
     /// </summary>
     void HookInt(string serializerName, string fieldName, PerClientIntProxy callback);
 

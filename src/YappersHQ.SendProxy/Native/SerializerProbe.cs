@@ -6,11 +6,8 @@ using Sharp.Shared.Units;
 namespace YappersHQ.SendProxy.Native;
 
 /// <summary>
-///     READ-ONLY diagnostic: resolve an entity's serializer the game-function way
-///     (vtable slot 0 = <c>GetNetworkSerializerInfo()</c>) and dump the
-///     <c>CNetworkSerializerClassInfo</c> head so the runtime offsets (m_pszClassName, m_Fields
-///     CUtlVector, field record layout) can be confirmed on the live build before any patch.
-///     Touches no engine state — only reads memory.
+///     READ-ONLY diagnostic: resolve an entity's serializer via vtable slot 0 (GetNetworkSerializerInfo)
+///     and dump CNetworkSerializerClassInfo to confirm runtime offsets. Reads memory only.
 /// </summary>
 internal static class SerializerProbe
 {
@@ -73,8 +70,7 @@ internal static class SerializerProbe
             if (classInfo == 0)
                 return;
 
-            // CONFIRMED layout: +0x00 m_nHash, +0x08 m_pszClassName, +0x10 field count(int),
-            // +0x18 field-array ptr (array of CNetworkSerializerFieldInfo*).
+            // CNetworkSerializerClassInfo: +0x00 m_nHash, +0x08 m_pszClassName, +0x10 field count, +0x18 field-array ptr.
             var className = TryReadAscii(*(nint*) (classInfo + 0x08));
             var fieldCount = *(int*) (classInfo + 0x10);
             var fieldArray = *(nint*) (classInfo + 0x18);
@@ -84,11 +80,8 @@ internal static class SerializerProbe
             if (fieldArray == 0 || fieldCount <= 0 || fieldCount > 4096)
                 return;
 
-            // Field record layout is already confirmed (m_FieldNameHash +0x00, m_pszFieldName +0x08,
-            // m_nFieldSize/m_nFieldOffset +0x38). Only read field[0]'s name via the confirmed offset.
-            // NOTE: ANY raw deref of engine memory can hit an unmapped page → AccessViolationException,
-            // which is UNCATCHABLE in .NET and aborts the process. So we do the minimum, no speculative
-            // qword scanning, no multi-field walk (that's what crashed the server before).
+            // Field record: +0x00 m_FieldNameHash, +0x08 char* m_pszFieldName, +0x38 m_nFieldSize/Offset.
+            // Only read field[0] — speculative multi-field walks hit unmapped pages (uncatchable AV).
             var rec0 = *(nint*) (fieldArray + 0);
             if (rec0 != 0)
             {
@@ -104,11 +97,10 @@ internal static class SerializerProbe
     }
 
     /// <summary>
-    ///     READ-ONLY: find the first live entity whose serializer class == <paramref name="classFilter"/>,
-    ///     walk its field array for <paramref name="fieldName"/>, and dump the raw qword window of that
-    ///     field record (offsets 0x28..0x50) with pointer-likeness tags. This resolves the open question
-    ///     of what lives at field+0x38 (encoder-dispatch ptr per the Ghidra decomp, vs m_nFieldSize/Offset
-    ///     per an earlier gdb read) BEFORE we swap anything. No writes. Every deref is range-gated.
+    ///     Find the first live entity with serializer class <paramref name="classFilter"/>, walk its
+    ///     field array for <paramref name="fieldName"/>, and dump the raw qword window (offsets 0x20..0x50)
+    ///     with pointer-likeness tags. Useful for confirming what lives at field+0x38 before patching.
+    ///     No writes. All derefs are range-gated.
     /// </summary>
     public static unsafe void DumpField(InterfaceBridge bridge, ILogger logger, string classFilter, string fieldName)
     {
@@ -132,7 +124,7 @@ internal static class SerializerProbe
                 logger.LogInformation("sp_field: matched class \"{Cls}\" at idx={Idx} (fields={Cnt})",
                     classFilter, i, count);
 
-                // "*" lists every field name+index (so we can discover the real networked name).
+                // "*" lists all field names.
                 if (fieldName == "*")
                 {
                     for (var f = 0; f < count; f++)
@@ -184,12 +176,10 @@ internal static class SerializerProbe
         }
     }
 
-    // Linux x64 mapped-pointer heuristic: high bytes == 0x00007F.. (heap/.so range). Cheap gate to
-    // avoid dereferencing scalar field values (small ints) as pointers and segfaulting.
+    // Linux x64 heap/rodata heuristic: high bytes == 0x00007F. PtrLike requires > 0x10000 to also
+    // exclude low-address constants; TryReadAscii uses strict 0x7F gate (same as NativeUtil.IsUserPtr).
     private static bool PtrLike(nint p) => p > 0x10000 && ((ulong) p >> 40) == 0x7F;
 
-    // Read up to 31 printable ASCII bytes at p. Gated to Linux x64 heap/rodata range
-    // (0x00007Fxx_xxxxxxxx) so we don't dereference scalar field values and segfault.
     private static unsafe string TryReadAscii(nint p)
     {
         if (p <= 0 || ((ulong) p >> 40) != 0x7F)

@@ -8,10 +8,10 @@ using YappersHQ.SendProxy.Shared;
 namespace YappersHQ.SendProxy;
 
 /// <summary>
-///     Hook bookkeeping + the public <see cref="ISendProxyManager"/> surface. Registration is
-///     fully implemented; the live per-field encoder swap is applied by <see cref="EncoderHook"/>
-///     once verified (see <see cref="FlattenedSerializerLayout"/>). Until then hooks are recorded
-///     and surfaced via the API, but values are not yet substituted on the wire.
+///     Hook bookkeeping and the public <see cref="ISendProxyManager"/> implementation.
+///     Phase-1 hooks (HookInt/HookFloat/etc.) are recorded in the registry and drive
+///     <see cref="ApplyEncoderSwap"/> once the Phase-1 encoder swap is implemented.
+///     Phase-2 per-client hooks use <see cref="FieldSubstitution"/> directly.
 /// </summary>
 internal sealed class SendProxyManager : ISendProxyManager
 {
@@ -21,16 +21,12 @@ internal sealed class SendProxyManager : ISendProxyManager
     private readonly Dictionary<(int Entity, string Prop), List<HookEntry>> _hooks = new();
     private readonly Dictionary<(int Entity, string Prop), List<PropChangeCallback>> _changeHooks = new();
 
-    // Injected by SendProxyModule — installs Phase-2 sub-detours and returns true on success.
+    // Injected by SendProxyModule.PostInit — installs Phase-2 sub-detours (idempotent).
     // Called lazily when the first per-client callback is registered.
     private Func<bool>? _ensureSubDetours;
 
     public SendProxyManager(ILogger logger) => _logger = logger;
 
-    /// <summary>
-    ///     Called by SendProxyModule during PostInit to wire the Phase-2 detour installer.
-    ///     The func is idempotent (hooks are only installed once).
-    /// </summary>
     internal void SetSubDetourInstaller(Func<bool> installer) => _ensureSubDetours = installer;
 
     private sealed record HookEntry(SendPropType Type, Delegate Callback, int Element);
@@ -45,14 +41,7 @@ internal sealed class SendProxyManager : ISendProxyManager
             _hooks[key] = list = [];
         list.Add(new HookEntry(type, cb, element));
 
-        if (!EncoderHook.Enabled)
-            _logger.LogWarning(
-                "SendProxy hook registered for {Entity}/{Prop} ({Type}) but the live encoder patch is "
-                + "DISABLED (offsets unverified) — value will NOT be substituted yet. See README.",
-                entity, prop, type);
-        else
-            ApplyEncoderSwap(entity, prop, type, element);
-
+        ApplyEncoderSwap(entity, prop, type, element);
         return true;
     }
 
@@ -88,8 +77,7 @@ internal sealed class SendProxyManager : ISendProxyManager
         if (list.Count == 0)
         {
             _hooks.Remove((entity, prop));
-            if (EncoderHook.Enabled)
-                RemoveEncoderSwap(entity, prop);
+            RemoveEncoderSwap(entity, prop);
         }
         return removed;
     }
@@ -97,25 +85,22 @@ internal sealed class SendProxyManager : ISendProxyManager
     public bool Unhook(int entity, string prop)
     {
         var had = _hooks.Remove((entity, prop));
-        if (had && EncoderHook.Enabled)
-            RemoveEncoderSwap(entity, prop);
+        if (had) RemoveEncoderSwap(entity, prop);
         return had;
     }
 
     public bool UnhookGameRules(string prop, Delegate callback) => Unhook(GameRulesEntity, prop, callback);
 
     /// <summary>
-    ///     Drop every hook bound to <paramref name="entity"/>. Called on entity deletion — entity
-    ///     indices are reused after a disconnect / round restart, so a stale hook would otherwise
-    ///     apply to a different entity that later takes the same index. (Flaw #2 fix.)
+    ///     Drop every hook bound to <paramref name="entity"/>. Called from IEntityListener.OnEntityDeleted —
+    ///     entity indices are reused after disconnect/round restart so stale hooks must not persist.
     /// </summary>
     internal void RemoveEntityHooks(int entity)
     {
         foreach (var key in _hooks.Keys.Where(k => k.Entity == entity).ToList())
         {
             _hooks.Remove(key);
-            if (EncoderHook.Enabled)
-                RemoveEncoderSwap(key.Entity, key.Prop);
+            RemoveEncoderSwap(key.Entity, key.Prop);
         }
 
         foreach (var key in _changeHooks.Keys.Where(k => k.Entity == entity).ToList())
@@ -138,24 +123,21 @@ internal sealed class SendProxyManager : ISendProxyManager
     public bool UnhookPropChange(int entity, string prop, PropChangeCallback callback)
         => _changeHooks.TryGetValue((entity, prop), out var list) && list.Remove(callback);
 
-    // ── Live encoder hook (Phase 1 completion — gated by EncoderHook.Enabled) ────────
-    // Resolution of (entity -> serializer -> field) is CONFIRMED LIVE: entity vtable[0] =
-    // GetNetworkSerializerInfo() -> CNetworkSerializerClassInfo (classname +0x08, field count
-    // +0x10, field-array ptr +0x18); each field record has m_FieldNameHash +0x00 / m_pszFieldName
-    // +0x08. BUT the value-substitution mechanism is NOT settled: the live dump disproved the
-    // "+0x38 encoder ptr" assumption (+0x38 = m_nFieldSize/m_nFieldOffset). The encode fn is
-    // resolved from the named m_NetworkEncoder at serialize time — there's no stored per-field
-    // encode ptr to swap in this record. Likely path: global detour of CFlattenedSerializer::
-    // EncodeField (resolved via FindFunction) + a hooked-(class,field) fast filter. See README.
-    private void ApplyEncoderSwap(int entity, string prop, SendPropType type, int element)
+    // ── Phase-1 encoder swap (TODO: implement once EncodeField dispatch is settled) ──
+    //
+    //  The live field record layout (verified by SerializerProbe) is:
+    //    +0x00 m_FieldNameHash, +0x08 m_pszFieldName*, +0x38 m_nFieldSize/m_nFieldOffset
+    //  There is no stored per-field encode-fn pointer in this record to swap; the encoder
+    //  is resolved from the named m_NetworkEncoder at serialize time. The substitution
+    //  mechanism is WFL-level (Phase-2). Phase-1 ApplyEncoderSwap is a no-op placeholder.
+    private static void ApplyEncoderSwap(int entity, string prop, SendPropType type, int element)
     {
-        // TODO(phase1-live): install EncodeField detour (or locate the cached dispatch block).
-        // No-op until the value-substitution mechanism is settled — never patch unverified memory.
+        // TODO(phase1): install EncodeField detour + field fast-filter when mechanism is settled.
     }
 
-    private void RemoveEncoderSwap(int entity, string prop)
+    private static void RemoveEncoderSwap(int entity, string prop)
     {
-        // TODO(phase1-live): restore the original encoder pointer.
+        // TODO(phase1): restore original encoder pointer.
     }
 
     // ── Phase-2 per-client raw callback API ──────────────────────────────────
@@ -166,13 +148,12 @@ internal sealed class SendProxyManager : ISendProxyManager
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null)
             return;
 
-        // Install Phase-2 sub-detours on first use (idempotent if already installed).
         if (_ensureSubDetours is { } installer)
         {
             if (!installer())
             {
                 _logger.LogWarning(
-                    "SendProxy: HookInt(ser, field, callback) — Phase-2 sub-detours failed to install; "
+                    "SendProxy: HookInt(ser, field, callback) — Phase-2 sub-detours failed; "
                     + "callback for \"{Ser}::{Field}\" NOT registered",
                     serializerName, fieldName);
                 return;
@@ -211,7 +192,6 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void UnhookAllPerClient()
     {
         FieldSubstitution.ClearCallbacks();
-        // Only uninstall if there are no uniform spoofs left either.
         if (!FieldSubstitution.HasSpoofs)
             FieldSubstitution.Uninstall();
         _logger.LogInformation("SendProxy: all per-client callbacks removed");
