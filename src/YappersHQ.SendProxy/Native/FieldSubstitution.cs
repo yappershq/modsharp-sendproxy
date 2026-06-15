@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Concurrent;
+using System.Collections.Generic;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
@@ -66,16 +67,17 @@ namespace YappersHQ.SendProxy.Native;
 
 internal enum SubstitutionMode { Off, Verify, Fake }
 
-// Network encoder family for a registered field, decided from the field's encoder-fn identity.
-//   Int32/Int64 — signed integer, EncodeInt32 (zigzag varint). Both share the same encoder; the
-//                 zigzag is computed over the sign-extended 64-bit value so the byte stream is
-//                 identical for an int value that fits 32 bits.
-//   UInt32      — unsigned integer, EncodeUInt32 (raw varint, no zigzag).
-//   Bool        — 1-bit field, EncodeBool.
-//   Float32     — 32-bit IEEE-754, EncodeFloat32 (raw 32-bit inline write).
-//   Unsupported — anything else (quantized float/vector, handle/64-bit-special, string/bytes,
-//                 unresolved encoder). MUST passthrough — never substitute.
-internal enum FieldType { Unsupported = 0, Int32, UInt32, Int64, Bool, Float32 }
+// Network encoder family for a registered field, decided by walking the encoder registry table.
+//   Int32Signed — bucket 1 "default" (signed int8/16/32/64, zigzag varint).
+//   UInt32      — bucket 2 "default" (unsigned int8/16/32/64, raw varint, no zigzag).
+//   Fixed32     — bucket 1 or 2 "fixed32" (raw 32-bit write, no varint).
+//   Fixed64     — bucket 1 or 2 "fixed64" (raw 64-bit write, no varint).
+//   Bool        — bucket 7 "default" (1-bit fixed write).
+//   Float32     — bucket 4 "default" (raw 32-bit IEEE-754 inline write).
+//   Int64       — alias of Int32Signed (same encoder, value is sign-extended before zigzag).
+//   Unsupported — anything else (quantized float/vector, handle, string/bytes, arrays,
+//                 bucket 0 no-op stub, unresolved table). MUST passthrough — never substitute.
+internal enum FieldType { Unsupported = 0, Int32, UInt32, Int64, Bool, Float32, Fixed32, Fixed64 }
 
 internal static unsafe class FieldSubstitution
 {
@@ -162,14 +164,18 @@ internal static unsafe class FieldSubstitution
     public static nint WriteFieldListAddr; // file-vaddr 0x343b60
     public static nint WdeAddr;            // WriteDeltaEntity_Internal (0 = skip entity-index capture)
 
-    // ── Encoder-identity addresses (set by SendProxyModule before Install) ────────────────────
-    //  Used ONLY to classify a field's network type by comparing against the encoder fn the engine
-    //  installed at  *( *(fieldInfo+0x38) + 0x30 ).  None of these are ever called.  A 0 value
-    //  disables that type (Classify returns Unsupported → passthrough).
-    public static nint EncSignedAddr;      // EncodeInt32 (signed int8/16/32/64, zigzag varint)
-    public static nint EncUInt32Addr;      // EncodeUInt32 (unsigned int8/16/32/64, raw varint)
-    public static nint EncFloat32Addr;     // EncodeFloat32 (raw 32-bit IEEE-754)
-    public static nint EncBoolAddr;        // EncodeBool (1 bit)
+    // ── Encoder registry table (set by SendProxyModule before Install) ───────
+    //  Absolute address of the 8-bucket encoder-registry table in networksystem's .data section
+    //  (file-vaddr 0x45f360, resolved via "CFlattenedSerializer::EncoderRegistry" gamedata entry).
+    //  Set to 0 if gamedata resolution failed — Classify returns Unsupported for every field (safe).
+    public static nint RegistryAddr;
+
+    // ── Lazy fn→FieldType map (built once from the registry table on first Install) ──────────
+    //  Key   = encode fn pointer read from entry+0x30 inside each registry bucket.
+    //  Value = FieldType classification per bucket index and entry name.
+    //  Built under _encoderTypesLock; after that, read-only (concurrent reads safe without lock).
+    private static Dictionary<nint, FieldType>? _encoderTypes;
+    private static readonly object _encoderTypesLock = new();
 
     // ── Install / Uninstall ──────────────────────────────────────────────────
 
@@ -181,6 +187,17 @@ internal static unsafe class FieldSubstitution
             return false;
 
         _varintWriter = (delegate* unmanaged[Cdecl]<nint, ulong, void>) VarintWriterAddr;
+
+        // Build fn→FieldType map from registry table if not yet done.
+        // Thread-safe: double-checked lock; map is read-only after this point.
+        if (_encoderTypes is null)
+        {
+            lock (_encoderTypesLock)
+            {
+                if (_encoderTypes is null)
+                    _encoderTypes = BuildEncoderTypeMap(logger);
+            }
+        }
 
         // 1. WFL shim — captures serializer ptr (rdi) into _currentSerializer [ThreadStatic].
         if (_wflShimHook is null)
@@ -485,6 +502,24 @@ internal static unsafe class FieldSubstitution
                         _varintWriter(dst, (uint) effectiveFake);
                         break;
                     }
+                    case FieldType.Fixed32:
+                    {
+                        // Raw 32-bit fixed-width write (no varint, no zigzag).
+                        // Used by signed/unsigned integer fields tagged with "fixed32" in the registry.
+                        // effectiveFake carries the 32-bit pattern (callers may pass via BitConverter).
+                        WriteUBitLong(dst, (uint) effectiveFake, 32);
+                        break;
+                    }
+                    case FieldType.Fixed64:
+                    {
+                        // Raw 64-bit fixed-width write: two consecutive 32-bit little-endian words.
+                        // The int API means high 32 bits come from sign-extension of effectiveFake.
+                        // For typical use (substitute a 32-bit-range value) high word is 0 or ~0.
+                        var u = (ulong) (long) effectiveFake; // sign-extend int → long → ulong
+                        WriteUBitLong(dst, (uint)  u,         32); // low  word
+                        WriteUBitLong(dst, (uint) (u >> 32),  32); // high word
+                        break;
+                    }
                     case FieldType.Bool:
                     {
                         WriteUBitLong(dst, effectiveFake != 0 ? 1u : 0u, 1);
@@ -621,17 +656,19 @@ internal static unsafe class FieldSubstitution
     ///
     ///     The leaf record's +0x00 is the CNetworkSerializerFieldInfo*. The engine dispatches
     ///     encoding through  encoderFn = *( *(fieldInfo+0x38) + 0x30 )  — fieldInfo+0x38 is the
-    ///     type-bucket handler object, slot[6] (+0x30) is its encode fn. We compare that fn pointer
-    ///     against the known encoder identities resolved from gamedata.
+    ///     type-bucket handler object, slot[6] (+0x30) is its encode fn. We look that fn up in
+    ///     the _encoderTypes map built from the registry table by BuildEncoderTypeMap.
     ///
-    ///     Verified (CS2 dedicated, 2026-06 build): EncodeInt32 0x3c8e70 (signed, zigzag varint),
-    ///     EncodeUInt32 0x3c8e90 (raw varint), EncodeFloat32 0x3ce8e0 (32-bit inline),
-    ///     EncodeBool 0x3c4c00 (1-bit inline). All dereferences are IsUserPtr-gated; any fault or
-    ///     unrecognised encoder yields Unsupported → caller passes through (never corrupts bits).
+    ///     Any fault or fn not found in the map yields Unsupported → caller passes through
+    ///     (never corrupts bits).
     /// </summary>
     private static FieldType Classify(nint leafRec)
     {
         if (!NativeUtil.IsUserPtr(leafRec))
+            return FieldType.Unsupported;
+
+        var map = _encoderTypes;
+        if (map is null)
             return FieldType.Unsupported;
 
         try
@@ -648,17 +685,132 @@ internal static unsafe class FieldSubstitution
             if (!NativeUtil.IsUserPtr(encoderFn))
                 return FieldType.Unsupported;
 
-            // Compare against resolved identities (0 entries are skipped → that type disabled).
-            if (EncSignedAddr  != 0 && encoderFn == EncSignedAddr)  return FieldType.Int32;
-            if (EncUInt32Addr  != 0 && encoderFn == EncUInt32Addr)  return FieldType.UInt32;
-            if (EncFloat32Addr != 0 && encoderFn == EncFloat32Addr) return FieldType.Float32;
-            if (EncBoolAddr    != 0 && encoderFn == EncBoolAddr)    return FieldType.Bool;
-
-            return FieldType.Unsupported;
+            return map.TryGetValue(encoderFn, out var t) ? t : FieldType.Unsupported;
         }
         catch
         {
             return FieldType.Unsupported;
+        }
+    }
+
+    /// <summary>
+    ///     Walk the 8-bucket encoder-registry table at <see cref="RegistryAddr"/> and build a
+    ///     fn-pointer → FieldType dictionary.
+    ///
+    ///     Registry layout (file-vaddr 0x45f360):
+    ///       8 × 16-byte buckets: { nint handler (+0x00), int count (+0x08) }
+    ///       handler → array of `count` entries, stride 0x80:
+    ///         entry+0x00 = char* name
+    ///         entry+0x30 = encode fn ptr
+    ///
+    ///     Bucket semantics (b-index → classification):
+    ///       b0  default = no-op stub                     → Unsupported
+    ///       b1  default = signed zigzag varint           → Int32Signed (Int32)
+    ///           fixed32 = raw 32-bit write               → Fixed32
+    ///           fixed64 = raw 64-bit write               → Fixed64
+    ///       b2  default = unsigned raw varint            → UInt32
+    ///           fixed32 = raw 32-bit write               → Fixed32
+    ///           fixed64 = raw 64-bit write               → Fixed64
+    ///       b3  all     = quantized float/vector/angle   → Unsupported (multi-component)
+    ///       b4  default = raw 32-bit IEEE-754            → Float32
+    ///       b5  all     = uint64/handle/string           → Unsupported
+    ///       b6  all     = array                          → Unsupported
+    ///       b7  default = 1-bit bool                     → Bool
+    ///
+    ///     Invalid/non-user-ptr fn ptrs and Unsupported types are silently skipped.
+    ///     Returns an empty (but non-null) dictionary on any global fault.
+    /// </summary>
+    private static Dictionary<nint, FieldType> BuildEncoderTypeMap(ILogger logger)
+    {
+        var map = new Dictionary<nint, FieldType>();
+
+        if (RegistryAddr == 0)
+        {
+            logger.LogWarning("FieldSubstitution: registry address is 0 — encoder type map will be empty (all fields Unsupported)");
+            return map;
+        }
+
+        try
+        {
+            for (var b = 0; b < 8; b++)
+            {
+                var bucketBase = RegistryAddr + b * 16;
+                var handler    = *(nint*) (bucketBase + 0x00);
+                var count      = *(int*)  (bucketBase + 0x08);
+
+                if (!NativeUtil.IsUserPtr(handler) || count <= 0 || count > 32)
+                    continue;
+
+                for (var e = 0; e < count; e++)
+                {
+                    var entry = handler + e * 0x80;
+
+                    nint namePtr, fn;
+                    try
+                    {
+                        namePtr = *(nint*) (entry + 0x00);
+                        fn      = *(nint*) (entry + 0x30);
+                    }
+                    catch { continue; }
+
+                    if (!NativeUtil.IsUserPtr(fn))
+                        continue;
+
+                    var name = NativeUtil.ReadShortAscii(namePtr, 32);
+                    var type = ClassifyByBucketAndName(b, name);
+
+                    if (type == FieldType.Unsupported)
+                        continue;
+
+                    map[fn] = type;
+                    logger.LogInformation(
+                        "FieldSubstitution registry: bucket={B} name=\"{Name}\" fn=0x{Fn:X} → {Type}",
+                        b, name, fn, type);
+                }
+            }
+
+            logger.LogInformation("FieldSubstitution: encoder type map built — {Count} entries", map.Count);
+        }
+        catch (Exception ex)
+        {
+            logger.LogWarning(ex, "FieldSubstitution: BuildEncoderTypeMap faulted — partial or empty map");
+        }
+
+        return map;
+    }
+
+    /// <summary>
+    ///     Determine FieldType from (bucket index, encoder entry name).
+    ///     Returns Unsupported for any bucket/name combination we don't substitute.
+    /// </summary>
+    private static FieldType ClassifyByBucketAndName(int bucket, string name)
+    {
+        switch (bucket)
+        {
+            case 1: // signed int bucket
+                if (name == "default") return FieldType.Int32;
+                if (name == "fixed32") return FieldType.Fixed32;
+                if (name == "fixed64") return FieldType.Fixed64;
+                return FieldType.Unsupported;
+
+            case 2: // unsigned int bucket
+                if (name == "default") return FieldType.UInt32;
+                if (name == "fixed32") return FieldType.Fixed32;
+                if (name == "fixed64") return FieldType.Fixed64;
+                return FieldType.Unsupported;
+
+            case 4: // float32 bucket
+                if (name == "default") return FieldType.Float32;
+                return FieldType.Unsupported;
+
+            case 7: // bool bucket
+                if (name == "default") return FieldType.Bool;
+                return FieldType.Unsupported;
+
+            default:
+                // b0 (no-op), b3 (quantized float/vector/angle), b5 (uint64/handle/string),
+                // b6 (array): none are substitutable.
+                return FieldType.Unsupported;
         }
     }
 

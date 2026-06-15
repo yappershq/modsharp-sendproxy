@@ -28,9 +28,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private nint _getBitRangeAddr;     // CFlattenedSerializer::GetBitRange
     private nint _bitCopyAddr;         // FUN_00500b70 (bit-copy primitive)
     private nint _varintWriterAddr;    // FUN_00500890 (zigzag/varint writer)
-    private nint _encUInt32Addr;       // EncodeUInt32 identity (raw varint, no zigzag)
-    private nint _encFloat32Addr;      // EncodeFloat32 identity (32-bit inline write)
-    private nint _encBoolAddr;         // EncodeBool identity (1-bit inline write)
+    private nint _registryAddr;        // CFlattenedSerializer::EncoderRegistry table base
 
     public SendProxyModule(
         ISharedSystem  sharedSystem,
@@ -125,9 +123,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private const string GetBitRangeKey        = "CFlattenedSerializer::GetBitRange";
     private const string BitCopyKey            = "CFlattenedSerializer::BitCopyPrimitive";
     private const string VarintWriterKey       = "CFlattenedSerializer::VarintWriter";
-    private const string EncodeUInt32Key       = "CFlattenedSerializer::EncodeUInt32";
-    private const string EncodeFloat32Key      = "CFlattenedSerializer::EncodeFloat32";
-    private const string EncodeBoolKey         = "CFlattenedSerializer::EncodeBool";
+    private const string EncoderRegistryKey    = "CFlattenedSerializer::EncoderRegistry";
 
     private void ResolveNativeTargets()
     {
@@ -140,11 +136,8 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _getBitRangeAddr    = ResolveFromGameData(GetBitRangeKey);
         _bitCopyAddr        = ResolveFromGameData(BitCopyKey);
         _varintWriterAddr   = ResolveFromGameData(VarintWriterKey);
-        // Encoder-identity probes for per-field-type classification (not called; compared against
-        // the field's encoder fn ptr). A failed resolve only disables that type → passthrough.
-        _encUInt32Addr      = ResolveFromGameData(EncodeUInt32Key);
-        _encFloat32Addr     = ResolveFromGameData(EncodeFloat32Key);
-        _encBoolAddr        = ResolveFromGameData(EncodeBoolKey);
+        // Encoder registry table base — walked once at Install to build fn→FieldType map.
+        _registryAddr       = ResolveFromGameData(EncoderRegistryKey);
     }
 
     private nint ResolveFromGameData(string key)
@@ -341,12 +334,9 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         FieldSubstitution.WriteFieldListAddr = _writeFieldListAddr;
         // WDE address for entity-index capture (0 = skip; entityIndex in callbacks will be -1).
         FieldSubstitution.WdeAddr            = _wdeAddr;
-        // Encoder-identity addresses for per-field-type classification. EncodeInt32 (signed) reuses
-        // the already-resolved _intEncoderAddr. Any 0 here disables that type → passthrough.
-        FieldSubstitution.EncSignedAddr      = _intEncoderAddr;
-        FieldSubstitution.EncUInt32Addr      = _encUInt32Addr;
-        FieldSubstitution.EncFloat32Addr     = _encFloat32Addr;
-        FieldSubstitution.EncBoolAddr        = _encBoolAddr;
+        // Registry table base for runtime fn→FieldType classification. 0 → Classify always returns
+        // Unsupported (all substitutions pass through — safe but inert).
+        FieldSubstitution.RegistryAddr       = _registryAddr;
 
         if (_perClientEncodeAddr != 0)
             RecipientCapture.Install(_bridge, _logger, _perClientEncodeAddr);

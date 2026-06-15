@@ -70,33 +70,26 @@
       "linux": "8B 4F 10 48 89 F2 8B 47 0C F6 C1 07 75 0B"
     },
 
-    // ── Phase-2b: per-field-type classification (encoder-identity probes) ─────────────────
-    // These addresses are NOT called. They identify which encode-fn the engine's type bucket
-    // installs at fieldInfo->handler[slot6]. FieldSubstitution.Classify() reads the field's encoder
-    // fn ptr ( *( *(fieldInfo+0x38) + 0x30 ) ) and compares against these to decide how to emit
-    // the substitute bits. An unrecognised encoder → Unsupported → passthrough (never corrupt).
+    // ── Phase-2b: encoder registry table (runtime classification) ────────────────────────
+    // CFlattenedSerializer::EncoderRegistry — the 8-bucket descriptor table in networksystem's
+    // .data section (file-vaddr 0x45f360). Layout: 8 × 16-byte buckets {handler*(+0x00), int count(+0x08)}.
+    // Each handler → array of `count` encoder entries (stride 0x80):
+    //   slot[0] (+0x00) = char* encoder-name
+    //   slot[6] (+0x30) = encode fn ptr
+    // At runtime, FieldSubstitution walks this table once (lazy, on Install) to build a
+    // fn→FieldType dictionary. Classify() then does a single dict lookup instead of hardcoded comparisons.
     //
-    // EncodeInt32 (signed integers) is the existing CFlattenedSerializer::EncodeInt32 (RVA 0x3c8e70):
-    //   mov rax,[rcx]; zigzag (lea/sar/xor); call VarintWriter. Serves int8/16/32/64 (signed).
-    //
-    // EncodeUInt32 (unsigned integers, RVA 0x3c8e90): mov rsi,[rcx]; call VarintWriter — raw, no
-    // zigzag. Serves uint8/16/32/64. (12B sig includes the concrete rel32 to VarintWriter for
-    // uniqueness; the thin wrapper body alone is shared by several thunks.)
-    "CFlattenedSerializer::EncodeUInt32": {
+    // Sig is the table-load lea in the registry initialiser:
+    //   lea rax, [rip+disp32]   ; rax = &table
+    //   add rax, rdx            ; rdx = bucket index * 16
+    //   movsxd r12, [rax+0x08] ; count = *(int*)(bucket+8)
+    //   mov r13, [rax]          ; handler = *(nint*)(bucket)
+    // factory "+3 r" skips the 3-byte opcode (48 8D 05) to the rel32 displacement, then RIP-resolves
+    // → absolute address of the table (confirmed unique in networksystem, resolves 0x45f360).
+    "CFlattenedSerializer::EncoderRegistry": {
       "library": "networksystem",
-      "linux": "48 8B 31 55 48 89 E5 E8 F4 79 03 00 B8 01 00 00 00 5D"
-    },
-    // EncodeFloat32 (RVA 0x3ce8e0): movsd xmm0,[value]; cvtsd2ss; writes exactly 32 raw bits inline
-    // into the bf_write at dst+0x10 (no varint). We replicate the 32-bit fixed write to substitute.
-    "CFlattenedSerializer::EncodeFloat32": {
-      "library": "networksystem",
-      "linux": "8B 57 0C 48 89 C8 8B 4F 10 89 D6 29 CE 83 FE 1F 7E 76"
-    },
-    // EncodeBool (RVA 0x3c4c00): reads 1 byte from value, writes exactly 1 bit inline into the
-    // bf_write. We replicate the 1-bit fixed write to substitute (bool = value != 0).
-    "CFlattenedSerializer::EncodeBool": {
-      "library": "networksystem",
-      "linux": "48 89 C8 8B 57 0C 8B 4F 10 39 CA 7E 33"
+      "linux": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28",
+      "factory": "+3 r"
     }
   }
 }
