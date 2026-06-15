@@ -19,8 +19,12 @@ namespace YappersHQ.SendProxy.Native;
 //
 //    1.  GetBitRange  (FUN_00426260, file-vaddr 0x326260):
 //            FUN_00426260(appppsStack_18b58, DAT_00577a58, uVar24)
-//        Third argument (uVar24) is the changed-field index.  We detour this
-//        to capture the field index into a [ThreadStatic].
+//        rdi=arg1 (CFieldPath* pathOut — WFL stack buffer), rsi=arg2 (descriptor
+//        table), rdx=arg3 (opaque registry index — NOT a bit-packed field path).
+//        We detour to CALL THE ORIGINAL FIRST (so pathOut gets filled by the
+//        engine), then capture arg1 into [ThreadStatic] _currentFieldPath.
+//        The pathOut buffer remains valid through the following value-copy call
+//        on the same thread.
 //
 //    2.  Value-copy primitive  (FUN_00500b70, file-vaddr 0x400b70):
 //            FUN_00500b70(&puStack_18b38, &lStack_18b08, iVar3 - iVar30)
@@ -39,6 +43,13 @@ namespace YappersHQ.SendProxy.Native;
 //    void(bf_write* dst, uint32 zigzag)
 //    rdi=dst, rsi=zigzag.  Zigzag encoding: (uint)((v<<1)^(v>>31)).
 //
+//  CFieldPath header layout (verified by RE of GetBitRange output buffer):
+//    hdr+0x00..0x0F : up to 8 inline short indices (when read-only flag is 0)
+//    hdr+0x18       : count (short) — number of valid path levels (0..7)
+//    hdr+0x1A       : read-only flag (byte); when != 0 the first 8 bytes are a
+//                     pointer to an external short[] rather than inline indices
+//    Sentinel: 0x7FFF at idx[0] means no valid path (return "").
+//
 //  MODES:
 //    Off    — pure passthrough, detours uninstalled.
 //    Verify — detours installed; for proxied fields, logs cursor math + field
@@ -47,7 +58,7 @@ namespace YappersHQ.SendProxy.Native;
 //    Fake   — full substitution: save/call-original/rewind/varint-write.
 //
 //  THREAD SAFETY:
-//    All mutable state is either [ThreadStatic] (field index, serializer ptr)
+//    All mutable state is either [ThreadStatic] (field path ptr, serializer ptr)
 //    or read-only after Install() (fn ptrs, spoof table snapshot per-call).
 //    _spoofs is a ConcurrentDictionary — safe for concurrent set + read.
 //
@@ -80,15 +91,19 @@ internal static unsafe class FieldSubstitution
 
     // ── [ThreadStatic] per-call context ─────────────────────────────────────
 
-    // Set in GetBitRange detour, consumed in value-copy detour on the same thread.
-    [ThreadStatic] private static uint _currentFieldIndex;    // changed-field index captured from GetBitRange arg3
+    // Set in GetBitRange detour AFTER the original runs (so pathOut is filled).
+    // Points to the WFL stack buffer that holds the decoded CFieldPath for this field.
+    // Remains valid through the value-copy call that immediately follows on the same thread.
+    [ThreadStatic] private static nint _currentFieldPath;   // CFieldPath* (arg1 of GetBitRange, post-fill)
 
     // Set in WriteFieldList context — the serializer ptr is WFL param_1.
-    // We capture it in the GetBitRange hook (also inside WFL, same thread, same call).
-    // GetBitRange is always called from WFL while WFL still has param_1 alive on the stack.
-    // We obtain the serializer pointer from the WFL-entry hook installed in WriteFieldProbe.
-    // But to avoid coupling, we capture it separately via a WFL-entry shim in Install().
-    [ThreadStatic] private static nint _currentSerializer;    // CFlattenedSerializer* (WFL param_1 / rdi)
+    // We capture it in the WFL shim installed in Install().
+    [ThreadStatic] private static nint _currentSerializer;  // CFlattenedSerializer* (WFL param_1 / rdi)
+
+    // Diagnostic: log first N distinct (ser, leaf) pairs seen.
+    private static int _diagCount;
+    private const  int MaxDiagCount = 25;
+    private static readonly ConcurrentDictionary<(string, string), byte> _diagSeen = new();
 
     // Log throttle for Verify + Fake first-N messages.
     private static int _logCount;
@@ -96,7 +111,7 @@ internal static unsafe class FieldSubstitution
 
     // ── Hooks ────────────────────────────────────────────────────────────────
 
-    // GetBitRange hook: captures field index (3rd arg) + serializer ptr (from WFL-shim).
+    // GetBitRange hook: calls original first, then captures filled pathOut ptr.
     private static IDetourHook? _getBitRangeHook;
     private static nint         _getBitRangeTrampoline;
     // Value-copy hook: performs the substitution.
@@ -104,10 +119,6 @@ internal static unsafe class FieldSubstitution
     private static nint         _valueCopyTrampoline;
 
     // WFL shim: captures serializer ptr from WFL rdi each call.
-    // Reuses WriteFieldProbe infrastructure if it's already installed, OR installs its own
-    // lightweight shim that only captures param_1 + passes through, sharing the existing hook.
-    // We install a SEPARATE lightweight WFL-entry hook here (independent of WriteFieldProbe)
-    // because WriteFieldProbe may not be active during substitution mode.
     private static IDetourHook? _wflShimHook;
     private static nint         _wflShimTrampoline;
 
@@ -117,9 +128,9 @@ internal static unsafe class FieldSubstitution
 
     // ── Addresses (set by SendProxyModule before Install) ────────────────────
 
-    public static nint GetBitRangeAddr;   // file-vaddr 0x326260
-    public static nint ValueCopyAddr;     // file-vaddr 0x400b70
-    public static nint VarintWriterAddr;  // file-vaddr 0x400890
+    public static nint GetBitRangeAddr;    // file-vaddr 0x326260
+    public static nint ValueCopyAddr;      // file-vaddr 0x400b70
+    public static nint VarintWriterAddr;   // file-vaddr 0x400890
     public static nint WriteFieldListAddr; // file-vaddr 0x343b60 (for WFL shim)
 
     // ── Install / Uninstall ──────────────────────────────────────────────────
@@ -153,7 +164,7 @@ internal static unsafe class FieldSubstitution
             logger.LogInformation("FieldSubstitution: WFL shim installed @ 0x{Addr:X}", WriteFieldListAddr);
         }
 
-        // 2. GetBitRange hook — captures field index from 3rd argument.
+        // 2. GetBitRange hook — calls original first (fills pathOut), then captures arg1.
         if (_getBitRangeHook is null)
         {
             var gbrHook   = bridge.HookManager.CreateDetourHook();
@@ -189,6 +200,8 @@ internal static unsafe class FieldSubstitution
         }
 
         Interlocked.Exchange(ref _logCount, 0);
+        Interlocked.Exchange(ref _diagCount, 0);
+        _diagSeen.Clear();
         return true;
     }
 
@@ -196,9 +209,9 @@ internal static unsafe class FieldSubstitution
     {
         Mode = SubstitutionMode.Off;
 
-        _valueCopyHook?.Uninstall(); _valueCopyHook?.Dispose();   _valueCopyHook   = null; _valueCopyTrampoline  = 0;
+        _valueCopyHook?.Uninstall(); _valueCopyHook?.Dispose();     _valueCopyHook   = null; _valueCopyTrampoline   = 0;
         _getBitRangeHook?.Uninstall(); _getBitRangeHook?.Dispose(); _getBitRangeHook = null; _getBitRangeTrampoline = 0;
-        _wflShimHook?.Uninstall(); _wflShimHook?.Dispose();       _wflShimHook     = null; _wflShimTrampoline    = 0;
+        _wflShimHook?.Uninstall(); _wflShimHook?.Dispose();         _wflShimHook     = null; _wflShimTrampoline     = 0;
 
         _logger?.LogInformation("FieldSubstitution: all hooks uninstalled");
         _logger = null;
@@ -208,8 +221,6 @@ internal static unsafe class FieldSubstitution
     //
     //  Captures WFL param_1 (CFlattenedSerializer* = rdi) into _currentSerializer [ThreadStatic],
     //  then passes all 9 args through unchanged.
-    //  The shim also ensures RecipientCapture.CurrentClient is available (it relies on the
-    //  RecipientCapture hook being installed independently — its value is just read here).
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static nint WflShim(
@@ -229,23 +240,27 @@ internal static unsafe class FieldSubstitution
 
     // ── GetBitRange hook ─────────────────────────────────────────────────────
     //
-    //  ABI: FUN_00426260(appppsStack_18b58, DAT_00577a58, uVar24)
-    //  rdi=arg1 (dst short-buffer), rsi=arg2 (descriptor), rdx=arg3 (field index, int).
-    //  We only care about arg3 (the changed-field index).  Pure passthrough — no return value.
+    //  ABI: FUN_00426260(pathOut /*rdi*/, table /*rsi*/, registryIndex /*rdx*/)
+    //  arg1 (rdi) = CFieldPath* — WFL stack buffer that receives the decoded path.
+    //  arg3 (rdx) = opaque registry index — NOT a bit-packed CFieldPath; do NOT decode it.
+    //
+    //  Strategy: call the original FIRST so the engine fills pathOut, then capture arg1.
+    //  The buffer remains valid on this thread until after the value-copy call.
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static void GetBitRangeHook(nint arg1, nint arg2, uint fieldIndex)
+    private static void GetBitRangeHook(nint pathOut, nint table, uint registryIndex)
     {
-        _currentFieldIndex = fieldIndex;
-        ((delegate* unmanaged[Cdecl]<nint, nint, uint, void>) _getBitRangeTrampoline)(arg1, arg2, fieldIndex);
+        // Call original first — this fills the CFieldPath at pathOut.
+        ((delegate* unmanaged[Cdecl]<nint, nint, uint, void>) _getBitRangeTrampoline)(pathOut, table, registryIndex);
+        // Capture the now-filled path buffer for the immediately following value-copy call.
+        _currentFieldPath = pathOut;
     }
 
     // ── Value-copy hook ───────────────────────────────────────────────────────
     //
     //  ABI: byte FUN_00500b70(bf_write* dst, bf_read* src, uint bitcount)
     //  rdi=dst, rsi=src, rdx=bitcount.
-    //  bf_write cursor: *(int*)(dst + 0x10).  Confirmed from sp_bitprims.out:
-    //    param_1[2] as long* = byte offset +0x10.
+    //  bf_write cursor: *(int*)(dst + 0x10).  Confirmed from sp_bitprims.out.
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static byte ValueCopyHook(nint dst, nint src, uint bitcount)
@@ -262,13 +277,36 @@ internal static unsafe class FieldSubstitution
 
         try
         {
-            // Resolve serializer name (needed for diag + spoof lookup).
+            // Resolve serializer name from the serializer's own name field.
             var serName = ReadShortAscii(*(nint*) (serPtr + 0x00), 48);
 
-            // Decode the CFieldPath token and resolve field name.
-            var token = _currentFieldIndex;
-            DecodeToken(token, out var i0, out var i1, out var i2);
-            var fieldName = ResolveFieldName(serPtr, token, i0, i1, i2);
+            // Resolve the leaf field name from the CFieldPath buffer filled by GetBitRange.
+            var fieldName = ResolveFieldName(serPtr, _currentFieldPath);
+
+            // Emit diagnostic log for the first MaxDiagCount distinct (ser, leaf) pairs.
+            if (fieldName.Length > 0 && _logger is { } diagLog)
+            {
+                var key = (serName, fieldName);
+                if (_diagSeen.TryAdd(key, 0))
+                {
+                    var n = Interlocked.Increment(ref _diagCount);
+                    if (n <= MaxDiagCount)
+                    {
+                        try
+                        {
+                            var hdr   = _currentFieldPath;
+                            var count = (hdr != 0) ? *(short*)(hdr + 0x18) : (short)0;
+                            var i0    = (count > 0) ? *(short*)(hdr + 0x00) : (short)-1;
+                            var i1    = (count > 1) ? *(short*)(hdr + 0x02) : (short)-1;
+                            var i2    = (count > 2) ? *(short*)(hdr + 0x04) : (short)-1;
+                            diagLog.LogInformation(
+                                "WFLD#{N} ser=\"{Ser}\" count={Count} idx=[{I0},{I1},{I2}] name=\"{Name}\"",
+                                n, serName, count, i0, i1, i2, fieldName);
+                        }
+                        catch { /* diag log must never crash */ }
+                    }
+                }
+            }
 
             if (fieldName.Length == 0)
                 goto Passthrough;
@@ -280,17 +318,17 @@ internal static unsafe class FieldSubstitution
             // Client identity (for future per-client divergence).
             var client = RecipientCapture.CurrentClient;
 
-            var n = Interlocked.Increment(ref _logCount);
+            var ln = Interlocked.Increment(ref _logCount);
 
             if (mode == SubstitutionMode.Verify)
             {
-                // VERIFY: call original normally (no rewind), but log the cursor math to
+                // VERIFY: call original normally (no rewind), but log cursor math to
                 // prove field detection + cursor reads are working correctly.
                 int cursorBefore = (dst != 0) ? *(int*) (dst + 0x10) : -1;
                 byte result = CallOriginal(dst, src, bitcount);
                 int cursorAfter  = (dst != 0) ? *(int*) (dst + 0x10) : -1;
 
-                if (n <= MaxLogCount && _logger is { } log)
+                if (ln <= MaxLogCount && _logger is { } log)
                 {
                     log.LogInformation(
                         "SUBST-VERIFY field=\"{Ser}::{Field}\" client=0x{Client:X} bitcount={Bits} "
@@ -313,7 +351,7 @@ internal static unsafe class FieldSubstitution
                 uint zigzag = (uint) ((fakeValue << 1) ^ (fakeValue >> 31));
                 _varintWriter(dst, zigzag);
 
-                if (n <= MaxLogCount && _logger is { } log)
+                if (ln <= MaxLogCount && _logger is { } log)
                 {
                     log.LogInformation(
                         "SUBST-FAKE field=\"{Ser}::{Field}\" client=0x{Client:X} bitcount={Bits} "
@@ -339,96 +377,92 @@ internal static unsafe class FieldSubstitution
     // ── Helpers ───────────────────────────────────────────────────────────────
 
     /// <summary>
-    ///     Decode a packed CFieldPath token into up to three 0-based level indices.
-    ///     Token format (verified against CCSPlayerPawn examples):
-    ///       token = ((i0+1)&lt;&lt;22) | ((i1+1)&lt;&lt;11) | (i2+1)
-    ///       A level is absent when its decoded value is -1 (stored as 0 = bias-1 encoding).
-    ///       Special sentinel: 0xFFFFFFFF = root (skip).
-    /// </summary>
-    private static void DecodeToken(uint token, out int i0, out int i1, out int i2)
-    {
-        i0 = (int) ((token >> 22) & 0x7FF) - 1;
-        i1 = (int) ((token >> 11) & 0x7FF) - 1;
-        i2 = (int) ( token        & 0x7FF) - 1;
-    }
-
-    /// <summary>
-    ///     Resolve the leaf field name from a CFlattenedSerializer and a decoded CFieldPath token.
+    ///     Resolve the leaf field name from a CFlattenedSerializer and the CFieldPath buffer
+    ///     that was filled by GetBitRange (arg1 / rdi of that function, captured post-original-call).
     ///
-    ///     Flattened-serializer field array layout (verified from encodefield.out lines 207/228-232):
-    ///       arrayBase  = *(nint*)(serializer + 0x30)   — deref: pointer stored at +0x30
-    ///       record_i   = arrayBase + i * 0x2E          — inline records, byte stride 0x2E
-    ///       record+0x00 = CNetworkSerializerFieldInfo*  — fieldInfo ptr (for leaf name)
-    ///       record+0x08 = CFlattenedSerializer*         — child serializer (for nested descent)
-    ///       leaf name  = *(char**)(*(nint*)(record+0x00) + 0x08) → ASCII
+    ///     CFieldPath header layout:
+    ///       hdr+0x00..0x0F : inline short[8] indices (when read-only byte at hdr+0x1A == 0)
+    ///                        OR: *(nint*)(hdr+0x00) is a pointer to an external short[] (read-only != 0)
+    ///       hdr+0x18       : count (short) — number of valid path levels; valid range 1..7
+    ///       hdr+0x1A       : read-only flag (byte)
+    ///       idx[0] == 0x7FFF → sentinel / empty path; return "".
     ///
-    ///     Descent pattern (i0/i1/i2 are 0-based indices; negative = absent):
-    ///       base = *(nint*)(serializer + 0x30); rec = base + i0*0x2E
-    ///       if i1 >= 0: child = *(nint*)(rec+0x08); base = *(nint*)(child+0x30); rec = base + i1*0x2E
-    ///       if i2 >= 0: child = *(nint*)(rec+0x08); base = *(nint*)(child+0x30); rec = base + i2*0x2E
-    ///       fieldInfo = *(nint*)(rec+0x00); namePtr = *(nint*)(fieldInfo+0x08); return ReadShortAscii(namePtr)
+    ///     Flattened-serializer field array (stride 0x2E, inline):
+    ///       arrayBase = *(nint*)(serializer + 0x30)
+    ///       record_i  = arrayBase + i * 0x2E
+    ///       record+0x00 = CNetworkSerializerFieldInfo* (leaf name at fieldInfo+0x08)
+    ///       record+0x08 = CFlattenedSerializer* child (for descent)
+    ///
+    ///     NOTE: when EncodeField recurses into a sub-serializer, _currentSerializer may be the
+    ///     CHILD serializer (e.g. "CCSPlayer_WeaponServices") with a path relative to that child.
+    ///     The (serName, leafName) registry key uses the serializer's OWN name — which is correct
+    ///     because the diag log reveals exactly what serName + leafName pair each field resolves to.
     ///
     ///     All dereferences are IsUserPtr-gated; entire function is wrapped in try/catch → "" on fault.
     /// </summary>
-    private static string ResolveFieldName(nint serializer, uint token, int i0, int i1, int i2)
+    private static string ResolveFieldName(nint serializer, nint hdr)
     {
-        // token 0xFFFFFFFF = root sentinel (skip); token 0 = absent (all levels -1 after decode)
-        if (token == 0xFFFFFFFF || token == 0 || i0 < 0)
+        if (!IsUserPtr(serializer) || !IsUserPtr(hdr))
             return string.Empty;
 
         try
         {
-            // ── Level 0 ─────────────────────────────────────────────────────────
-            // Array base is a pointer stored at serializer+0x30 (must deref once).
+            // Read count from hdr+0x18.
+            var count = *(short*) (hdr + 0x18);
+            if (count <= 0 || count > 7)
+                return string.Empty;
+
+            // Determine index array base: inline (hdr itself) or indirected (read-only flag).
+            nint idxArr;
+            if (*(byte*) (hdr + 0x1A) != 0)
+            {
+                // Read-only: first 8 bytes of hdr hold a pointer to the external short[].
+                idxArr = *(nint*) hdr;
+                if (!IsUserPtr(idxArr))
+                    return string.Empty;
+            }
+            else
+            {
+                // Inline: indices are at hdr+0x00.
+                idxArr = hdr;
+            }
+
+            // Read level-0 index.
+            var idx0 = *(short*) (idxArr + 0 * 2);
+            if (idx0 == 0x7FFF)
+                return string.Empty;
+
+            // ── Level 0 ─────────────────────────────────────────────────────
             var arr0 = *(nint*) (serializer + 0x30);
             if (!IsUserPtr(arr0))
                 return string.Empty;
 
-            // Inline records, stride 0x2E bytes — NOT a pointer array.
-            var rec0 = arr0 + i0 * 0x2E;
+            var rec = arr0 + idx0 * 0x2E;
 
-            if (i1 < 0)
+            // Descend for levels 1..count-1.
+            for (var k = 1; k < count; k++)
             {
-                // Leaf at level 0: fieldInfo @ rec+0x00, name char* @ fieldInfo+0x08.
-                var fi0 = *(nint*) (rec0 + 0x00);
-                if (!IsUserPtr(fi0)) return string.Empty;
-                return ReadShortAscii(*(nint*) (fi0 + 0x08), 48);
+                var idxK = *(short*) (idxArr + k * 2);
+                if (idxK == 0x7FFF)
+                    break;
+
+                var child = *(nint*) (rec + 0x08);
+                if (!IsUserPtr(child))
+                    return string.Empty;
+
+                var arrK = *(nint*) (child + 0x30);
+                if (!IsUserPtr(arrK))
+                    return string.Empty;
+
+                rec = arrK + idxK * 0x2E;
             }
 
-            // ── Level 1 descent: child serializer ptr @ rec+0x08 ────────────────
-            var child1 = *(nint*) (rec0 + 0x08);
-            if (!IsUserPtr(child1))
+            // Leaf: read name from fieldInfo at rec+0x00, name char* at fieldInfo+0x08.
+            var pInfo = *(nint*) (rec + 0x00);
+            if (!IsUserPtr(pInfo))
                 return string.Empty;
 
-            var arr1 = *(nint*) (child1 + 0x30);
-            if (!IsUserPtr(arr1))
-                return string.Empty;
-
-            var rec1 = arr1 + i1 * 0x2E;
-
-            if (i2 < 0)
-            {
-                // Leaf at level 1.
-                var fi1 = *(nint*) (rec1 + 0x00);
-                if (!IsUserPtr(fi1)) return string.Empty;
-                return ReadShortAscii(*(nint*) (fi1 + 0x08), 48);
-            }
-
-            // ── Level 2 descent: child serializer ptr @ rec+0x08 ────────────────
-            var child2 = *(nint*) (rec1 + 0x08);
-            if (!IsUserPtr(child2))
-                return string.Empty;
-
-            var arr2 = *(nint*) (child2 + 0x30);
-            if (!IsUserPtr(arr2))
-                return string.Empty;
-
-            var rec2 = arr2 + i2 * 0x2E;
-
-            // Leaf at level 2.
-            var fi2 = *(nint*) (rec2 + 0x00);
-            if (!IsUserPtr(fi2)) return string.Empty;
-            return ReadShortAscii(*(nint*) (fi2 + 0x08), 48);
+            return ReadShortAscii(*(nint*) (pInfo + 0x08), 48);
         }
         catch
         {
@@ -463,10 +497,10 @@ internal static unsafe class FieldSubstitution
     private static bool ValidateAddresses(ILogger logger)
     {
         var ok = true;
-        if (GetBitRangeAddr   == 0) { logger.LogWarning("FieldSubstitution: GetBitRange address not resolved");   ok = false; }
-        if (ValueCopyAddr     == 0) { logger.LogWarning("FieldSubstitution: ValueCopy address not resolved");     ok = false; }
-        if (VarintWriterAddr  == 0) { logger.LogWarning("FieldSubstitution: VarintWriter address not resolved");  ok = false; }
-        if (WriteFieldListAddr == 0){ logger.LogWarning("FieldSubstitution: WriteFieldList address not resolved"); ok = false; }
+        if (GetBitRangeAddr    == 0) { logger.LogWarning("FieldSubstitution: GetBitRange address not resolved");    ok = false; }
+        if (ValueCopyAddr      == 0) { logger.LogWarning("FieldSubstitution: ValueCopy address not resolved");      ok = false; }
+        if (VarintWriterAddr   == 0) { logger.LogWarning("FieldSubstitution: VarintWriter address not resolved");   ok = false; }
+        if (WriteFieldListAddr == 0) { logger.LogWarning("FieldSubstitution: WriteFieldList address not resolved"); ok = false; }
         return ok;
     }
 }
