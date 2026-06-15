@@ -106,6 +106,11 @@ internal static unsafe class FieldSubstitution
         public readonly PerClientStringProxy? StringCallback;
         public readonly PerClientBytesProxy?  BytesCallback;
 
+        // Assembly name of the module that owns this callback (null for uniform spoofs, which hold no
+        // delegate). Used to purge a consumer's callbacks when its module unloads — invoking a delegate
+        // into an unloaded AssemblyLoadContext would crash the server.
+        public readonly string? Owner;
+
         public SpoofEntry(int value) : this()
         {
             HasIntSpoof = true;
@@ -128,37 +133,47 @@ internal static unsafe class FieldSubstitution
         {
             CallbackType = CallbackKind.Int;
             IntCallback  = callback;
+            Owner        = OwnerOf(callback);
         }
 
         public SpoofEntry(PerClientFloatProxy callback) : this()
         {
             CallbackType  = CallbackKind.Float;
             FloatCallback = callback;
+            Owner         = OwnerOf(callback);
         }
 
         public SpoofEntry(PerClientBoolProxy callback) : this()
         {
             CallbackType = CallbackKind.Bool;
             BoolCallback = callback;
+            Owner        = OwnerOf(callback);
         }
 
         public SpoofEntry(PerClientVectorProxy callback) : this()
         {
             CallbackType   = CallbackKind.Vector;
             VectorCallback = callback;
+            Owner          = OwnerOf(callback);
         }
 
         public SpoofEntry(PerClientStringProxy callback) : this()
         {
             CallbackType   = CallbackKind.String;
             StringCallback = callback;
+            Owner          = OwnerOf(callback);
         }
 
         public SpoofEntry(PerClientBytesProxy callback) : this()
         {
             CallbackType  = CallbackKind.Bytes;
             BytesCallback = callback;
+            Owner         = OwnerOf(callback);
         }
+
+        // The defining assembly of the callback target = the consumer module that registered it.
+        private static string? OwnerOf(Delegate callback)
+            => callback.Method.Module.Assembly.GetName().Name;
 
         public bool HasCallback => CallbackType != CallbackKind.None;
 
@@ -208,6 +223,23 @@ internal static unsafe class FieldSubstitution
     public static void ClearGlobal(string ser, string field)            => _registry.TryRemove((ser, field, -1), out _);
     public static void ClearEntity(int ent, string ser, string field)   => _registry.TryRemove((ser, field, ent), out _);
     public static void ClearAll()                                       => _registry.Clear();
+
+    // Remove every callback registration owned by an unloading module. A delegate into an unloaded
+    // AssemblyLoadContext would crash the server when the send path invokes it, so this is called from
+    // OnLibraryDisconnect. Uniform spoofs (Owner == null) hold no delegate and are left untouched.
+    public static int PurgeOwner(string moduleName)
+    {
+        var removed = 0;
+        foreach (var kv in _registry)
+        {
+            if (kv.Value.Owner == moduleName && _registry.TryRemove(kv.Key, out _))
+            {
+                removed++;
+            }
+        }
+
+        return removed;
+    }
 
     // Drop every registration scoped to a specific entity index (called from OnEntityDeleted — indices
     // are reused after disconnect/round restart, so stale entity-scoped registrations must not persist).

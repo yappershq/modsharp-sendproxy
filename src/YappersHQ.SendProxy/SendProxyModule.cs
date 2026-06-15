@@ -106,6 +106,11 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.EntityManager.InstallEntityListener(this);
     }
 
+    // A consumer module unloaded — purge any per-client callbacks it owns before the send path can
+    // invoke a delegate into its unloaded AssemblyLoadContext (which would crash the server).
+    public void OnLibraryDisconnect(string name)
+        => _manager.RemoveOwnerRegistrations(name);
+
     public void Shutdown()
     {
         RecipientCapture.Uninstall();

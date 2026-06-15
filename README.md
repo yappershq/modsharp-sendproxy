@@ -216,6 +216,24 @@ loads it from `<sharp>/gamedata/yappershq.sendproxy.jsonc`.
 > write the gamedata **directly** to `/game/sharp/gamedata/yappershq.sendproxy.jsonc` rather than
 > trusting the deploy step.
 
+## Lifecycle & safety
+
+Hook lifecycle is managed so a consumer can't dangle a registration and crash the server (mirrors how
+SourceMod's SendProxyManager purges hooks on plugin unload / entity removal):
+
+- **Consumer module unload** — every per-client callback records the assembly that registered it. When
+  that module disconnects (`OnLibraryDisconnect`), its callbacks are purged automatically, so the send
+  path never invokes a delegate into an unloaded `AssemblyLoadContext`. You should still call `Unhook`
+  in your own `Shutdown` for promptness, but forgetting to won't crash anything.
+- **Entity removal** — entity-scoped registrations are dropped on `OnEntityDeleted` (entity indices are
+  reused after disconnect / round restart, so stale scoping can't bleed onto a new entity).
+- **Client disconnect** — the per-client path stores **no** per-client state; the recipient is captured
+  transiently (`[ThreadStatic]`) only for the duration of that client's own encode, so a disconnect
+  needs no cleanup.
+- **Dispatch is stateless & guarded** — each field is re-resolved per call (no stored entity pointers),
+  every native read is `IsUserPtr`-gated, and any field whose encoder isn't a known substitutable type
+  classifies as `Unsupported` and passes through untouched. A throwing callback is caught → passthrough.
+
 ## Status / caveats
 
 - **Per-client substitution and multi-type substitution are mechanism-verified** — recipient capture,

@@ -64,6 +64,17 @@ internal sealed class SendProxyManager : ISendProxyManager
     internal void RemoveEntityRegistrations(int entityIndex)
         => FieldSubstitution.ClearEntityIndex(entityIndex);
 
+    // Drop every callback owned by an unloading consumer module (called from OnLibraryDisconnect) — a
+    // dangling delegate into an unloaded module would crash the send path.
+    internal void RemoveOwnerRegistrations(string moduleName)
+    {
+        var removed = FieldSubstitution.PurgeOwner(moduleName);
+        if (removed > 0)
+        {
+            _logger.LogInformation("SendProxy: purged {Count} callback(s) owned by unloaded module \"{Module}\"", removed, moduleName);
+        }
+    }
+
     // -- Hook, all entities -----------------------------------------------------------------------
 
     public void Hook(string serializerName, string fieldName, PerClientIntProxy callback)
