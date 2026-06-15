@@ -27,7 +27,6 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private nint _writeFieldListAddr;  // CFlattenedSerializer::WriteFieldList
     private nint _getBitRangeAddr;     // CFlattenedSerializer::GetBitRange
     private nint _bitCopyAddr;         // FUN_00500b70 (bit-copy primitive)
-    private nint _varintWriterAddr;    // FUN_00500890 (zigzag/varint writer)
     private nint _registryAddr;        // CFlattenedSerializer::EncoderRegistry table base
 
     public SendProxyModule(
@@ -122,7 +121,6 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private const string WriteFieldListKey      = "CFlattenedSerializer::WriteFieldList";
     private const string GetBitRangeKey        = "CFlattenedSerializer::GetBitRange";
     private const string BitCopyKey            = "CFlattenedSerializer::BitCopyPrimitive";
-    private const string VarintWriterKey       = "CFlattenedSerializer::VarintWriter";
     private const string EncoderRegistryKey    = "CFlattenedSerializer::EncoderRegistry";
 
     private void ResolveNativeTargets()
@@ -135,7 +133,6 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _writeFieldListAddr = ResolveFromGameData(WriteFieldListKey);
         _getBitRangeAddr    = ResolveFromGameData(GetBitRangeKey);
         _bitCopyAddr        = ResolveFromGameData(BitCopyKey);
-        _varintWriterAddr   = ResolveFromGameData(VarintWriterKey);
         // Encoder registry table base — walked once at Install to build fn→FieldType map.
         _registryAddr       = ResolveFromGameData(EncoderRegistryKey);
     }
@@ -318,19 +315,18 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
     private bool EnsureSubDetours()
     {
-        if (_getBitRangeAddr == 0 || _bitCopyAddr == 0 || _varintWriterAddr == 0 || _writeFieldListAddr == 0)
+        if (_getBitRangeAddr == 0 || _bitCopyAddr == 0 || _writeFieldListAddr == 0)
         {
             _logger.LogWarning(
                 "sp_sub_*: one or more Phase-2 addresses not resolved "
-                + "(GetBitRange={Gbr:X} BitCopy={Bc:X} VarintWriter={Vw:X} WFL={Wfl:X}) — "
+                + "(GetBitRange={Gbr:X} BitCopy={Bc:X} WFL={Wfl:X}) — "
                 + "check gamedata sigs match this build",
-                _getBitRangeAddr, _bitCopyAddr, _varintWriterAddr, _writeFieldListAddr);
+                _getBitRangeAddr, _bitCopyAddr, _writeFieldListAddr);
             return false;
         }
 
         FieldSubstitution.GetBitRangeAddr    = _getBitRangeAddr;
         FieldSubstitution.ValueCopyAddr      = _bitCopyAddr;
-        FieldSubstitution.VarintWriterAddr   = _varintWriterAddr;
         FieldSubstitution.WriteFieldListAddr = _writeFieldListAddr;
         // WDE address for entity-index capture (0 = skip; entityIndex in callbacks will be -1).
         FieldSubstitution.WdeAddr            = _wdeAddr;

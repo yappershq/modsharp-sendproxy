@@ -62,14 +62,6 @@
       "library": "networksystem",
       "linux": "55 48 89 F0 41 89 D0 48 89 E5 41 57 41 56 41 55"
     },
-    // CFlattenedSerializer::VarintWriter — bf_write varint primitive used to emit our substitute
-    // value. RVA 0x400890. Sig (bf_write* dst, uint64 value); the SAME primitive is used for both
-    // signed (caller pre-zigzags) and unsigned (raw) varints, 32- and 64-bit (rsi is 64-bit).
-    "CFlattenedSerializer::VarintWriter": {
-      "library": "networksystem",
-      "linux": "8B 4F 10 48 89 F2 8B 47 0C F6 C1 07 75 0B"
-    },
-
     // ── Phase-2b: encoder registry table (runtime classification) ────────────────────────
     // CFlattenedSerializer::EncoderRegistry — the 8-bucket descriptor table in networksystem's
     // .data section (file-vaddr 0x45f360). Layout: 8 × 16-byte buckets {handler*(+0x00), int count(+0x08)}.

@@ -28,19 +28,18 @@ namespace YappersHQ.SendProxy.Native;
 //    a)  Save dst cursor.
 //    b)  Call original (advances src + dst cursors, writes real bits).
 //    c)  Rewind dst cursor.
-//    d)  Re-emit the fake value using the FIELD's real encoder family (see Classify):
-//          - Int32/Int64 — signed zigzag varint via FUN_00500890 (rdi=dst, rsi=zigzag-of-int64).
-//          - UInt32      — raw varint via the same FUN_00500890 (no zigzag).
-//          - Bool        — 1-bit fixed write (WriteUBitLong).
-//          - Float32     — 32-bit fixed write of the IEEE-754 bits (WriteUBitLong).
-//          - Unsupported — PASSTHROUGH (re-call would corrupt; we leave the engine's bits).
-//        FUN_00500890 is the engine's single varint primitive: void(bf_write*, uint64). It handles
-//        both signed (caller pre-zigzags) and unsigned, 32- and 64-bit, in one place.
+//    d)  Re-emit the fake value by invoking the FIELD's own engine encoder directly:
+//          encoderFn = *(nint*)( *(nint*)(fieldInfo+0x38) )    // slot[0] of the dispatch table
+//          ABI (System V): encoder(rdi=bf_write*, rsi=fieldInfo*, rdx=paramsPtr, rcx=valuePtr, r8d=0)
+//          paramsPtr: byte off = *(byte*)(fieldInfo+0xC9);
+//                     paramsPtr = (off==0xFF) ? 0 : *(nint*)(fieldInfo+0x40) + off;
+//          valuePtr: stackalloc scratch holding the fake value in the engine's native layout.
+//          Unsupported fields (quantized/coord/normal/string/array/handle) PASSTHROUGH — never substitute.
 //
 //  Type detection (Classify): the leaf field record's +0x00 is CNetworkSerializerFieldInfo*; the
 //  engine dispatches encoding via  *( *(fieldInfo+0x38) + 0x30 )  — fieldInfo+0x38 = type-bucket
 //  handler, slot[6] (+0x30) = encode fn. We compare that fn ptr against encoder identities resolved
-//  from gamedata (EncodeInt32/EncodeUInt32/EncodeFloat32/EncodeBool). Unknown → Unsupported.
+//  from the registry table. Unknown → Unsupported.
 //
 //  CFieldPath header (verified by RE of GetBitRange output buffer):
 //    hdr+0x00..0x0F : inline short[8] indices (or external short[] ptr when read-only flag != 0)
@@ -216,17 +215,12 @@ internal static unsafe class FieldSubstitution
     private static IDetourHook? _wdeEntityCaptureHook;
     private static nint         _wdeEntityCaptureTrampoline;
 
-    // FUN_00500890 — varint writer: void(bf_write* dst, uint64 value). The engine uses ONE varint
-    // primitive for signed (caller pre-zigzags) and unsigned, 32- and 64-bit (rsi is 64-bit wide).
-    // We type the value as ulong so Int64/UInt32/UInt64 all route through it correctly.
-    private static delegate* unmanaged[Cdecl]<nint, ulong, void> _varintWriter;
     private static ILogger? _logger;
 
     // ── Addresses (set by SendProxyModule before Install) ────────────────────
 
     public static nint GetBitRangeAddr;    // file-vaddr 0x326260
     public static nint ValueCopyAddr;      // file-vaddr 0x400b70
-    public static nint VarintWriterAddr;   // file-vaddr 0x400890
     public static nint WriteFieldListAddr; // file-vaddr 0x343b60
     public static nint WdeAddr;            // WriteDeltaEntity_Internal (0 = skip entity-index capture)
 
@@ -251,8 +245,6 @@ internal static unsafe class FieldSubstitution
 
         if (!ValidateAddresses(logger))
             return false;
-
-        _varintWriter = (delegate* unmanaged[Cdecl]<nint, ulong, void>) VarintWriterAddr;
 
         // Build fn→FieldType map from registry table if not yet done.
         // Thread-safe: double-checked lock; map is read-only after this point.
@@ -572,69 +564,75 @@ internal static unsafe class FieldSubstitution
                 }
 
                 // Save cursor, call original (advances src + dst cursors + writes real bits), then
-                // rewind the dst cursor and re-emit our value with the field's real encoder.
+                // rewind the dst cursor and re-emit our value by calling the field's own engine encoder.
                 int savedCursor     = *(int*) (dst + 0x10);
                 byte originalResult = CallOriginal(dst, src, bitcount);
                 int afterOriginal   = *(int*) (dst + 0x10);
 
                 *(int*) (dst + 0x10) = savedCursor;
 
+                // Resolve the field's per-instance encoder fn: slot[0] of the dispatch table at
+                // fieldInfo+0x38 (NOT slot[6]/+0x30, which is the registry handler used only for Classify).
+                // ABI (System V x64):
+                //   encoder(rdi=bf_write*, rsi=fieldInfo*, rdx=paramsPtr, rcx=valuePtr, r8d=0)
+                // paramsPtr derivation replicates the engine call site:
+                //   byte off = *(byte*)(fieldInfo+0xC9); paramsPtr = (off==0xFF)?0:*(nint*)(fieldInfo+0x40)+off
+                // valuePtr points to a 16-byte scratch containing the fake value in its native engine layout.
+                var fieldInfo  = *(nint*) (leafRec + 0x00);
+                var dispatch   = *(nint*) (fieldInfo + 0x38);
+                var encoderFn  = NativeUtil.IsUserPtr(dispatch) ? *(nint*) dispatch : 0;
+                byte paramOff  = *(byte*) (fieldInfo + 0xC9);
+                var paramsPtr  = (paramOff == 0xFF) ? 0 : (*(nint*) (fieldInfo + 0x40) + paramOff);
+
+                if (!NativeUtil.IsUserPtr(encoderFn))
+                {
+                    // Encoder fn unresolvable — fall back to the engine's already-written bits.
+                    *(int*) (dst + 0x10) = afterOriginal;
+                    return originalResult;
+                }
+
+                // Build a 16-byte scratch with the fake value in the engine's native in-memory layout.
+                // Layout per FieldType (matches what the engine's in-process field stores):
+                //   Int32/Int64/Fixed32/Fixed64 (signed): *(long*) = sign-extended effectiveFake
+                //   UInt32/UInt64:                        *(ulong*)= (uint)effectiveFake  (zero-high)
+                //   Bool:                                 *(byte*) = 0 or 1
+                //   Float32: encoder reads *(double*) and narrows; supply sign-extended IEEE bits
+                var scratch = stackalloc byte[16];
                 switch (fieldType)
                 {
                     case FieldType.Int32:
                     case FieldType.Int64:
-                    {
-                        // Signed zigzag varint. Zigzag over the sign-extended 64-bit value so the
-                        // byte stream matches the engine for both int32 and int64 widths.
-                        long  v64    = effectiveFake;                       // sign-extend int → long
-                        ulong zigzag = (ulong) ((v64 << 1) ^ (v64 >> 63));
-                        _varintWriter(dst, zigzag);
-                        break;
-                    }
-                    case FieldType.UInt32:
-                    {
-                        // Raw varint, no zigzag. Mask to 32 bits (callback value is int-shaped).
-                        _varintWriter(dst, (uint) effectiveFake);
-                        break;
-                    }
                     case FieldType.Fixed32:
-                    {
-                        // Raw 32-bit fixed-width write (no varint, no zigzag).
-                        // Used by signed/unsigned integer fields tagged with "fixed32" in the registry.
-                        // effectiveFake carries the 32-bit pattern (callers may pass via BitConverter).
-                        WriteUBitLong(dst, (uint) effectiveFake, 32);
-                        break;
-                    }
                     case FieldType.Fixed64:
-                    {
-                        // Raw 64-bit fixed-width write: two consecutive 32-bit little-endian words.
-                        // The int API means high 32 bits come from sign-extension of effectiveFake.
-                        // For typical use (substitute a 32-bit-range value) high word is 0 or ~0.
-                        var u = (ulong) (long) effectiveFake; // sign-extend int → long → ulong
-                        WriteUBitLong(dst, (uint)  u,         32); // low  word
-                        WriteUBitLong(dst, (uint) (u >> 32),  32); // high word
+                        *(long*) scratch = (long) effectiveFake;    // sign-extend int → long
                         break;
-                    }
+                    case FieldType.UInt32:
+                        *(ulong*) scratch = (uint) effectiveFake;   // zero-extend to 64 bits
+                        break;
                     case FieldType.Bool:
-                    {
-                        WriteUBitLong(dst, effectiveFake != 0 ? 1u : 0u, 1);
+                        *scratch = (byte) (effectiveFake != 0 ? 1 : 0);
                         break;
-                    }
                     case FieldType.Float32:
-                    {
-                        // Reinterpret the int payload's bits as the 32-bit IEEE-754 value to emit.
-                        // Callers pass the float via BitConverter.SingleToInt32Bits.
-                        WriteUBitLong(dst, (uint) effectiveFake, 32);
+                        // Encoder reads *(double*) then narrows to float.
+                        // effectiveFake carries the IEEE-754 bit pattern (caller used SingleToInt32Bits).
+                        *(double*) scratch = (double) BitConverter.Int32BitsToSingle(effectiveFake);
                         break;
-                    }
                     default:
-                    {
-                        // Unreachable (Unsupported handled above) — but be defensive: keep the
-                        // engine's own (already-written) output by restoring the post-original
-                        // cursor. Do NOT call the original again (it would re-advance the bf_read).
+                        // Unreachable — Unsupported was gated above — but be defensive.
                         *(int*) (dst + 0x10) = afterOriginal;
                         return originalResult;
-                    }
+                }
+
+                try
+                {
+                    ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, uint, void>)
+                        encoderFn)(dst, fieldInfo, paramsPtr, (nint) scratch, 0u);
+                }
+                catch
+                {
+                    // Encoder faulted — restore post-original cursor so engine bits stand.
+                    *(int*) (dst + 0x10) = afterOriginal;
+                    return originalResult;
                 }
 
                 if (ln <= MaxLogCount && _logger is { } fakeLog)
@@ -909,58 +907,11 @@ internal static unsafe class FieldSubstitution
         }
     }
 
-    // ── Fixed-width bf_write emit (bool/float32) ──────────────────────────────────────────────
-    //
-    //  Replicates the engine's inline bf_write::WriteUBitLong (little-endian bit packing) verified
-    //  from EncodeFloat32 0x3ce8e0 / EncodeBool 0x3c4c00. bf_write layout:
-    //    [bf+0x00] uint32* data
-    //    [bf+0x0c] int     nMaxBits  (capacity)
-    //    [bf+0x10] int     iCurBit   (cursor)
-    //    [bf+0x20] byte    bOverflow
-    //  Writes the low `numBits` of `value` at the cursor, advancing it. On insufficient room it
-    //  sets the overflow flag exactly as the engine does and writes nothing — matching native
-    //  behaviour so a substitute can never run past the buffer.
-    [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    private static void WriteUBitLong(nint bf, uint value, int numBits)
-    {
-        var data    = *(uint**) (bf + 0x00);
-        var maxBits = *(int*)  (bf + 0x0C);
-        var cur     = *(int*)  (bf + 0x10);
-
-        if (maxBits - cur < numBits)
-        {
-            *(int*)  (bf + 0x10) = maxBits;
-            *(byte*) (bf + 0x20) = 1;
-            return;
-        }
-
-        if (numBits < 32)
-            value &= (1u << numBits) - 1u;
-
-        *(int*) (bf + 0x10) = cur + numBits;
-
-        var idx   = cur >> 5;
-        var shift = cur & 0x1F;
-
-        // Low dword: replace the `numBits` bits starting at `shift` (clamped to this dword).
-        var mask0 = (shift == 0) ? 0xFFFFFFFFu : (0xFFFFFFFFu << shift);
-        data[idx] = (data[idx] & ~mask0) | ((value << shift) & mask0);
-
-        // High dword: only when the field straddles a 32-bit boundary.
-        var bitsInFirst = 32 - shift;
-        if (numBits > bitsInFirst)
-        {
-            var mask1 = (1u << (numBits - bitsInFirst)) - 1u;
-            data[idx + 1] = (data[idx + 1] & ~mask1) | ((value >> bitsInFirst) & mask1);
-        }
-    }
-
     private static bool ValidateAddresses(ILogger logger)
     {
         var ok = true;
         if (GetBitRangeAddr    == 0) { logger.LogWarning("FieldSubstitution: GetBitRange address not resolved");    ok = false; }
         if (ValueCopyAddr      == 0) { logger.LogWarning("FieldSubstitution: ValueCopy address not resolved");      ok = false; }
-        if (VarintWriterAddr   == 0) { logger.LogWarning("FieldSubstitution: VarintWriter address not resolved");   ok = false; }
         if (WriteFieldListAddr == 0) { logger.LogWarning("FieldSubstitution: WriteFieldList address not resolved"); ok = false; }
         return ok;
     }
