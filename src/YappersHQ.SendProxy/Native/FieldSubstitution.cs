@@ -535,12 +535,7 @@ internal static unsafe class FieldSubstitution
             return CallOriginal(dst, src, bitcount);
         }
 
-        // Consume-once: WriteFieldList buffers the path and value streams separately, so a value-copy is
-        // not guaranteed to be preceded by a matching GetBitRange. Take the captured path and clear it
-        // immediately — a copy without a fresh path passes through rather than reusing a STALE path
-        // (which would resolve against the wrong field and walk into unmapped memory → fatal AV).
         var pathPtr = _currentFieldPath;
-        _currentFieldPath = 0;
         if (!NativeUtil.IsUserPtr(pathPtr))
         {
             return CallOriginal(dst, src, bitcount);
