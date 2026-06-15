@@ -350,6 +350,11 @@ internal static unsafe class FieldSubstitution
         }
     }
 
+    private static readonly Dictionary<nint, FieldType> _emptyEncoderMap = new();
+
+    /// <summary>The fn-pointer → FieldType encoder map (empty until <see cref="PrebuildEncoderMap"/> runs).</summary>
+    public static IReadOnlyDictionary<nint, FieldType> EncoderTypeMap => _encoderTypes ?? _emptyEncoderMap;
+
     public static bool Install(InterfaceBridge bridge, ILogger logger)
     {
         _logger = logger;

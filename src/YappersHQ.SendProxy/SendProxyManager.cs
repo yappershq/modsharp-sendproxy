@@ -33,11 +33,29 @@ internal sealed class SendProxyManager : ISendProxyManager
     // Set by SendProxyModule.PostInit; installs the substitution sub-detours on first use.
     private Func<bool>? _ensureSubDetours;
 
+    // Installs the uniform encoder detours (all-clients substitution) on first use.
+    private Func<bool>? _ensureUniformHook;
+
     public SendProxyManager(ILogger logger)
         => _logger = logger;
 
     internal void SetSubDetourInstaller(Func<bool> installer)
         => _ensureSubDetours = installer;
+
+    internal void SetUniformHookInstaller(Func<bool> installer)
+        => _ensureUniformHook = installer;
+
+    private bool EnsureUniformHook(string context)
+    {
+        if (_ensureUniformHook is { } installer && installer())
+        {
+            return true;
+        }
+
+        _logger.LogWarning("SendProxy: {Ctx} — uniform encoder hook unavailable", context);
+
+        return false;
+    }
 
     private bool EnsureDetours(string context)
     {
@@ -195,58 +213,51 @@ internal sealed class SendProxyManager : ISendProxyManager
 
     // -- SetUniform, all entities -----------------------------------------------------------------
 
+    // Uniform (all-clients) substitution rides the per-field ENCODER hook (UniformEncoderHook): the
+    // encoder fires once during the shared pack and receives the field's fieldInfo directly, so the
+    // field is matched unambiguously and every client sees the value. (The bit-copy path can't reliably
+    // pair a value-copy to its field, so it's reserved for per-client callbacks.) Matched by field name.
+
     public void SetUniform(string serializerName, string fieldName, int value)
     {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
-        if (!EnsureDetours($"SetUniform(\"{serializerName}::{fieldName}\", int)")) return;
-        FieldSubstitution.SetSpoof(serializerName, fieldName, value);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: uniform int spoof (all entities) \"{Ser}::{Field}\" → {Value}", serializerName, fieldName, value);
+        if (string.IsNullOrEmpty(fieldName) || !EnsureUniformHook($"SetUniform(\"{fieldName}\", int)")) return;
+        UniformEncoderHook.SetInt(fieldName, value);
+        _logger.LogInformation("SendProxy: uniform int spoof \"{Field}\" → {Value}", fieldName, value);
     }
 
     public void SetUniform(string serializerName, string fieldName, float value)
     {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
-        if (!EnsureDetours($"SetUniform(\"{serializerName}::{fieldName}\", float)")) return;
-        FieldSubstitution.SetSpoof(serializerName, fieldName, BitConverter.SingleToInt32Bits(value));
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: uniform float spoof (all entities) \"{Ser}::{Field}\" → {Value}", serializerName, fieldName, value);
+        if (string.IsNullOrEmpty(fieldName) || !EnsureUniformHook($"SetUniform(\"{fieldName}\", float)")) return;
+        UniformEncoderHook.SetFloat(fieldName, value);
+        _logger.LogInformation("SendProxy: uniform float spoof \"{Field}\" → {Value}", fieldName, value);
     }
 
     public void SetUniform(string serializerName, string fieldName, bool value)
     {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
-        if (!EnsureDetours($"SetUniform(\"{serializerName}::{fieldName}\", bool)")) return;
-        FieldSubstitution.SetSpoof(serializerName, fieldName, value ? 1 : 0);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: uniform bool spoof (all entities) \"{Ser}::{Field}\" → {Value}", serializerName, fieldName, value);
+        if (string.IsNullOrEmpty(fieldName) || !EnsureUniformHook($"SetUniform(\"{fieldName}\", bool)")) return;
+        UniformEncoderHook.SetBool(fieldName, value);
+        _logger.LogInformation("SendProxy: uniform bool spoof \"{Field}\" → {Value}", fieldName, value);
     }
 
     public void SetUniform(string serializerName, string fieldName, Vector3 value)
     {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
-        if (!EnsureDetours($"SetUniform(\"{serializerName}::{fieldName}\", vector)")) return;
-        FieldSubstitution.SetSpoof(serializerName, fieldName, value);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: uniform vector spoof (all entities) \"{Ser}::{Field}\" → {Value}", serializerName, fieldName, value);
+        if (string.IsNullOrEmpty(fieldName) || !EnsureUniformHook($"SetUniform(\"{fieldName}\", vector)")) return;
+        UniformEncoderHook.SetVector(fieldName, value);
+        _logger.LogInformation("SendProxy: uniform vector spoof \"{Field}\" → {Value}", fieldName, value);
     }
 
     public void SetUniform(string serializerName, string fieldName, string value)
     {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
-        if (!EnsureDetours($"SetUniform(\"{serializerName}::{fieldName}\", string)")) return;
-        FieldSubstitution.SetSpoof(serializerName, fieldName, value);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: uniform string spoof (all entities) \"{Ser}::{Field}\" → \"{Value}\"", serializerName, fieldName, value);
+        if (string.IsNullOrEmpty(fieldName) || !EnsureUniformHook($"SetUniform(\"{fieldName}\", string)")) return;
+        UniformEncoderHook.SetString(fieldName, value);
+        _logger.LogInformation("SendProxy: uniform string spoof \"{Field}\" → \"{Value}\"", fieldName, value);
     }
 
     public void SetUniform(string serializerName, string fieldName, byte[] value)
     {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
-        if (!EnsureDetours($"SetUniform(\"{serializerName}::{fieldName}\", bytes)")) return;
-        FieldSubstitution.SetSpoof(serializerName, fieldName, value);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: uniform bytes spoof (all entities) \"{Ser}::{Field}\" ({Len} bytes)", serializerName, fieldName, value.Length);
+        if (string.IsNullOrEmpty(fieldName) || !EnsureUniformHook($"SetUniform(\"{fieldName}\", bytes)")) return;
+        UniformEncoderHook.SetBytes(fieldName, value);
+        _logger.LogInformation("SendProxy: uniform bytes spoof \"{Field}\" ({Len} bytes)", fieldName, value.Length);
     }
 
     // -- SetUniform, single entity ----------------------------------------------------------------
@@ -316,7 +327,8 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void Unhook(string serializerName, string fieldName)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
-        FieldSubstitution.ClearGlobal(serializerName, fieldName);
+        UniformEncoderHook.Remove(fieldName);                  // uniform (encoder hook)
+        FieldSubstitution.ClearGlobal(serializerName, fieldName); // per-client (bit-copy path)
         _logger.LogInformation("SendProxy: global registration removed for \"{Ser}::{Field}\"", serializerName, fieldName);
     }
 
@@ -330,11 +342,12 @@ internal sealed class SendProxyManager : ISendProxyManager
 
     public void UnhookAll()
     {
+        UniformEncoderHook.Uninstall();
         FieldSubstitution.ClearAll();
         FieldSubstitution.Uninstall();
-        _logger.LogInformation("SendProxy: all registrations cleared, substitution detours uninstalled");
+        _logger.LogInformation("SendProxy: all registrations cleared, detours uninstalled");
     }
 
     public bool IsHooked(string serializerName, string fieldName)
-        => FieldSubstitution.IsHooked(serializerName, fieldName);
+        => UniformEncoderHook.HasAny || FieldSubstitution.IsHooked(serializerName, fieldName);
 }

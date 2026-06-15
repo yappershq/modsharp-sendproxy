@@ -99,6 +99,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     public void PostInit()
     {
         _manager.SetSubDetourInstaller(EnsureSubDetours);
+        _manager.SetUniformHookInstaller(EnsureUniformHook);
 
         _bridge.SharpModuleManager.RegisterSharpModuleInterface<ISendProxyManager>(
             this, ISendProxyManager.Identity, _manager);
@@ -118,6 +119,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
     public void Shutdown()
     {
+        UniformEncoderHook.Uninstall();
         RecipientCapture.Uninstall();
         FieldSubstitution.Uninstall();
         _bridge.EntityManager.RemoveEntityListener(this);
@@ -180,6 +182,11 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
             return 0;
         }
     }
+
+    // Installs the uniform encoder detours (all-clients substitution) lazily on first SetUniform. Uses
+    // the encoder map FieldSubstitution prebuilds at load.
+    private bool EnsureUniformHook()
+        => UniformEncoderHook.Install(_bridge, _logger, FieldSubstitution.EncoderTypeMap);
 
     private bool EnsureSubDetours()
     {
