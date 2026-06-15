@@ -71,16 +71,29 @@ public sealed class ExampleModule : IModSharpModule
         _conVar.CreateServerCommand("sp_example_perclienthp_off", OnPerClientHpOff,
             "Remove the per-client m_iHealth callback registered by sp_example_perclienthp.",
             ConVarFlags.Release);
+
+        // QAngle demo: hook an eye-angle field on CCSPlayerPawn so every client sees a fixed pitch.
+        // "m_angEyeAngles" is the CCSPlayerPawn qangle field that replicates the player's view angles.
+        // Use sp_example_fakeangle_off to remove.
+        _conVar.CreateServerCommand("sp_example_fakeangle", OnFakeAngle,
+            "Spoof CCSPlayerPawn::m_angEyeAngles for all clients to a fixed pitch: "
+            + "sp_example_fakeangle <pitch> <yaw> <roll>",
+            ConVarFlags.Release);
+        _conVar.CreateServerCommand("sp_example_fakeangle_off", OnFakeAngleOff,
+            "Remove the per-client eye-angle hook installed by sp_example_fakeangle.",
+            ConVarFlags.Release);
     }
 
     public void Shutdown()
     {
         _conVar.ReleaseCommand("sp_example_fakehp");
         _conVar.ReleaseCommand("sp_example_fakehp_entity");
-        // Remove per-client callback on shutdown to avoid dangling references.
+        // Remove per-client callbacks on shutdown to avoid dangling references.
         _sendProxy?.UnhookAllPerClient();
         _conVar.ReleaseCommand("sp_example_perclienthp");
         _conVar.ReleaseCommand("sp_example_perclienthp_off");
+        _conVar.ReleaseCommand("sp_example_fakeangle");
+        _conVar.ReleaseCommand("sp_example_fakeangle_off");
     }
 
     private ECommandAction OnFakeHp(StringCommand command)
@@ -169,6 +182,51 @@ public sealed class ExampleModule : IModSharpModule
 
         _sendProxy.UnhookInt("CCSPlayerPawn", "m_iHealth");
         _logger.LogInformation("Per-client m_iHealth hook removed");
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnFakeAngle(StringCommand command)
+    {
+        if (_sendProxy is null)
+            return ECommandAction.Stopped;
+
+        // Parse pitch/yaw/roll from args (default to 0 0 0).
+        float pitch = 0f, yaw = 0f, roll = 0f;
+        if (command.ArgCount >= 1) float.TryParse(command.GetArg(1), out pitch);
+        if (command.ArgCount >= 2) float.TryParse(command.GetArg(2), out yaw);
+        if (command.ArgCount >= 3) float.TryParse(command.GetArg(3), out roll);
+
+        var capturedPitch = pitch;
+        var capturedYaw   = yaw;
+        var capturedRoll  = roll;
+
+        // Hook CCSPlayerPawn::m_angEyeAngles — a QAngle3 field.
+        // Every client will see the same fixed angles for ALL player pawns regardless of who
+        // is sending. Real server-side view angles are untouched.
+        //
+        // For a per-entity version (spoof angles of only one specific pawn) use HookEntityVector.
+        _sendProxy.HookVector("CCSPlayerPawn", "m_angEyeAngles",
+            (nint client, int entityIndex, ref float x, ref float y, ref float z) =>
+            {
+                x = capturedPitch;
+                y = capturedYaw;
+                z = capturedRoll;
+                return true; // substitute
+            });
+
+        _logger.LogInformation(
+            "Fake eye-angle hook installed: pitch={P} yaw={Y} roll={R} (all CCSPlayerPawn, all clients)",
+            capturedPitch, capturedYaw, capturedRoll);
+        return ECommandAction.Stopped;
+    }
+
+    private ECommandAction OnFakeAngleOff(StringCommand command)
+    {
+        if (_sendProxy is null)
+            return ECommandAction.Stopped;
+
+        _sendProxy.Unhook("CCSPlayerPawn", "m_angEyeAngles");
+        _logger.LogInformation("Fake eye-angle hook removed");
         return ECommandAction.Stopped;
     }
 }

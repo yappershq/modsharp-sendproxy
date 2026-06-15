@@ -74,9 +74,14 @@ internal enum SubstitutionMode { Off, Verify, Fake }
 //   Bool        — bucket 7 "default" (1-bit fixed write).
 //   Float32     — bucket 4 "default" (raw 32-bit IEEE-754 inline write).
 //   Int64       — alias of Int32Signed (same encoder, value is sign-extended before zigzag).
-//   Unsupported — anything else (quantized float/vector, handle, string/bytes, arrays,
+//   QAngle3     — bucket 3 "qangle" (3×float32 scratch, encoder uses paramsPtr for mode/bits).
+//   Vector3     — bucket 3 "vector3" (same 3×float32 scratch layout as QAngle3).
+//   Unsupported — anything else (quantized float coord/normal/integral, handle, string/bytes, arrays,
 //                 bucket 0 no-op stub, unresolved table). MUST passthrough — never substitute.
-internal enum FieldType { Unsupported = 0, Int32, UInt32, Int64, Bool, Float32, Fixed32, Fixed64 }
+internal enum FieldType { Unsupported = 0, Int32, UInt32, Int64, Bool, Float32, Fixed32, Fixed64, QAngle3, Vector3 }
+
+// Discriminated union tag for which typed callback is stored in a SpoofEntry.
+internal enum CallbackKind { None = 0, Int, Float, Bool, Vector }
 
 internal static unsafe class FieldSubstitution
 {
@@ -103,25 +108,58 @@ internal static unsafe class FieldSubstitution
     {
         public readonly bool             HasSpoof;
         public readonly int              SpoofValue;
-        public readonly PerClientIntProxy? Callback;
 
+        // Typed callback discriminated union. At most one field is non-null.
+        // CallbackKind identifies which delegate type is stored.
+        public readonly CallbackKind        CallbackType;
+        public readonly PerClientIntProxy?  IntCallback;
+        public readonly PerClientFloatProxy? FloatCallback;
+        public readonly PerClientBoolProxy?  BoolCallback;
+        public readonly PerClientVectorProxy? VectorCallback;
+
+        // Legacy int-only uniform spoof (no callback).
         public SpoofEntry(int spoofValue) : this()
         {
             HasSpoof   = true;
             SpoofValue = spoofValue;
         }
 
+        // Typed-callback constructors.
         public SpoofEntry(PerClientIntProxy callback) : this()
         {
-            Callback = callback;
+            CallbackType = CallbackKind.Int;
+            IntCallback  = callback;
         }
 
+        public SpoofEntry(PerClientFloatProxy callback) : this()
+        {
+            CallbackType  = CallbackKind.Float;
+            FloatCallback = callback;
+        }
+
+        public SpoofEntry(PerClientBoolProxy callback) : this()
+        {
+            CallbackType = CallbackKind.Bool;
+            BoolCallback = callback;
+        }
+
+        public SpoofEntry(PerClientVectorProxy callback) : this()
+        {
+            CallbackType   = CallbackKind.Vector;
+            VectorCallback = callback;
+        }
+
+        // Int spoof + int callback (preserved for compat with existing int-only overload).
         public SpoofEntry(int spoofValue, PerClientIntProxy? callback) : this()
         {
-            HasSpoof   = true;
-            SpoofValue = spoofValue;
-            Callback   = callback;
+            HasSpoof     = true;
+            SpoofValue   = spoofValue;
+            CallbackType = callback is null ? CallbackKind.None : CallbackKind.Int;
+            IntCallback  = callback;
         }
+
+        // Convenience: does ANY callback exist?
+        public bool HasCallback => CallbackType != CallbackKind.None;
     }
 
     // Key: (ser, field, entityIndex) — entityIndex -1 = all entities.
@@ -135,6 +173,15 @@ internal static unsafe class FieldSubstitution
     public static void SetCallback(string serializerName, string fieldName, PerClientIntProxy callback)
         => _registry[(serializerName, fieldName, -1)] = new SpoofEntry(callback);
 
+    public static void SetCallback(string serializerName, string fieldName, PerClientFloatProxy callback)
+        => _registry[(serializerName, fieldName, -1)] = new SpoofEntry(callback);
+
+    public static void SetCallback(string serializerName, string fieldName, PerClientBoolProxy callback)
+        => _registry[(serializerName, fieldName, -1)] = new SpoofEntry(callback);
+
+    public static void SetCallback(string serializerName, string fieldName, PerClientVectorProxy callback)
+        => _registry[(serializerName, fieldName, -1)] = new SpoofEntry(callback);
+
     public static void ClearCallback(string serializerName, string fieldName)
         => _registry.TryRemove((serializerName, fieldName, -1), out _);
 
@@ -143,7 +190,7 @@ internal static unsafe class FieldSubstitution
         // Remove only global (-1) callback entries; leave entity-specific spoofs.
         foreach (var key in _registry.Keys)
         {
-            if (key.entityIndex == -1 && _registry.TryGetValue(key, out var e) && e.Callback is not null)
+            if (key.entityIndex == -1 && _registry.TryGetValue(key, out var e) && e.HasCallback)
                 _registry.TryRemove(key, out _);
         }
     }
@@ -152,13 +199,13 @@ internal static unsafe class FieldSubstitution
     {
         foreach (var key in _registry.Keys)
         {
-            if (key.entityIndex == -1 && _registry.TryGetValue(key, out var e) && e.HasSpoof && e.Callback is null)
+            if (key.entityIndex == -1 && _registry.TryGetValue(key, out var e) && e.HasSpoof && !e.HasCallback)
                 _registry.TryRemove(key, out _);
         }
     }
 
-    public static bool HasSpoofs    => !_registry.IsEmpty && HasEntriesMatching(static e => e.HasSpoof && e.Callback is null);
-    public static bool HasCallbacks => !_registry.IsEmpty && HasEntriesMatching(static e => e.Callback is not null);
+    public static bool HasSpoofs    => !_registry.IsEmpty && HasEntriesMatching(static e => e.HasSpoof && !e.HasCallback);
+    public static bool HasCallbacks => !_registry.IsEmpty && HasEntriesMatching(static e => e.HasCallback);
 
     private static bool HasEntriesMatching(Func<SpoofEntry, bool> pred)
     {
@@ -173,8 +220,20 @@ internal static unsafe class FieldSubstitution
     public static void SetEntitySpoof(int entityIndex, string serializerName, string fieldName, int value)
         => _registry[(serializerName, fieldName, entityIndex)] = new SpoofEntry(value);
 
-    /// <summary>Register a per-client callback scoped to a specific entity index only.</summary>
+    /// <summary>Register a per-client int callback scoped to a specific entity index only.</summary>
     public static void SetEntityCallback(int entityIndex, string serializerName, string fieldName, PerClientIntProxy callback)
+        => _registry[(serializerName, fieldName, entityIndex)] = new SpoofEntry(callback);
+
+    /// <summary>Register a per-client float callback scoped to a specific entity index only.</summary>
+    public static void SetEntityCallback(int entityIndex, string serializerName, string fieldName, PerClientFloatProxy callback)
+        => _registry[(serializerName, fieldName, entityIndex)] = new SpoofEntry(callback);
+
+    /// <summary>Register a per-client bool callback scoped to a specific entity index only.</summary>
+    public static void SetEntityCallback(int entityIndex, string serializerName, string fieldName, PerClientBoolProxy callback)
+        => _registry[(serializerName, fieldName, entityIndex)] = new SpoofEntry(callback);
+
+    /// <summary>Register a per-client vector/qangle callback scoped to a specific entity index only.</summary>
+    public static void SetEntityCallback(int entityIndex, string serializerName, string fieldName, PerClientVectorProxy callback)
         => _registry[(serializerName, fieldName, entityIndex)] = new SpoofEntry(callback);
 
     /// <summary>Remove the entity-specific registration for (entityIndex, ser, field). Does not touch the global -1 entry.</summary>
@@ -515,19 +574,64 @@ internal static unsafe class FieldSubstitution
             }
             else  // Fake
             {
-                // Determine effective fake value:
-                //   1. Start with the registered spoof value (0 if HasSpoof is false).
-                //   2. Invoke per-client callback if present — may overwrite value, returns true → substitute, false → passthrough.
-                // A throwing callback is caught → passthrough for this field/client.
+                // ── Invoke typed callback and determine effective scratch values ─────────────
+                //
+                // Each typed callback receives its own natural value type (float, bool, 3×float)
+                // rather than a bit-packed int — no caller-side bit-casting needed.
+                //
+                // Callback returns true → substitute; false → passthrough.
+                // A throwing callback → passthrough for this field/client.
+                //
+                // For scalar fields (Int/Float/Bool/Fixed) we use a single "effectiveFake" int
+                // carrier (legacy path). For vector fields we use three separate floats.
 
-                int  effectiveFake   = reg.HasSpoof ? reg.SpoofValue : 0;
-                bool shouldSubstitute = reg.Callback is null; // no callback → uniform spoof, always substitute
+                bool shouldSubstitute;
+                int  effectiveFake = reg.HasSpoof ? reg.SpoofValue : 0;
 
-                if (reg.Callback is not null)
+                // Vector/QAngle scratch values (only meaningful when fieldType is QAngle3/Vector3).
+                float vx = 0f, vy = 0f, vz = 0f;
+
+                if (!reg.HasCallback)
+                {
+                    // Uniform spoof (no callback) — always substitute.
+                    shouldSubstitute = true;
+                }
+                else
                 {
                     try
                     {
-                        shouldSubstitute = reg.Callback(client, entityIndex, ref effectiveFake);
+                        switch (reg.CallbackType)
+                        {
+                            case CallbackKind.Int:
+                                shouldSubstitute = reg.IntCallback!(client, entityIndex, ref effectiveFake);
+                                break;
+
+                            case CallbackKind.Float:
+                            {
+                                // Seed with 0.0f; callback writes its own float.
+                                float fval = 0f;
+                                shouldSubstitute = reg.FloatCallback!(client, entityIndex, ref fval);
+                                // Pack the float bits into effectiveFake for the scalar scratch builder below.
+                                effectiveFake = BitConverter.SingleToInt32Bits(fval);
+                                break;
+                            }
+
+                            case CallbackKind.Bool:
+                            {
+                                bool bval = false;
+                                shouldSubstitute = reg.BoolCallback!(client, entityIndex, ref bval);
+                                effectiveFake = bval ? 1 : 0;
+                                break;
+                            }
+
+                            case CallbackKind.Vector:
+                                shouldSubstitute = reg.VectorCallback!(client, entityIndex, ref vx, ref vy, ref vz);
+                                break;
+
+                            default:
+                                shouldSubstitute = false;
+                                break;
+                        }
                     }
                     catch (Exception ex)
                     {
@@ -577,7 +681,7 @@ internal static unsafe class FieldSubstitution
                 //   encoder(rdi=bf_write*, rsi=fieldInfo*, rdx=paramsPtr, rcx=valuePtr, r8d=0)
                 // paramsPtr derivation replicates the engine call site:
                 //   byte off = *(byte*)(fieldInfo+0xC9); paramsPtr = (off==0xFF)?0:*(nint*)(fieldInfo+0x40)+off
-                // valuePtr points to a 16-byte scratch containing the fake value in its native engine layout.
+                // valuePtr points to a scratch buffer containing the fake value in its native engine layout.
                 var fieldInfo  = *(nint*) (leafRec + 0x00);
                 var dispatch   = *(nint*) (fieldInfo + 0x38);
                 var encoderFn  = NativeUtil.IsUserPtr(dispatch) ? *(nint*) dispatch : 0;
@@ -591,12 +695,18 @@ internal static unsafe class FieldSubstitution
                     return originalResult;
                 }
 
-                // Build a 16-byte scratch with the fake value in the engine's native in-memory layout.
-                // Layout per FieldType (matches what the engine's in-process field stores):
-                //   Int32/Int64/Fixed32/Fixed64 (signed): *(long*) = sign-extended effectiveFake
-                //   UInt32/UInt64:                        *(ulong*)= (uint)effectiveFake  (zero-high)
-                //   Bool:                                 *(byte*) = 0 or 1
-                //   Float32: encoder reads *(double*) and narrows; supply sign-extended IEEE bits
+                // Build scratch with the fake value in the engine's native in-memory layout.
+                //
+                // Scalar types (≤ 8 bytes):
+                //   Int32/Int64/Fixed32/Fixed64 (signed): *(long*)  = sign-extended effectiveFake
+                //   UInt32:                               *(ulong*) = (uint)effectiveFake (zero-high)
+                //   Bool:                                 *(byte*)  = 0 or 1
+                //   Float32: encoder reads *(double*) then narrows; effectiveFake already holds IEEE bits.
+                //
+                // Vector/QAngle (12 bytes, 3 × float32):
+                //   QAngle3 / Vector3: three contiguous float32 — [0]=x, [1]=y, [2]=z.
+                //   The qangle encoder reads 3 floats from scratch + uses paramsPtr for mode/bit-count.
+                //   16-byte scratch gives comfortable alignment margin beyond the 12 bytes consumed.
                 var scratch = stackalloc byte[16];
                 switch (fieldType)
                 {
@@ -614,8 +724,15 @@ internal static unsafe class FieldSubstitution
                         break;
                     case FieldType.Float32:
                         // Encoder reads *(double*) then narrows to float.
-                        // effectiveFake carries the IEEE-754 bit pattern (caller used SingleToInt32Bits).
+                        // effectiveFake carries the IEEE-754 bit pattern.
                         *(double*) scratch = (double) BitConverter.Int32BitsToSingle(effectiveFake);
+                        break;
+                    case FieldType.QAngle3:
+                    case FieldType.Vector3:
+                        // Three contiguous float32 in the order the encoder reads them.
+                        ((float*) scratch)[0] = vx;
+                        ((float*) scratch)[1] = vy;
+                        ((float*) scratch)[2] = vz;
                         break;
                     default:
                         // Unreachable — Unsupported was gated above — but be defensive.
@@ -804,7 +921,8 @@ internal static unsafe class FieldSubstitution
     ///       b2  default = unsigned raw varint            → UInt32
     ///           fixed32 = raw 32-bit write               → Fixed32
     ///           fixed64 = raw 64-bit write               → Fixed64
-    ///       b3  all     = quantized float/vector/angle   → Unsupported (multi-component)
+    ///       b3  qangle  = 3-float qangle/vector3          → QAngle3 / Vector3
+    ///           others  = quantized (coord/normal/etc)   → Unsupported (read quant state from value struct)
     ///       b4  default = raw 32-bit IEEE-754            → Float32
     ///       b5  all     = uint64/handle/string           → Unsupported
     ///       b6  all     = array                          → Unsupported
@@ -900,9 +1018,17 @@ internal static unsafe class FieldSubstitution
                 if (name == "default") return FieldType.Bool;
                 return FieldType.Unsupported;
 
+            case 3: // qangle / vector3 bucket
+                // The qangle encoder (0x3c6220) reads 3 contiguous float32 from the scratch plus uses
+                // paramsPtr for its mode/bit-count — synthesizable.
+                // All other bucket-3 entries (coord, normal, coord_integral, quantized-default) read
+                // quantization state from the value struct, NOT from scratch alone — Unsupported.
+                if (name == "qangle") return FieldType.QAngle3;
+                if (name == "vector3") return FieldType.Vector3;
+                return FieldType.Unsupported;
+
             default:
-                // b0 (no-op), b3 (quantized float/vector/angle), b5 (uint64/handle/string),
-                // b6 (array): none are substitutable.
+                // b0 (no-op), b5 (uint64/handle/string), b6 (array): none are substitutable.
                 return FieldType.Unsupported;
         }
     }

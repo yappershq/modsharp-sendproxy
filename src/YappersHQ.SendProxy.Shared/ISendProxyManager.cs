@@ -41,6 +41,31 @@ public enum SendProxyResult
 
 public delegate bool PerClientIntProxy(nint client, int entityIndex, ref int value);
 
+/// <summary>
+///     Per-client float field substitution callback.
+///     <paramref name="value"/> is seeded 0f — write the desired float and return true to substitute,
+///     false to pass through the real value.
+///     Runs on engine send threads — must be thread-safe and non-blocking.
+/// </summary>
+public delegate bool PerClientFloatProxy(nint client, int entityIndex, ref float value);
+
+/// <summary>
+///     Per-client bool field substitution callback.
+///     <paramref name="value"/> is seeded false — write the desired bool and return true to substitute,
+///     false to pass through the real value.
+///     Runs on engine send threads — must be thread-safe and non-blocking.
+/// </summary>
+public delegate bool PerClientBoolProxy(nint client, int entityIndex, ref bool value);
+
+/// <summary>
+///     Per-client vector/qangle field substitution callback.
+///     x/y/z are seeded 0f — write the desired components and return true to substitute,
+///     false to pass through the real value.
+///     Applies to QAngle3 and Vector3 fields (3 contiguous float32 in the engine's native layout).
+///     Runs on engine send threads — must be thread-safe and non-blocking.
+/// </summary>
+public delegate bool PerClientVectorProxy(nint client, int entityIndex, ref float x, ref float y, ref float z);
+
 // ── Proxy callbacks (per-type, value passed by ref) ──────────────────────────────
 
 public delegate SendProxyResult SendProxyIntCallback(IGameClient? client, int entity, string prop, int element, ref int value);
@@ -133,6 +158,56 @@ public interface ISendProxyManager
     ///     Does NOT uninstall Phase-2 detours (call <c>UnhookAllPerClient</c> for that).
     /// </summary>
     void UnhookInt(string serializerName, string fieldName);
+
+    // ── Typed per-client API: Float ───────────────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Register a per-client float substitution callback for (serializerName, fieldName), all entities.
+    ///     Use for fields classified Float32. Installs Phase-2 detours on first use.
+    /// </summary>
+    void HookFloat(string serializerName, string fieldName, PerClientFloatProxy callback);
+
+    /// <summary>
+    ///     Register a per-client float substitution callback scoped to a SPECIFIC entity index.
+    ///     Installs Phase-2 detours on first use.
+    /// </summary>
+    void HookEntityFloat(int entityIndex, string serializerName, string fieldName, PerClientFloatProxy callback);
+
+    // ── Typed per-client API: Bool ────────────────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Register a per-client bool substitution callback for (serializerName, fieldName), all entities.
+    ///     Use for fields classified Bool. Installs Phase-2 detours on first use.
+    /// </summary>
+    void HookBool(string serializerName, string fieldName, PerClientBoolProxy callback);
+
+    /// <summary>
+    ///     Register a per-client bool substitution callback scoped to a SPECIFIC entity index.
+    ///     Installs Phase-2 detours on first use.
+    /// </summary>
+    void HookEntityBool(int entityIndex, string serializerName, string fieldName, PerClientBoolProxy callback);
+
+    // ── Typed per-client API: Vector/QAngle ──────────────────────────────────────────────────
+
+    /// <summary>
+    ///     Register a per-client vector/qangle substitution callback for (serializerName, fieldName), all entities.
+    ///     Use for fields classified QAngle3 or Vector3 (3 contiguous float32 in the engine layout).
+    ///     Installs Phase-2 detours on first use.
+    /// </summary>
+    void HookVector(string serializerName, string fieldName, PerClientVectorProxy callback);
+
+    /// <summary>
+    ///     Register a per-client vector/qangle substitution callback scoped to a SPECIFIC entity index.
+    ///     Installs Phase-2 detours on first use.
+    /// </summary>
+    void HookEntityVector(int entityIndex, string serializerName, string fieldName, PerClientVectorProxy callback);
+
+    /// <summary>
+    ///     Remove the global per-client callback for (serializerName, fieldName) regardless of type.
+    ///     Alias for UnhookInt — type-agnostic removal.
+    ///     Does NOT uninstall Phase-2 detours (call <c>UnhookAllPerClient</c> for that).
+    /// </summary>
+    void Unhook(string serializerName, string fieldName);
 
     /// <summary>
     ///     Remove ALL registered per-client callbacks and entity-specific spoofs/callbacks,

@@ -232,6 +232,121 @@ internal sealed class SendProxyManager : ISendProxyManager
     }
 
     /// <inheritdoc/>
+    public void Unhook(string serializerName, string fieldName)
+        => UnhookInt(serializerName, fieldName);
+
+    // ── Float ─────────────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public void HookFloat(string serializerName, string fieldName, PerClientFloatProxy callback)
+    {
+        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null)
+            return;
+
+        if (!EnsureDetours($"HookFloat(\"{serializerName}::{fieldName}\")"))
+            return;
+
+        FieldSubstitution.SetCallback(serializerName, fieldName, callback);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+
+        _logger.LogInformation(
+            "SendProxy: per-client float callback (all entities) registered for \"{Ser}::{Field}\"",
+            serializerName, fieldName);
+    }
+
+    /// <inheritdoc/>
+    public void HookEntityFloat(int entityIndex, string serializerName, string fieldName, PerClientFloatProxy callback)
+    {
+        if (entityIndex < 0) { _logger.LogWarning("SendProxy: HookEntityFloat — entityIndex must be >= 0 (got {Idx})", entityIndex); return; }
+        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null)
+            return;
+
+        if (!EnsureDetours($"HookEntityFloat(ent={entityIndex}, \"{serializerName}::{fieldName}\")"))
+            return;
+
+        FieldSubstitution.SetEntityCallback(entityIndex, serializerName, fieldName, callback);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+
+        _logger.LogInformation(
+            "SendProxy: per-client float callback registered for ent={Ent} \"{Ser}::{Field}\"",
+            entityIndex, serializerName, fieldName);
+    }
+
+    // ── Bool ──────────────────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public void HookBool(string serializerName, string fieldName, PerClientBoolProxy callback)
+    {
+        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null)
+            return;
+
+        if (!EnsureDetours($"HookBool(\"{serializerName}::{fieldName}\")"))
+            return;
+
+        FieldSubstitution.SetCallback(serializerName, fieldName, callback);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+
+        _logger.LogInformation(
+            "SendProxy: per-client bool callback (all entities) registered for \"{Ser}::{Field}\"",
+            serializerName, fieldName);
+    }
+
+    /// <inheritdoc/>
+    public void HookEntityBool(int entityIndex, string serializerName, string fieldName, PerClientBoolProxy callback)
+    {
+        if (entityIndex < 0) { _logger.LogWarning("SendProxy: HookEntityBool — entityIndex must be >= 0 (got {Idx})", entityIndex); return; }
+        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null)
+            return;
+
+        if (!EnsureDetours($"HookEntityBool(ent={entityIndex}, \"{serializerName}::{fieldName}\")"))
+            return;
+
+        FieldSubstitution.SetEntityCallback(entityIndex, serializerName, fieldName, callback);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+
+        _logger.LogInformation(
+            "SendProxy: per-client bool callback registered for ent={Ent} \"{Ser}::{Field}\"",
+            entityIndex, serializerName, fieldName);
+    }
+
+    // ── Vector / QAngle ───────────────────────────────────────────────────────
+
+    /// <inheritdoc/>
+    public void HookVector(string serializerName, string fieldName, PerClientVectorProxy callback)
+    {
+        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null)
+            return;
+
+        if (!EnsureDetours($"HookVector(\"{serializerName}::{fieldName}\")"))
+            return;
+
+        FieldSubstitution.SetCallback(serializerName, fieldName, callback);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+
+        _logger.LogInformation(
+            "SendProxy: per-client vector/qangle callback (all entities) registered for \"{Ser}::{Field}\"",
+            serializerName, fieldName);
+    }
+
+    /// <inheritdoc/>
+    public void HookEntityVector(int entityIndex, string serializerName, string fieldName, PerClientVectorProxy callback)
+    {
+        if (entityIndex < 0) { _logger.LogWarning("SendProxy: HookEntityVector — entityIndex must be >= 0 (got {Idx})", entityIndex); return; }
+        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null)
+            return;
+
+        if (!EnsureDetours($"HookEntityVector(ent={entityIndex}, \"{serializerName}::{fieldName}\")"))
+            return;
+
+        FieldSubstitution.SetEntityCallback(entityIndex, serializerName, fieldName, callback);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+
+        _logger.LogInformation(
+            "SendProxy: per-client vector/qangle callback registered for ent={Ent} \"{Ser}::{Field}\"",
+            entityIndex, serializerName, fieldName);
+    }
+
+    /// <inheritdoc/>
     public void UnhookAllPerClient()
     {
         // Clear the entire registry (global + entity-specific) and uninstall detours.
