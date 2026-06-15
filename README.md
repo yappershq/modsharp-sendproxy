@@ -169,18 +169,27 @@ They require the `sendproxy:example` permission; grant it (or `*`) via your admi
 resolves AdminManager in `OnAllModulesLoaded` and retries in `OnLibraryConnected` (so it survives
 CommandCenter loading late); AdminManager auto-unregisters the commands on disconnect.
 
+It is a **test matrix**: the generic commands hit any encoder type, on any field, in any mode, with no
+recompile. `<type>` is one of `int uint float bool vec string bytes` (mapping: `int`→bucket 1, `uint`→2,
+`vec`→3 qangle/vector/coord/quantized, `float`→4, `string`→5, `bytes`→6, `bool`→7). `vec` takes three
+floats; `string` takes free text; `bytes` takes a contiguous hex string (e.g. `DEADBEEF`).
+
 | Command | Demonstrates |
 |---|---|
-| `sp_example_fakehp <value>` | **Uniform** spoof — `SetUniform` on `CCSPlayerPawn::m_iHealth`, all clients, all pawns |
-| `sp_example_fakehp_entity <entityIndex> <fakeValue>` | **Per-entity** uniform spoof — `SetUniform(entity, ...)` scoped to one entity |
-| `sp_example_perclienthp <baseValue>` | **Per-client** int callback — `Hook(..., PerClientIntProxy)`, derives a per-recipient value from the client pointer |
-| `sp_example_perclienthp_off` | `Unhook` — remove that per-client callback |
-| `sp_example_fakeangle <pitch> <yaw> <roll>` | **Vector/QAngle** callback — `Hook(..., PerClientVectorProxy)` on `m_angEyeAngles`, fixed angles for all clients |
-| `sp_example_fakeangle_off` | `Unhook` — remove the eye-angle callback |
-| `sp_example_off` | `UnhookAll` — clear everything, uninstall the substitution detours |
+| `sp_set <ser> <field> <type> <value...>` | **Uniform** spoof (all clients) — dispatches to the matching `SetUniform` overload |
+| `sp_setpc <ser> <field> <type>` | **Per-client** callback — registers a `Hook(...)` proxy whose value varies per recipient |
+| `sp_setent <idx> <ser> <field> <type> <value...>` | **Per-entity** uniform spoof — `SetUniform(entity, ...)` scoped to one entity |
+| `sp_unset <ser> <field>` | `Unhook` the all-entities registration for a field |
+| `sp_clear` | `UnhookAll` — clear everything, uninstall the substitution detours |
+| `sp_help` | Print the matrix + ready-to-paste examples |
+| `sp_fakehp <value>` | Preset — `SetUniform("CCSPlayerPawn","m_iHealth", value)` |
+| `sp_fakename <text>` | Preset — `SetUniform("CCSPlayerController","m_iszPlayerName", text)` (b5 string) |
 | `sp_probe_scan` | Read-only serializer probe — list live entities + classes, dump the first |
 | `sp_probe_dump <entityIndex>` | Read-only — dump one entity's serializer class info / field[0] |
 | `sp_probe_field <serializerClass> <fieldName>` | Read-only — dump a field record's qword window (RE aid) |
+
+Examples: `sp_set CCSPlayerPawn m_iHealth int 1337` · `sp_set CCSPlayerController m_iszPlayerName string Hacker`
+· `sp_setpc CCSPlayerPawn m_iHealth int` (each client a different HP) · `sp_setent 3 CCSPlayerPawn m_iHealth int 1`.
 
 ## Build / deploy
 
