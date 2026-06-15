@@ -26,15 +26,16 @@ using Sharp.Shared.Enums;
 using Sharp.Shared.Managers;
 using Sharp.Shared.Objects;
 using Sharp.Shared.Types;
+using Sharp.Shared.Units;
 using YappersHQ.SendProxy.Shared;
 
 namespace YappersHQ.SendProxy.Example;
 
 /// <summary>
 ///     Example consumer of <see cref="ISendProxyManager"/>. Demonstrates the full public API — uniform
-///     spoofs, per-entity spoofs, per-client callbacks, vector hooks — plus the read-only serializer
-///     probe. All commands are registered through AdminManager (admin-gated, dispatched from chat,
-///     console and RCON); the Core library ships no commands.
+///     spoofs, per-entity spoofs, per-client callbacks, vector hooks, string hooks — plus the read-only
+///     serializer probe. All commands are registered through AdminManager (admin-gated, dispatched from
+///     chat, console and RCON); the Core library ships no commands.
 /// </summary>
 public sealed class ExampleModule : IModSharpModule
 {
@@ -44,10 +45,10 @@ public sealed class ExampleModule : IModSharpModule
     private static readonly string ModuleIdentity =
         typeof(ExampleModule).Assembly.GetName().Name ?? "YappersHQ.SendProxy.Example";
 
-    private readonly ISharedSystem        _sharedSystem;
+    private readonly ISharedSystem         _sharedSystem;
     private readonly ILogger<ExampleModule> _logger;
-    private readonly IEntityManager       _entityManager;
-    private readonly ISharpModuleManager  _modules;
+    private readonly IEntityManager        _entityManager;
+    private readonly ISharpModuleManager   _modules;
 
     private ISendProxyManager?                       _sendProxy;
     private IModSharpModuleInterface<IAdminManager>? _adminManager;
@@ -102,9 +103,9 @@ public sealed class ExampleModule : IModSharpModule
 
     public void Shutdown()
     {
-        // AdminManager auto-unregisters this module's commands and permissions on disconnect, so only the
-        // per-client registrations need cleaning up here.
-        _sendProxy?.UnhookAllPerClient();
+        // AdminManager auto-unregisters this module's commands and permissions on disconnect; only the
+        // substitution registrations need explicit cleanup here.
+        _sendProxy?.UnhookAll();
     }
 
     #endregion
@@ -132,13 +133,16 @@ public sealed class ExampleModule : IModSharpModule
             // wildcards. Server operators grant "sendproxy:example" (or "*") via their real admin source.
             registry.RegisterPermissions([SendProxyPermission]);
 
-            registry.RegisterAdminCommand("sp_example_fakehp",         OnFakeHp,         [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_example_fakehp_entity",  OnFakeHpEntity,   [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_example_perclienthp",    OnPerClientHp,    [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_example_perclienthp_off", OnPerClientHpOff, [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_example_fakeangle",      OnFakeAngle,      [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_example_fakeangle_off",  OnFakeAngleOff,   [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_example_off",            OnExampleOff,     [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_example_fakehp",          OnFakeHp,          [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_example_fakehp_off",       OnFakeHpOff,       [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_example_fakehp_entity",    OnFakeHpEntity,    [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_example_perclienthp",      OnPerClientHp,     [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_example_perclienthp_off",  OnPerClientHpOff,  [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_example_fakeangle",        OnFakeAngle,       [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_example_fakeangle_off",    OnFakeAngleOff,    [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_example_fakename",         OnFakeName,        [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_example_fakename_off",     OnFakeNameOff,     [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_example_off",              OnExampleOff,      [SendProxyPermission]);
 
             registry.RegisterAdminCommand("sp_probe_scan",  OnProbeScan,  [SendProxyPermission]);
             registry.RegisterAdminCommand("sp_probe_dump",  OnProbeDump,  [SendProxyPermission]);
@@ -173,6 +177,7 @@ public sealed class ExampleModule : IModSharpModule
 
     #region SendProxy demo commands
 
+    // sp_example_fakehp <n> — broadcast a fake uniform HP to all clients for every CCSPlayerPawn.
     private void OnFakeHp(IGameClient? issuer, StringCommand command)
     {
         if (_sendProxy is null)
@@ -187,10 +192,23 @@ public sealed class ExampleModule : IModSharpModule
             return;
         }
 
-        _sendProxy.SetUniformInt("CCSPlayerPawn", "m_iHealth", value);
+        _sendProxy.SetUniform("CCSPlayerPawn", "m_iHealth", value);
         Reply(issuer, $"Uniform fakehp: CCSPlayerPawn::m_iHealth → {value} for all clients (real HP unchanged)");
     }
 
+    // sp_example_fakehp_off — remove the uniform HP spoof.
+    private void OnFakeHpOff(IGameClient? issuer, StringCommand command)
+    {
+        if (_sendProxy is null)
+        {
+            return;
+        }
+
+        _sendProxy.Unhook("CCSPlayerPawn", "m_iHealth");
+        Reply(issuer, "Uniform fakehp removed");
+    }
+
+    // sp_example_fakehp_entity <entityIndex> <fakeValue> — per-entity HP spoof.
     private void OnFakeHpEntity(IGameClient? issuer, StringCommand command)
     {
         if (_sendProxy is null)
@@ -199,7 +217,7 @@ public sealed class ExampleModule : IModSharpModule
         }
 
         if (command.ArgCount < 2
-            || !int.TryParse(command.GetArg(1), out var entity)
+            || !int.TryParse(command.GetArg(1), out var entityIdx)
             || !int.TryParse(command.GetArg(2), out var fake))
         {
             Reply(issuer, "usage: sp_example_fakehp_entity <entityIndex> <fakeValue>");
@@ -207,10 +225,18 @@ public sealed class ExampleModule : IModSharpModule
             return;
         }
 
-        _sendProxy.SetEntitySpoof(entity, "CCSPlayerPawn", "m_iHealth", fake);
-        Reply(issuer, $"Per-entity m_iHealth spoof installed: ent={entity} → {fake} (other entities unaffected)");
+        if (_entityManager.FindEntityByIndex((EntityIndex) entityIdx) is not { } entity)
+        {
+            Reply(issuer, $"No entity at index {entityIdx}");
+
+            return;
+        }
+
+        _sendProxy.SetUniform(entity, "CCSPlayerPawn", "m_iHealth", fake);
+        Reply(issuer, $"Per-entity m_iHealth spoof installed: ent={entityIdx} → {fake} (other entities unaffected)");
     }
 
+    // sp_example_perclienthp — install a per-client HP callback: each client sees 1 + (clientPtr & 0xFF).
     private void OnPerClientHp(IGameClient? issuer, StringCommand command)
     {
         if (_sendProxy is null)
@@ -218,26 +244,18 @@ public sealed class ExampleModule : IModSharpModule
             return;
         }
 
-        if (command.ArgCount < 1 || !int.TryParse(command.GetArg(1), out var baseValue))
-        {
-            Reply(issuer, "usage: sp_example_perclienthp <baseValue>");
+        _sendProxy.Hook("CCSPlayerPawn", "m_iHealth",
+            (nint client, int entityIndex, ref int value) =>
+            {
+                value = 1 + (int) (client & 0xFF);
 
-            return;
-        }
+                return true;
+            });
 
-        // Capture baseValue by value — the callback runs on engine send threads and must not block or
-        // allocate. Demo logic: derive a per-client toggle from the client pointer (no deref).
-        var capturedBase = baseValue;
-        _sendProxy.HookInt("CCSPlayerPawn", "m_iHealth", (nint client, int entityIndex, ref int value) =>
-        {
-            value = (client & 1L) != 0 ? capturedBase : capturedBase + 50;
-
-            return true;
-        });
-
-        Reply(issuer, $"Per-client m_iHealth hook installed: odd-client-ptr → {capturedBase}, even → {capturedBase + 50}");
+        Reply(issuer, "Per-client m_iHealth hook installed: each client sees 1 + (clientPtr & 0xFF)");
     }
 
+    // sp_example_perclienthp_off — remove the per-client HP hook.
     private void OnPerClientHpOff(IGameClient? issuer, StringCommand command)
     {
         if (_sendProxy is null)
@@ -245,10 +263,11 @@ public sealed class ExampleModule : IModSharpModule
             return;
         }
 
-        _sendProxy.UnhookInt("CCSPlayerPawn", "m_iHealth");
+        _sendProxy.Unhook("CCSPlayerPawn", "m_iHealth");
         Reply(issuer, "Per-client m_iHealth hook removed");
     }
 
+    // sp_example_fakeangle [pitch] [yaw] [roll] — broadcast fake eye angles to all clients.
     private void OnFakeAngle(IGameClient? issuer, StringCommand command)
     {
         if (_sendProxy is null)
@@ -278,12 +297,10 @@ public sealed class ExampleModule : IModSharpModule
         var capturedYaw   = yaw;
         var capturedRoll  = roll;
 
-        _sendProxy.HookVector("CCSPlayerPawn", "m_angEyeAngles",
-            (nint client, int entityIndex, ref float x, ref float y, ref float z) =>
+        _sendProxy.Hook("CCSPlayerPawn", "m_angEyeAngles",
+            (nint client, int entityIndex, ref System.Numerics.Vector3 value) =>
             {
-                x = capturedPitch;
-                y = capturedYaw;
-                z = capturedRoll;
+                value = new System.Numerics.Vector3(capturedPitch, capturedYaw, capturedRoll);
 
                 return true;
             });
@@ -291,6 +308,7 @@ public sealed class ExampleModule : IModSharpModule
         Reply(issuer, $"Fake eye-angle hook installed: pitch={capturedPitch} yaw={capturedYaw} roll={capturedRoll} (all CCSPlayerPawn)");
     }
 
+    // sp_example_fakeangle_off — remove the eye-angle hook.
     private void OnFakeAngleOff(IGameClient? issuer, StringCommand command)
     {
         if (_sendProxy is null)
@@ -302,6 +320,39 @@ public sealed class ExampleModule : IModSharpModule
         Reply(issuer, "Fake eye-angle hook removed");
     }
 
+    // sp_example_fakename <text> — broadcast a fake player name string to all clients (b5 string demo).
+    private void OnFakeName(IGameClient? issuer, StringCommand command)
+    {
+        if (_sendProxy is null)
+        {
+            return;
+        }
+
+        if (command.ArgCount < 1)
+        {
+            Reply(issuer, "usage: sp_example_fakename <text>");
+
+            return;
+        }
+
+        var name = command.GetArg(1);
+        _sendProxy.SetUniform("CCSPlayerController", "m_iszPlayerName", name);
+        Reply(issuer, $"Uniform fakename: CCSPlayerController::m_iszPlayerName → \"{name}\" for all clients");
+    }
+
+    // sp_example_fakename_off — remove the uniform name spoof.
+    private void OnFakeNameOff(IGameClient? issuer, StringCommand command)
+    {
+        if (_sendProxy is null)
+        {
+            return;
+        }
+
+        _sendProxy.Unhook("CCSPlayerController", "m_iszPlayerName");
+        Reply(issuer, "Uniform fakename removed");
+    }
+
+    // sp_example_off — clear all example registrations and uninstall substitution detours.
     private void OnExampleOff(IGameClient? issuer, StringCommand command)
     {
         if (_sendProxy is null)
@@ -309,7 +360,7 @@ public sealed class ExampleModule : IModSharpModule
             return;
         }
 
-        _sendProxy.UnhookAllPerClient();
+        _sendProxy.UnhookAll();
         Reply(issuer, "sp_example_off: all example hooks cleared, substitution detours uninstalled");
     }
 

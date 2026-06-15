@@ -8,11 +8,11 @@ A consumer plugin asks the `ISendProxyManager` interface to spoof a field; the l
 necessary native detours into CS2's serializer/send path and rewrites the per-client bit-stream as
 each snapshot is encoded. Three targeting modes:
 
-- **Uniform** — every client sees the same fake value for the field (`SetUniformInt`).
-- **Per-client** — a callback returns a (potentially different) value *per recipient* (`HookInt`/
-  `HookFloat`/`HookBool`/`HookVector`).
-- **Per-entity** — scope a spoof or callback to a single entity index (`SetUniformIntForEntity`,
-  `HookEntityInt`, …).
+- **Uniform** — every client sees the same fake value for the field (`SetUniform`).
+- **Per-client** — a callback returns a (potentially different) value *per recipient* (`Hook` with a
+  typed `PerClient*Proxy` delegate).
+- **Per-entity** — scope a spoof or callback to a single `IBaseEntity` (`SetUniform(entity, ...)` /
+  `Hook(entity, ...)`).
 
 > **Why this is hard on CS2:** Source 1's SendProxy swapped each `SendProp`'s `m_pProxyFn`, a
 > per-field function the engine called *while serializing each client's snapshot* — so per-client
@@ -32,8 +32,9 @@ each snapshot is encoded. Three targeting modes:
 | Boolean | bool | substitutable (1 bit) |
 | Float | float32 | substitutable (32 raw bits) |
 | Angle / vector | qangle, vector3 | substitutable (3 contiguous float32) |
+| String | null-terminated string | substitutable (7-bit encoded, null-terminated) |
+| Byte array | raw byte array | substitutable (varint count + count raw bytes) |
 | Float-derived | coord, normal, coord_integral, quantized float | **passthrough** (not yet substitutable) |
-| Other | string, array, handle | **passthrough** |
 
 If a field's type can't be classified, the hook passes through untouched — it never writes
 wrong-type bits, so an unsupported field is a no-op, not corruption.
@@ -68,42 +69,57 @@ public void OnAllModulesLoaded()
 }
 ```
 
-### Uniform spoof (all clients, all entities)
+### Method surface
 
-Every client sees `value` for the field on every entity of that serializer; the real server-side
-value is untouched.
+All registration is through two overload families:
+
+- `Hook(serializerName, fieldName, callback)` — per-client callback, all entities of that serializer.
+- `Hook(entity, serializerName, fieldName, callback)` — per-client callback, scoped to one `IBaseEntity`.
+- `SetUniform(serializerName, fieldName, value)` — same value for every client, all entities.
+- `SetUniform(entity, serializerName, fieldName, value)` — same value for every client, single entity.
+- `Unhook(serializerName, fieldName)` — remove all-entities registration.
+- `Unhook(entity, serializerName, fieldName)` — remove single-entity registration.
+- `UnhookAll()` — remove every registration and uninstall the substitution detours.
+- `IsHooked(serializerName, fieldName)` — returns true if any registration exists for that field.
+
+Each `Hook` and `SetUniform` overload is typed: `PerClientIntProxy` / `PerClientFloatProxy` /
+`PerClientBoolProxy` / `PerClientVectorProxy` / `PerClientStringProxy` / `PerClientBytesProxy`
+for the callback family; `int` / `float` / `bool` / `Vector3` / `string` / `byte[]` for the uniform family.
+
+Per-entity registrations win over all-entities registrations for that entity when both exist.
+Detours install lazily on first registration.
+
+### Uniform spoof (all clients, all entities)
 
 ```csharp
 // Everyone sees 1337 HP on every player pawn; real m_iHealth still drives damage/death.
-_sendProxy.SetUniformInt("CCSPlayerPawn", "m_iHealth", 1337);
+_sendProxy.SetUniform("CCSPlayerPawn", "m_iHealth", 1337);
+
+// Force a string field to a fixed value for all clients.
+_sendProxy.SetUniform("CCSGameRulesProxy", "m_szMatchStatTxt", "custom text");
 ```
 
 ### Per-client callback
 
-The callback runs as each client's snapshot is encoded and returns the value *that client* should
-see. Return `false` to leave the original value for that client.
+The callback runs as each client's snapshot is encoded; return `true` to substitute the value you
+wrote via `ref`, `false` to leave the original.
 
 ```csharp
-_sendProxy.HookInt("CCSPlayerPawn", "m_iHealth", (nint client, int entityIndex, ref int value) =>
-{
-    value = SomeLookup(client);   // value the recipient sees
-    return true;                  // true → substitute, false → leave original
-});
-```
+// Per-client int — each recipient sees a value derived from their client pointer.
+_sendProxy.Hook("CCSPlayerPawn", "m_iHealth",
+    (nint client, int entityIndex, ref int value) =>
+    {
+        value = SomeLookup(client);
+        return true;
+    });
 
-Typed variants for the other supported categories:
-
-```csharp
-_sendProxy.HookFloat("CCSPlayerPawn", "m_flField",
-    (nint client, int entityIndex, ref float value) => { value = 0.5f; return true; });
-
-_sendProxy.HookBool("SomeSerializer", "m_bField",
-    (nint client, int entityIndex, ref bool value) => { value = true; return true; });
-
-// QAngle3 / Vector3 — three contiguous float32 (e.g. eye angles).
-_sendProxy.HookVector("CCSPlayerPawn", "m_angEyeAngles",
-    (nint client, int entityIndex, ref float x, ref float y, ref float z) =>
-    { x = 0f; y = 90f; z = 0f; return true; });
+// Per-client string field.
+_sendProxy.Hook("SomeSerializer", "m_szSomeField",
+    (nint client, int entityIndex, ref string value) =>
+    {
+        value = GetStringForClient(client);
+        return true;
+    });
 ```
 
 #### Callback contract — read before writing one
@@ -111,40 +127,38 @@ _sendProxy.HookVector("CCSPlayerPawn", "m_angEyeAngles",
 - **Runs on the engine's send worker threads** (~6 of them). The callback **must be thread-safe and
   fast** — no locks held long, no blocking, no allocation on the hot path. Capture immutable data by
   value or index into a pre-sized slot array.
-- **`client`** is the raw `CServerSideClient*` (an `nint`) for the recipient. Use it as an opaque
-  key / pointer; don't assume it can be safely dereferenced from managed code.
-- **`entityIndex`** is the entity currently being sent (`-1` if it wasn't captured).
-- **Return `false`** to leave the original (real) value for that client; **`true`** to substitute the
-  value you wrote by `ref`.
+- **`client`** is the raw `CServerSideClient*` (`nint`) for the recipient. Use as an opaque key;
+  do not dereference from managed code.
+- **`entityIndex`** is the entity currently being sent (`-1` if not captured).
+- **Return `false`** to leave the original value for that client; **`true`** to substitute the value
+  you wrote by `ref`. The `ref` parameter is seeded with the registered uniform value, or the type
+  zero/empty if none is registered.
 - A throwing callback is caught and treated as passthrough for that field/client.
 
 ### Per-entity targeting
 
-Scope a spoof or callback to one entity index. When both a per-entity and a global (`-1`)
-registration exist for the same `(serializer, field)`, the per-entity one wins for that entity.
-
 ```csharp
-// Only entity 42's pawn shows 1 HP to everyone; other pawns unaffected.
-_sendProxy.SetUniformIntForEntity(42, "CCSPlayerPawn", "m_iHealth", 1);
+// All clients see 1 HP for one specific entity; other pawns unaffected.
+_sendProxy.SetUniform(someEntity, "CCSPlayerPawn", "m_iHealth", 1);
 
-// Per-entity per-client callback.
-_sendProxy.HookEntityInt(42, "CCSPlayerPawn", "m_iHealth",
+// Per-client callback scoped to one entity.
+_sendProxy.Hook(someEntity, "CCSPlayerPawn", "m_iHealth",
     (nint client, int entityIndex, ref int value) => { value = 1; return true; });
-// Also: HookEntityFloat / HookEntityBool / HookEntityVector, and SetEntitySpoof.
 ```
+
+`someEntity` is an `IBaseEntity` reference resolved at registration time. Do not store `IBaseEntity`
+long-term — resolve it fresh, call the registration once, then let the reference go.
 
 ### Unhooking
 
 ```csharp
-_sendProxy.UnhookInt("CCSPlayerPawn", "m_iHealth");      // remove global callback for a field (type-specific name)
-_sendProxy.Unhook("CCSPlayerPawn", "m_angEyeAngles");    // type-agnostic: remove global callback for a field
-_sendProxy.UnhookEntity(42, "CCSPlayerPawn", "m_iHealth"); // remove the per-entity registration only
-_sendProxy.UnhookAllPerClient();                          // remove EVERY registration + uninstall detours
+_sendProxy.Unhook("CCSPlayerPawn", "m_iHealth");           // remove all-entities registration
+_sendProxy.Unhook(someEntity, "CCSPlayerPawn", "m_iHealth"); // remove single-entity registration
+_sendProxy.UnhookAll();                                     // remove everything + uninstall detours
 ```
 
-Call `UnhookAllPerClient()` in your plugin's `Shutdown()` if you registered any callbacks — it clears
-all global/per-entity registrations and uninstalls the native detours, avoiding dangling delegate
-references.
+Call `UnhookAll()` in your plugin's `Shutdown()` — it clears all registrations and uninstalls the
+native detours, avoiding dangling delegate references.
 
 ## Example plugin
 
@@ -157,13 +171,13 @@ CommandCenter loading late); AdminManager auto-unregisters the commands on disco
 
 | Command | Demonstrates |
 |---|---|
-| `sp_example_fakehp <value>` | **Uniform** spoof — `SetUniformInt` on `CCSPlayerPawn::m_iHealth`, all clients, all pawns |
-| `sp_example_fakehp_entity <entityIndex> <fakeValue>` | **Per-entity** uniform spoof — `SetEntitySpoof` scoped to one entity |
-| `sp_example_perclienthp <baseValue>` | **Per-client** int callback — `HookInt`, derives a per-recipient value from the client pointer |
-| `sp_example_perclienthp_off` | `UnhookInt` — remove that per-client callback |
-| `sp_example_fakeangle <pitch> <yaw> <roll>` | **Vector/QAngle** callback — `HookVector` on `m_angEyeAngles`, fixed angles for all clients |
+| `sp_example_fakehp <value>` | **Uniform** spoof — `SetUniform` on `CCSPlayerPawn::m_iHealth`, all clients, all pawns |
+| `sp_example_fakehp_entity <entityIndex> <fakeValue>` | **Per-entity** uniform spoof — `SetUniform(entity, ...)` scoped to one entity |
+| `sp_example_perclienthp <baseValue>` | **Per-client** int callback — `Hook(..., PerClientIntProxy)`, derives a per-recipient value from the client pointer |
+| `sp_example_perclienthp_off` | `Unhook` — remove that per-client callback |
+| `sp_example_fakeangle <pitch> <yaw> <roll>` | **Vector/QAngle** callback — `Hook(..., PerClientVectorProxy)` on `m_angEyeAngles`, fixed angles for all clients |
 | `sp_example_fakeangle_off` | `Unhook` — remove the eye-angle callback |
-| `sp_example_off` | `UnhookAllPerClient` — clear everything, uninstall the substitution detours |
+| `sp_example_off` | `UnhookAll` — clear everything, uninstall the substitution detours |
 | `sp_probe_scan` | Read-only serializer probe — list live entities + classes, dump the first |
 | `sp_probe_dump <entityIndex>` | Read-only — dump one entity's serializer class info / field[0] |
 | `sp_probe_field <serializerClass> <fieldName>` | Read-only — dump a field record's qword window (RE aid) |

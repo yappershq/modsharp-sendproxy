@@ -40,34 +40,41 @@ internal static class SerializerProbe
         var firstValid = -1;
         for (var i = 0; i < 2048 && found < 24; i++)
         {
-            try
+            var ent = entityManager.FindEntityByIndex((EntityIndex) i);
+            if (ent is null)
             {
-                var ent = entityManager.FindEntityByIndex((EntityIndex) i);
-                if (ent is null)
-                {
-                    continue;
-                }
-
-                var p = ent.GetAbsPtr();
-                if (p == 0)
-                {
-                    continue;
-                }
-
-                var ci  = ((delegate* unmanaged<nint, nint>) (*(nint*) (*(nint*) p)))(p);
-                var cls = ci != 0 ? TryReadAscii(*(nint*) (ci + 0x08)) : "";
-                logger.LogInformation("sp_scan idx={Idx} ptr=0x{P:X} class=\"{Cls}\"", i, p, cls);
-                if (firstValid < 0)
-                {
-                    firstValid = i;
-                }
-
-                found++;
+                continue;
             }
-            catch
+
+            // Gate every pointer before dereferencing — a bad vtable call would fault uncatchably, so
+            // PtrLike is the protection (not a try/catch).
+            var p = ent.GetAbsPtr();
+            if (!PtrLike(p))
             {
-                // Skip indices that fault on resolve.
+                continue;
             }
+
+            var vtbl = *(nint*) p;
+            if (!PtrLike(vtbl))
+            {
+                continue;
+            }
+
+            var fn = *(nint*) vtbl;
+            if (!PtrLike(fn))
+            {
+                continue;
+            }
+
+            var ci  = ((delegate* unmanaged<nint, nint>) fn)(p);
+            var cls = PtrLike(ci) ? TryReadAscii(*(nint*) (ci + 0x08)) : "";
+            logger.LogInformation("sp_scan idx={Idx} ptr=0x{P:X} class=\"{Cls}\"", i, p, cls);
+            if (firstValid < 0)
+            {
+                firstValid = i;
+            }
+
+            found++;
         }
 
         logger.LogInformation("sp_scan: {Found} live entities (showing up to 24); dumping first valid idx={First}", found, firstValid);

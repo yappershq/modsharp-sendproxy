@@ -20,8 +20,10 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
+using System.Text;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using Sharp.Shared.Hooks;
@@ -29,12 +31,18 @@ using YappersHQ.SendProxy.Shared;
 
 namespace YappersHQ.SendProxy.Native;
 
-// Per-client per-field value substitution. WriteFieldList runs once per changed field per client on
-// an engine send thread; it calls GetBitRange (resolves the CFieldPath of the field being copied) then
-// BitCopyPrimitive (copies the field's pre-encoded bits). Substitution rides BitCopyPrimitive: save the
-// dst bit cursor, call the original, rewind, then re-emit the fake value through the field's own engine
-// encoder. RE layout/offset details: docs/REVERSE_ENGINEERING.md §11/§15. All mutable per-call state is
-// [ThreadStatic]; the registry and encoder maps are concurrent / read-only after Install.
+// Per-client per-field value substitution. WriteFieldList runs once per changed field per client on an
+// engine send worker thread; it calls GetBitRange (resolves the CFieldPath of the field being copied)
+// then BitCopyPrimitive (copies the field's pre-encoded bits). Substitution rides BitCopyPrimitive: save
+// the dst bit cursor, call the original, rewind, then re-emit the substitute value through the field's
+// own engine encoder. RE layout/offset details: docs/REVERSE_ENGINEERING.md §8/§9.
+//
+// Native memory access is guarded by IsUserPtr, never by try/catch — a bad dereference faults the
+// process (AccessViolation is not a catchable managed exception), so the pointer guard is the only real
+// protection. The few try blocks here wrap genuine managed throw-sites: the unmanaged-callback boundary,
+// the user proxy invocation, and the one-time install-time encoder enumeration. All per-field managed
+// work (building the substitute buffer) completes BEFORE the native save/rewind/emit sequence, so that
+// sequence has no managed throw-site and needs no guard of its own.
 
 internal enum SubstitutionMode
 {
@@ -44,15 +52,17 @@ internal enum SubstitutionMode
 }
 
 // Network encoder family for a registered field. The Coord3/Normal3/CoordIntegral3/QuantizedFloat set
-// requires reading the live value struct from the entity snapshot (the encoder's internal quant logic
-// must see the real float); the others are encoded from a synthesized scratch. Unsupported MUST pass
-// through untouched — writing wrong-type bits would corrupt the delta for every client.
+// requires reading the live value struct from the entity snapshot (the encoder's quant logic must see
+// the real float). String re-points the value at a scratch char*; ByteArray hands the encoder a scratch
+// {data,count} struct. Unsupported MUST pass through untouched — writing wrong-type bits would corrupt
+// the delta for every client.
 internal enum FieldType
 {
     Unsupported = 0,
     Int32, UInt32, Int64, Bool, Float32, Fixed32, Fixed64,
     QAngle3, Vector3,
     Coord3, Normal3, CoordIntegral3, QuantizedFloat,
+    String, ByteArray,
 }
 
 internal enum CallbackKind
@@ -62,6 +72,8 @@ internal enum CallbackKind
     Float,
     Bool,
     Vector,
+    String,
+    Bytes,
 }
 
 internal static unsafe class FieldSubstitution
@@ -74,24 +86,43 @@ internal static unsafe class FieldSubstitution
         set => Interlocked.Exchange(ref _mode, (int) value);
     }
 
-    // A registration holds an optional uniform spoof value and/or a per-client typed callback.
-    // Key entityIndex: -1 = all entities (global), >= 0 = specific entity. ValueCopyHook probes the
-    // entity-specific entry first, then the global fallback — both lock-free dictionary reads.
+    // A registration holds either a uniform value (one of the Has*/non-null fields) or a per-client typed
+    // callback. Key entityIndex: -1 = all entities (global), >= 0 = a specific entity. ValueCopyHook
+    // probes the entity-specific entry first, then the global fallback — both lock-free dictionary reads.
     private readonly struct SpoofEntry
     {
-        public readonly bool                  HasSpoof;
-        public readonly int                   SpoofValue;
+        public readonly bool    HasIntSpoof;
+        public readonly int     IntSpoof;       // int / uint / bool / fixed / float-bits
+        public readonly bool    HasVectorSpoof;
+        public readonly Vector3 VectorSpoof;
+        public readonly string? StringSpoof;
+        public readonly byte[]? BytesSpoof;
+
         public readonly CallbackKind          CallbackType;
         public readonly PerClientIntProxy?    IntCallback;
         public readonly PerClientFloatProxy?  FloatCallback;
         public readonly PerClientBoolProxy?   BoolCallback;
         public readonly PerClientVectorProxy? VectorCallback;
+        public readonly PerClientStringProxy? StringCallback;
+        public readonly PerClientBytesProxy?  BytesCallback;
 
-        public SpoofEntry(int spoofValue) : this()
+        public SpoofEntry(int value) : this()
         {
-            HasSpoof   = true;
-            SpoofValue = spoofValue;
+            HasIntSpoof = true;
+            IntSpoof    = value;
         }
+
+        public SpoofEntry(Vector3 value) : this()
+        {
+            HasVectorSpoof = true;
+            VectorSpoof    = value;
+        }
+
+        public SpoofEntry(string value) : this()
+            => StringSpoof = value;
+
+        public SpoofEntry(byte[] value) : this()
+            => BytesSpoof = value;
 
         public SpoofEntry(PerClientIntProxy callback) : this()
         {
@@ -117,49 +148,97 @@ internal static unsafe class FieldSubstitution
             VectorCallback = callback;
         }
 
+        public SpoofEntry(PerClientStringProxy callback) : this()
+        {
+            CallbackType   = CallbackKind.String;
+            StringCallback = callback;
+        }
+
+        public SpoofEntry(PerClientBytesProxy callback) : this()
+        {
+            CallbackType  = CallbackKind.Bytes;
+            BytesCallback = callback;
+        }
+
         public bool HasCallback => CallbackType != CallbackKind.None;
+
+        // True when this registration's callback kind can drive the given field family. A mismatch (e.g.
+        // a string callback on an int field) would write wrong-type bits, so the caller passes through.
+        public bool CallbackMatches(FieldType type)
+            => CallbackType switch
+            {
+                CallbackKind.Int    => type is FieldType.Int32 or FieldType.UInt32 or FieldType.Int64 or FieldType.Bool or FieldType.Fixed32 or FieldType.Fixed64,
+                CallbackKind.Float  => type is FieldType.Float32 or FieldType.Coord3 or FieldType.Normal3 or FieldType.CoordIntegral3 or FieldType.QuantizedFloat,
+                CallbackKind.Bool   => type is FieldType.Bool,
+                CallbackKind.Vector => type is FieldType.QAngle3 or FieldType.Vector3 or FieldType.Coord3 or FieldType.Normal3 or FieldType.CoordIntegral3 or FieldType.QuantizedFloat,
+                CallbackKind.String => type is FieldType.String,
+                CallbackKind.Bytes  => type is FieldType.ByteArray,
+                _                   => false,
+            };
     }
 
     private static readonly ConcurrentDictionary<(string ser, string field, int entityIndex), SpoofEntry> _registry = new();
 
-    public static void SetSpoof(string serializerName, string fieldName, int value)
-        => _registry[(serializerName, fieldName, -1)] = new SpoofEntry(value);
+    // -- Registration (called from SendProxyManager on the main thread) ----------------------------
 
-    public static void SetCallback(string serializerName, string fieldName, PerClientIntProxy callback)
-        => _registry[(serializerName, fieldName, -1)] = new SpoofEntry(callback);
+    public static void SetSpoof(string ser, string field, int value)         => _registry[(ser, field, -1)] = new SpoofEntry(value);
+    public static void SetSpoof(string ser, string field, Vector3 value)     => _registry[(ser, field, -1)] = new SpoofEntry(value);
+    public static void SetSpoof(string ser, string field, string value)      => _registry[(ser, field, -1)] = new SpoofEntry(value);
+    public static void SetSpoof(string ser, string field, byte[] value)      => _registry[(ser, field, -1)] = new SpoofEntry(value);
 
-    public static void SetCallback(string serializerName, string fieldName, PerClientFloatProxy callback)
-        => _registry[(serializerName, fieldName, -1)] = new SpoofEntry(callback);
+    public static void SetCallback(string ser, string field, PerClientIntProxy cb)    => _registry[(ser, field, -1)] = new SpoofEntry(cb);
+    public static void SetCallback(string ser, string field, PerClientFloatProxy cb)  => _registry[(ser, field, -1)] = new SpoofEntry(cb);
+    public static void SetCallback(string ser, string field, PerClientBoolProxy cb)   => _registry[(ser, field, -1)] = new SpoofEntry(cb);
+    public static void SetCallback(string ser, string field, PerClientVectorProxy cb) => _registry[(ser, field, -1)] = new SpoofEntry(cb);
+    public static void SetCallback(string ser, string field, PerClientStringProxy cb) => _registry[(ser, field, -1)] = new SpoofEntry(cb);
+    public static void SetCallback(string ser, string field, PerClientBytesProxy cb)  => _registry[(ser, field, -1)] = new SpoofEntry(cb);
 
-    public static void SetCallback(string serializerName, string fieldName, PerClientBoolProxy callback)
-        => _registry[(serializerName, fieldName, -1)] = new SpoofEntry(callback);
+    public static void SetEntitySpoof(int ent, string ser, string field, int value)     => _registry[(ser, field, ent)] = new SpoofEntry(value);
+    public static void SetEntitySpoof(int ent, string ser, string field, Vector3 value) => _registry[(ser, field, ent)] = new SpoofEntry(value);
+    public static void SetEntitySpoof(int ent, string ser, string field, string value)  => _registry[(ser, field, ent)] = new SpoofEntry(value);
+    public static void SetEntitySpoof(int ent, string ser, string field, byte[] value)  => _registry[(ser, field, ent)] = new SpoofEntry(value);
 
-    public static void SetCallback(string serializerName, string fieldName, PerClientVectorProxy callback)
-        => _registry[(serializerName, fieldName, -1)] = new SpoofEntry(callback);
+    public static void SetEntityCallback(int ent, string ser, string field, PerClientIntProxy cb)    => _registry[(ser, field, ent)] = new SpoofEntry(cb);
+    public static void SetEntityCallback(int ent, string ser, string field, PerClientFloatProxy cb)  => _registry[(ser, field, ent)] = new SpoofEntry(cb);
+    public static void SetEntityCallback(int ent, string ser, string field, PerClientBoolProxy cb)   => _registry[(ser, field, ent)] = new SpoofEntry(cb);
+    public static void SetEntityCallback(int ent, string ser, string field, PerClientVectorProxy cb) => _registry[(ser, field, ent)] = new SpoofEntry(cb);
+    public static void SetEntityCallback(int ent, string ser, string field, PerClientStringProxy cb) => _registry[(ser, field, ent)] = new SpoofEntry(cb);
+    public static void SetEntityCallback(int ent, string ser, string field, PerClientBytesProxy cb)  => _registry[(ser, field, ent)] = new SpoofEntry(cb);
 
-    public static void ClearCallback(string serializerName, string fieldName)
-        => _registry.TryRemove((serializerName, fieldName, -1), out _);
+    public static void ClearGlobal(string ser, string field)            => _registry.TryRemove((ser, field, -1), out _);
+    public static void ClearEntity(int ent, string ser, string field)   => _registry.TryRemove((ser, field, ent), out _);
+    public static void ClearAll()                                       => _registry.Clear();
 
-    public static void SetEntitySpoof(int entityIndex, string serializerName, string fieldName, int value)
-        => _registry[(serializerName, fieldName, entityIndex)] = new SpoofEntry(value);
+    // Drop every registration scoped to a specific entity index (called from OnEntityDeleted — indices
+    // are reused after disconnect/round restart, so stale entity-scoped registrations must not persist).
+    public static void ClearEntityIndex(int entityIndex)
+    {
+        if (entityIndex < 0)
+        {
+            return;
+        }
 
-    public static void SetEntityCallback(int entityIndex, string serializerName, string fieldName, PerClientIntProxy callback)
-        => _registry[(serializerName, fieldName, entityIndex)] = new SpoofEntry(callback);
+        foreach (var key in _registry.Keys)
+        {
+            if (key.entityIndex == entityIndex)
+            {
+                _registry.TryRemove(key, out _);
+            }
+        }
+    }
 
-    public static void SetEntityCallback(int entityIndex, string serializerName, string fieldName, PerClientFloatProxy callback)
-        => _registry[(serializerName, fieldName, entityIndex)] = new SpoofEntry(callback);
+    public static bool IsHooked(string ser, string field)
+    {
+        foreach (var key in _registry.Keys)
+        {
+            if (key.ser == ser && key.field == field)
+            {
+                return true;
+            }
+        }
 
-    public static void SetEntityCallback(int entityIndex, string serializerName, string fieldName, PerClientBoolProxy callback)
-        => _registry[(serializerName, fieldName, entityIndex)] = new SpoofEntry(callback);
-
-    public static void SetEntityCallback(int entityIndex, string serializerName, string fieldName, PerClientVectorProxy callback)
-        => _registry[(serializerName, fieldName, entityIndex)] = new SpoofEntry(callback);
-
-    public static void ClearEntityRegistration(int entityIndex, string serializerName, string fieldName)
-        => _registry.TryRemove((serializerName, fieldName, entityIndex), out _);
-
-    public static void ClearAll()
-        => _registry.Clear();
+        return false;
+    }
 
     // CFieldPath* filled by GetBitRange; valid for the BitCopyPrimitive call that follows on this thread.
     [ThreadStatic]
@@ -177,12 +256,9 @@ internal static unsafe class FieldSubstitution
     [ThreadStatic]
     private static nint _currentSnapshotPtr;
 
-    private static int                                          _diagCount;
-    private const  int                                          MaxDiagCount = 25;
+    private static int       _diagCount;
+    private const  int       MaxDiagCount = 25;
     private static readonly ConcurrentDictionary<(string, string), byte> _diagSeen = new();
-
-    private static int       _logCount;
-    private const  int       MaxLogCount = 20;
 
     private static IDetourHook? _getBitRangeHook;
     private static nint         _getBitRangeTrampoline;
@@ -206,16 +282,16 @@ internal static unsafe class FieldSubstitution
     private static nint   _encodeInt32Addr;
 
     // Bucket-index parallel to _bucketAddrs entries (engine encoder-registry bucket numbers).
-    private static readonly int[] BucketIndices = { 1, 2, 3, 4, 7 };
+    private static readonly int[] BucketIndices = { 1, 2, 3, 4, 5, 6, 7 };
 
     // fn pointer -> FieldType, built once at Install from the gamedata-resolved bucket handler bases.
     private static Dictionary<nint, FieldType>? _encoderTypes;
     private static readonly object _encoderTypesLock = new();
 
     /// <summary>
-    ///     Provide the gamedata-resolved encoder identities used for classification:
-    ///     the registry table base, the per-bucket handler array bases (parallel to
-    ///     <see cref="BucketIndices"/>), and the standalone int32 encoder fn (cross-check).
+    ///     Provide the gamedata-resolved encoder identities used for classification: the registry table
+    ///     base, the per-bucket handler array bases (parallel to <see cref="BucketIndices"/>), and the
+    ///     standalone int32 encoder fn (cross-check).
     /// </summary>
     public static void SetEncoderResolution(nint registryAddr, nint[] bucketAddrs, nint encodeInt32Addr)
     {
@@ -237,10 +313,7 @@ internal static unsafe class FieldSubstitution
         {
             lock (_encoderTypesLock)
             {
-                if (_encoderTypes is null)
-                {
-                    _encoderTypes = BuildEncoderTypeMap(logger);
-                }
+                _encoderTypes ??= BuildEncoderTypeMap(logger);
             }
         }
 
@@ -274,9 +347,7 @@ internal static unsafe class FieldSubstitution
             if (!gbrHook.Install())
             {
                 logger.LogWarning("FieldSubstitution: GetBitRange hook Install() failed");
-                _wflShimHook?.Uninstall();
-                _wflShimHook?.Dispose();
-                _wflShimHook = null;
+                DisposeHook(ref _wflShimHook, ref _wflShimTrampoline);
 
                 return false;
             }
@@ -295,12 +366,8 @@ internal static unsafe class FieldSubstitution
             if (!vcHook.Install())
             {
                 logger.LogWarning("FieldSubstitution: value-copy hook Install() failed");
-                _getBitRangeHook?.Uninstall();
-                _getBitRangeHook?.Dispose();
-                _getBitRangeHook = null;
-                _wflShimHook?.Uninstall();
-                _wflShimHook?.Dispose();
-                _wflShimHook = null;
+                DisposeHook(ref _getBitRangeHook, ref _getBitRangeTrampoline);
+                DisposeHook(ref _wflShimHook, ref _wflShimTrampoline);
 
                 return false;
             }
@@ -329,7 +396,6 @@ internal static unsafe class FieldSubstitution
             }
         }
 
-        Interlocked.Exchange(ref _logCount, 0);
         Interlocked.Exchange(ref _diagCount, 0);
         _diagSeen.Clear();
 
@@ -340,28 +406,21 @@ internal static unsafe class FieldSubstitution
     {
         Mode = SubstitutionMode.Off;
 
-        _valueCopyHook?.Uninstall();
-        _valueCopyHook?.Dispose();
-        _valueCopyHook       = null;
-        _valueCopyTrampoline = 0;
-
-        _getBitRangeHook?.Uninstall();
-        _getBitRangeHook?.Dispose();
-        _getBitRangeHook       = null;
-        _getBitRangeTrampoline = 0;
-
-        _wflShimHook?.Uninstall();
-        _wflShimHook?.Dispose();
-        _wflShimHook       = null;
-        _wflShimTrampoline = 0;
-
-        _wdeEntityCaptureHook?.Uninstall();
-        _wdeEntityCaptureHook?.Dispose();
-        _wdeEntityCaptureHook       = null;
-        _wdeEntityCaptureTrampoline = 0;
+        DisposeHook(ref _valueCopyHook, ref _valueCopyTrampoline);
+        DisposeHook(ref _getBitRangeHook, ref _getBitRangeTrampoline);
+        DisposeHook(ref _wflShimHook, ref _wflShimTrampoline);
+        DisposeHook(ref _wdeEntityCaptureHook, ref _wdeEntityCaptureTrampoline);
 
         _logger?.LogInformation("FieldSubstitution: all hooks uninstalled");
         _logger = null;
+    }
+
+    private static void DisposeHook(ref IDetourHook? hook, ref nint trampoline)
+    {
+        hook?.Uninstall();
+        hook?.Dispose();
+        hook       = null;
+        trampoline = 0;
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -389,43 +448,23 @@ internal static unsafe class FieldSubstitution
 
         if (NativeUtil.IsUserPtr(b))
         {
-            try
-            {
-                entityIndex = *(int*) (b + 0x34);
-            }
-            catch
-            {
-                // Leave entityIndex at -1 if the read faults.
-            }
+            entityIndex = *(int*) (b + 0x34);
 
-            try
+            var raw = *(nint*) (b + 0x90);
+            if (NativeUtil.IsUserPtr(raw))
             {
-                var raw = *(nint*) (b + 0x90);
-                if (NativeUtil.IsUserPtr(raw))
-                {
-                    snapshotPtr = raw;
-                }
-            }
-            catch
-            {
-                // Leave snapshotPtr at 0 if the read faults.
+                snapshotPtr = raw;
             }
         }
 
         _currentEntityIndex = entityIndex;
         _currentSnapshotPtr = snapshotPtr;
-        nint result;
 
-        try
-        {
-            result = ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nint, nint, nint>)
-                _wdeEntityCaptureTrampoline)(a, b, c, d, e, f);
-        }
-        finally
-        {
-            _currentEntityIndex = -1;
-            _currentSnapshotPtr = 0;
-        }
+        var result = ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nint, nint, nint>)
+            _wdeEntityCaptureTrampoline)(a, b, c, d, e, f);
+
+        _currentEntityIndex = -1;
+        _currentSnapshotPtr = 0;
 
         return result;
     }
@@ -441,395 +480,314 @@ internal static unsafe class FieldSubstitution
     private static byte ValueCopyHook(nint dst, nint src, uint bitcount)
     {
         var mode = (SubstitutionMode) _mode;
-        if (mode == SubstitutionMode.Off)
+        if (mode == SubstitutionMode.Off || !NativeUtil.IsUserPtr(_currentSerializer))
         {
-            goto Passthrough;
-        }
-
-        var serPtr = _currentSerializer;
-        if (!NativeUtil.IsUserPtr(serPtr))
-        {
-            goto Passthrough;
+            return CallOriginal(dst, src, bitcount);
         }
 
         try
         {
+            var serPtr    = _currentSerializer;
             var serName   = NativeUtil.ReadShortAscii(*(nint*) (serPtr + 0x00), 48);
             var fieldName = ResolveFieldName(serPtr, _currentFieldPath, out var leafRec);
-
-            if (fieldName.Length > 0 && _logger is { } diagLog)
-            {
-                var key = (serName, fieldName);
-                if (_diagSeen.TryAdd(key, 0))
-                {
-                    var n = Interlocked.Increment(ref _diagCount);
-                    if (n <= MaxDiagCount)
-                    {
-                        try
-                        {
-                            var hdr   = _currentFieldPath;
-                            var count = (hdr != 0) ? *(short*) (hdr + 0x18) : (short) 0;
-                            var i0    = (count > 0) ? *(short*) (hdr + 0x00) : (short) -1;
-                            var i1    = (count > 1) ? *(short*) (hdr + 0x02) : (short) -1;
-                            var i2    = (count > 2) ? *(short*) (hdr + 0x04) : (short) -1;
-                            diagLog.LogInformation(
-                                "WFLD#{N} ser=\"{Ser}\" count={Count} idx=[{I0},{I1},{I2}] name=\"{Name}\"",
-                                n, serName, count, i0, i1, i2, fieldName);
-                        }
-                        catch
-                        {
-                            // Diagnostics only — never let logging faults escape the hook.
-                        }
-                    }
-                }
-            }
-
             if (fieldName.Length == 0)
             {
-                goto Passthrough;
+                return CallOriginal(dst, src, bitcount);
             }
+
+            LogDiscoveredField(serName, fieldName);
 
             var client      = RecipientCapture.CurrentClient;
             var entityIndex = _currentEntityIndex;
 
-            SpoofEntry reg;
-            bool       hasReg;
-            if (entityIndex >= 0 && _registry.TryGetValue((serName, fieldName, entityIndex), out reg))
+            if (!TryGetRegistration(serName, fieldName, entityIndex, out var reg))
             {
-                hasReg = true;
-            }
-            else if (_registry.TryGetValue((serName, fieldName, -1), out reg))
-            {
-                hasReg = true;
-            }
-            else
-            {
-                hasReg = false;
-            }
-
-            if (!hasReg)
-            {
-                goto Passthrough;
+                return CallOriginal(dst, src, bitcount);
             }
 
             var fieldType = Classify(leafRec);
-            var ln        = Interlocked.Increment(ref _logCount);
+            if (fieldType == FieldType.Unsupported)
+            {
+                return CallOriginal(dst, src, bitcount);
+            }
 
-            if (ln <= MaxLogCount && _logger is { } diagSubstLog)
+            // Resolve the substitute value (uniform seed, then optional per-client callback). The callback
+            // is the one genuine managed throw-site on this path; a throw is logged and passed through.
+            var     intBits        = reg.HasIntSpoof ? reg.IntSpoof : 0;
+            var     vec            = reg.HasVectorSpoof ? reg.VectorSpoof : default;
+            string? str            = reg.StringSpoof;
+            var     bytes          = reg.BytesSpoof;
+            bool    substitute;
+
+            if (!reg.HasCallback)
+            {
+                substitute = true;
+            }
+            else if (!reg.CallbackMatches(fieldType))
+            {
+                // A callback registered for the wrong family would write garbage — pass through.
+                return CallOriginal(dst, src, bitcount);
+            }
+            else
             {
                 try
                 {
-                    var regEntIdx = _registry.TryGetValue((serName, fieldName, entityIndex), out _) && entityIndex >= 0
-                        ? entityIndex
-                        : -1;
-                    diagSubstLog.LogInformation(
-                        "SUBST ent={CurEnt} ser=\"{Ser}\" field=\"{Field}\" client=0x{Client:X} target={RegEnt}",
-                        entityIndex, serName, fieldName, client, regEntIdx);
+                    substitute = InvokeCallback(reg, client, entityIndex, ref intBits, ref vec, ref str, ref bytes);
                 }
-                catch
+                catch (Exception ex)
                 {
-                    // Diagnostics only.
+                    _logger?.LogWarning(ex, "SendProxy: per-client callback threw for \"{Ser}::{Field}\" — passing through", serName, fieldName);
+
+                    return CallOriginal(dst, src, bitcount);
                 }
+            }
+
+            if (!substitute)
+            {
+                return CallOriginal(dst, src, bitcount);
             }
 
             if (mode == SubstitutionMode.Verify)
             {
-                var cursorBefore = (dst != 0) ? *(int*) (dst + 0x10) : -1;
-                var result       = CallOriginal(dst, src, bitcount);
-                var cursorAfter  = (dst != 0) ? *(int*) (dst + 0x10) : -1;
-
-                if (ln <= MaxLogCount && _logger is { } log)
-                {
-                    log.LogInformation(
-                        "SUBST-VERIFY field=\"{Ser}::{Field}\" type={Type} client=0x{Client:X} ent={Ent} bitcount={Bits} "
-                        + "cursorBefore={Before} cursorAfter={After} (fake would be {Fake})",
-                        serName, fieldName, fieldType, client, entityIndex, bitcount, cursorBefore, cursorAfter, reg.SpoofValue);
-                }
-
-                return result;
+                return VerifyOnly(dst, src, bitcount, serName, fieldName, fieldType, client, entityIndex);
             }
 
-            bool shouldSubstitute;
-            var  effectiveFake = reg.HasSpoof ? reg.SpoofValue : 0;
-            var  vx = 0f;
-            var  vy = 0f;
-            var  vz = 0f;
-
-            if (!reg.HasCallback)
-            {
-                shouldSubstitute = true;
-            }
-            else
-            {
-                try
-                {
-                    switch (reg.CallbackType)
-                    {
-                        case CallbackKind.Int:
-                            shouldSubstitute = reg.IntCallback!(client, entityIndex, ref effectiveFake);
-                            break;
-
-                        case CallbackKind.Float:
-                            var fval = 0f;
-                            shouldSubstitute = reg.FloatCallback!(client, entityIndex, ref fval);
-                            effectiveFake    = BitConverter.SingleToInt32Bits(fval);
-                            break;
-
-                        case CallbackKind.Bool:
-                            var bval = false;
-                            shouldSubstitute = reg.BoolCallback!(client, entityIndex, ref bval);
-                            effectiveFake    = bval ? 1 : 0;
-                            break;
-
-                        case CallbackKind.Vector:
-                            shouldSubstitute = reg.VectorCallback!(client, entityIndex, ref vx, ref vy, ref vz);
-                            break;
-
-                        default:
-                            shouldSubstitute = false;
-                            break;
-                    }
-                }
-                catch (Exception ex)
-                {
-                    if (ln <= MaxLogCount && _logger is { } errLog)
-                    {
-                        try
-                        {
-                            errLog.LogWarning(ex,
-                                "SUBST-FAKE per-client callback threw for \"{Ser}::{Field}\" "
-                                + "client=0x{Client:X} ent={Ent} — passing through original",
-                                serName, fieldName, client, entityIndex);
-                        }
-                        catch
-                        {
-                            // Diagnostics only.
-                        }
-                    }
-
-                    return CallOriginal(dst, src, bitcount);
-                }
-            }
-
-            if (!shouldSubstitute)
-            {
-                return CallOriginal(dst, src, bitcount);
-            }
-
-            // Default-safe: only substitute encoder families we can re-emit; anything else passes through.
-            if (fieldType == FieldType.Unsupported)
-            {
-                if (ln <= MaxLogCount && _logger is { } skipLog)
-                {
-                    skipLog.LogWarning(
-                        "SUBST-FAKE field=\"{Ser}::{Field}\" classified Unsupported — passing through "
-                        + "(registered but not a substitutable type)", serName, fieldName);
-                }
-
-                return CallOriginal(dst, src, bitcount);
-            }
-
-            var isLiveStructType =
-                fieldType == FieldType.Coord3
-                || fieldType == FieldType.Normal3
-                || fieldType == FieldType.CoordIntegral3
-                || fieldType == FieldType.QuantizedFloat;
-
-            if (isLiveStructType)
-            {
-                var hasCompatibleCallback =
-                    !reg.HasCallback
-                    || reg.CallbackType == CallbackKind.Vector
-                    || reg.CallbackType == CallbackKind.Float;
-
-                if (!hasCompatibleCallback)
-                {
-                    if (ln <= MaxLogCount && _logger is { } cbWarnLog)
-                    {
-                        cbWarnLog.LogWarning(
-                            "SUBST-FAKE field=\"{Ser}::{Field}\" live-struct type={Type} "
-                            + "but callback={CbKind} is not Vector/Float — passing through",
-                            serName, fieldName, fieldType, reg.CallbackType);
-                    }
-
-                    return CallOriginal(dst, src, bitcount);
-                }
-
-                if (!TryGetLiveValuePtr(leafRec, out var liveValuePtr))
-                {
-                    if (ln <= MaxLogCount && _logger is { } noVpLog)
-                    {
-                        noVpLog.LogWarning(
-                            "SUBST-FAKE field=\"{Ser}::{Field}\" live-struct type={Type} "
-                            + "— live valuePtr unavailable (WriteDeltaEntity hook absent or snapshot invalid) "
-                            + "— passing through", serName, fieldName, fieldType);
-                    }
-
-                    return CallOriginal(dst, src, bitcount);
-                }
-
-                var liveScratch = stackalloc byte[LiveScratchSize];
-
-                for (var bi = 0; bi < LiveScratchSize; bi++)
-                {
-                    liveScratch[bi] = 0;
-                }
-
-                for (var bi = 0; bi < LiveScratchSize; bi++)
-                {
-                    liveScratch[bi] = *(byte*) (liveValuePtr + bi);
-                }
-
-                // Patch only the float component(s) the callback drove; preserve [+0x28] count and flags.
-                switch (reg.CallbackType)
-                {
-                    case CallbackKind.Vector:
-                        ((float*) liveScratch)[0] = vx;
-                        ((float*) liveScratch)[1] = vy;
-                        ((float*) liveScratch)[2] = vz;
-                        break;
-
-                    case CallbackKind.Float:
-                        ((float*) liveScratch)[0] = BitConverter.Int32BitsToSingle(effectiveFake);
-                        break;
-
-                    default:
-                        ((float*) liveScratch)[0] = BitConverter.Int32BitsToSingle(effectiveFake);
-                        break;
-                }
-
-                var liveFi        = *(nint*) (leafRec + 0x00);
-                var liveDispatch  = *(nint*) (liveFi + 0x38);
-                var liveEncFn     = NativeUtil.IsUserPtr(liveDispatch) ? *(nint*) liveDispatch : 0;
-                var liveParamOff  = *(byte*) (liveFi + 0xC9);
-                var liveParamsPtr = (liveParamOff == 0xFF) ? 0 : (*(nint*) (liveFi + 0x40) + liveParamOff);
-
-                if (!NativeUtil.IsUserPtr(liveEncFn))
-                {
-                    goto Passthrough;
-                }
-
-                var liveSavedCursor = *(int*) (dst + 0x10);
-                var liveOrigResult  = CallOriginal(dst, src, bitcount);
-                var liveAfterCursor = *(int*) (dst + 0x10);
-                *(int*) (dst + 0x10) = liveSavedCursor;
-
-                try
-                {
-                    ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, uint, void>)
-                        liveEncFn)(dst, liveFi, liveParamsPtr, (nint) liveScratch, 0u);
-                }
-                catch
-                {
-                    *(int*) (dst + 0x10) = liveAfterCursor;
-
-                    return liveOrigResult;
-                }
-
-                if (ln <= MaxLogCount && _logger is { } liveLog)
-                {
-                    liveLog.LogInformation(
-                        "SUBST-FAKE(live) field=\"{Ser}::{Field}\" type={Type} "
-                        + "client=0x{Client:X} ent={Ent} bitcount={Bits} savedCursor={Saved} "
-                        + "vx={Vx} vy={Vy} vz={Vz}",
-                        serName, fieldName, fieldType, client, entityIndex, bitcount,
-                        liveSavedCursor, vx, vy, vz);
-                }
-
-                return liveOrigResult;
-            }
-
-            // Scalar / synthesized-vector path: save cursor, call original, rewind, re-emit via the
-            // field's own engine encoder (dispatch slot 0 at fieldInfo+0x38) with a synthesized scratch.
-            var savedCursor    = *(int*) (dst + 0x10);
-            var originalResult = CallOriginal(dst, src, bitcount);
-            var afterOriginal  = *(int*) (dst + 0x10);
-
-            *(int*) (dst + 0x10) = savedCursor;
-
+            // Resolve the field's own engine encoder (dispatch slot 0 at fieldInfo+0x38) and its params.
             var fieldInfo = *(nint*) (leafRec + 0x00);
             var dispatch  = *(nint*) (fieldInfo + 0x38);
             var encoderFn = NativeUtil.IsUserPtr(dispatch) ? *(nint*) dispatch : 0;
+            if (!NativeUtil.IsUserPtr(encoderFn))
+            {
+                return CallOriginal(dst, src, bitcount);
+            }
+
             var paramOff  = *(byte*) (fieldInfo + 0xC9);
             var paramsPtr = (paramOff == 0xFF) ? 0 : (*(nint*) (fieldInfo + 0x40) + paramOff);
 
-            if (!NativeUtil.IsUserPtr(encoderFn))
-            {
-                *(int*) (dst + 0x10) = afterOriginal;
+            // Build the substitute value pointer in the layout this encoder expects. All allocation /
+            // managed work happens here, BEFORE the native save/rewind/emit below — so that sequence is
+            // pure native and cannot throw a managed exception mid-rewrite.
+            nint valuePtr;
+            var  scratch     = stackalloc byte[LiveScratchSize];
+            var  stringSlot  = stackalloc nint[1];
 
-                return originalResult;
-            }
-
-            var scratch = stackalloc byte[16];
             switch (fieldType)
             {
-                case FieldType.Int32:
-                case FieldType.Int64:
-                case FieldType.Fixed32:
-                case FieldType.Fixed64:
-                    *(long*) scratch = effectiveFake;
-                    break;
+                case FieldType.String:
+                {
+                    var s       = str ?? string.Empty;
+                    var byteLen = Encoding.UTF8.GetByteCount(s);
 
-                case FieldType.UInt32:
-                    *(ulong*) scratch = (uint) effectiveFake;
-                    break;
+                    // The scratch lives on the engine send worker thread's stack; cap it so a caller can't
+                    // overflow that stack with an oversized value. Oversized -> pass the real value through.
+                    if (byteLen > MaxSubstituteBytes)
+                    {
+                        return CallOriginal(dst, src, bitcount);
+                    }
 
-                case FieldType.Bool:
-                    *scratch = (byte) (effectiveFake != 0 ? 1 : 0);
+                    var strBuf = stackalloc byte[byteLen + 1];
+                    Encoding.UTF8.GetBytes(s, new Span<byte>(strBuf, byteLen));
+                    strBuf[byteLen] = 0;
+                    *stringSlot     = (nint) strBuf;        // encoder reads *valuePtr as char*
+                    valuePtr        = (nint) stringSlot;
                     break;
+                }
 
-                case FieldType.Float32:
-                    *(double*) scratch = BitConverter.Int32BitsToSingle(effectiveFake);
+                case FieldType.ByteArray:
+                {
+                    var b = bytes ?? Array.Empty<byte>();
+                    if (b.Length > MaxSubstituteBytes)
+                    {
+                        return CallOriginal(dst, src, bitcount);
+                    }
+
+                    var buf = stackalloc byte[b.Length];
+                    for (var i = 0; i < b.Length; i++)
+                    {
+                        buf[i] = b[i];
+                    }
+
+                    // Encoder reads {+0x00 data*, +0x28 uint count}; LiveScratchSize (0x30) covers it.
+                    for (var i = 0; i < LiveScratchSize; i++)
+                    {
+                        scratch[i] = 0;
+                    }
+
+                    *(nint*) (scratch + 0x00)  = (nint) buf;
+                    *(uint*) (scratch + 0x28)  = (uint) b.Length;
+                    valuePtr                   = (nint) scratch;
                     break;
+                }
+
+                case FieldType.Coord3:
+                case FieldType.Normal3:
+                case FieldType.CoordIntegral3:
+                case FieldType.QuantizedFloat:
+                {
+                    // The quant encoder must see the real live struct; copy it, then patch the float(s).
+                    if (!TryGetLiveValuePtr(leafRec, out var liveValuePtr))
+                    {
+                        return CallOriginal(dst, src, bitcount);
+                    }
+
+                    for (var i = 0; i < LiveScratchSize; i++)
+                    {
+                        scratch[i] = *(byte*) (liveValuePtr + i);
+                    }
+
+                    if (reg.CallbackType == CallbackKind.Vector || reg.HasVectorSpoof)
+                    {
+                        ((float*) scratch)[0] = vec.X;
+                        ((float*) scratch)[1] = vec.Y;
+                        ((float*) scratch)[2] = vec.Z;
+                    }
+                    else
+                    {
+                        ((float*) scratch)[0] = BitConverter.Int32BitsToSingle(intBits);
+                    }
+
+                    valuePtr = (nint) scratch;
+                    break;
+                }
 
                 case FieldType.QAngle3:
                 case FieldType.Vector3:
-                    ((float*) scratch)[0] = vx;
-                    ((float*) scratch)[1] = vy;
-                    ((float*) scratch)[2] = vz;
+                    ((float*) scratch)[0] = vec.X;
+                    ((float*) scratch)[1] = vec.Y;
+                    ((float*) scratch)[2] = vec.Z;
+                    valuePtr = (nint) scratch;
                     break;
 
-                default:
-                    *(int*) (dst + 0x10) = afterOriginal;
+                case FieldType.Float32:
+                    *(double*) scratch = BitConverter.Int32BitsToSingle(intBits);
+                    valuePtr           = (nint) scratch;
+                    break;
 
-                    return originalResult;
+                case FieldType.UInt32:
+                    *(ulong*) scratch = (uint) intBits;
+                    valuePtr          = (nint) scratch;
+                    break;
+
+                case FieldType.Bool:
+                    *scratch = (byte) (intBits != 0 ? 1 : 0);
+                    valuePtr = (nint) scratch;
+                    break;
+
+                default: // Int32 / Int64 / Fixed32 / Fixed64
+                    *(long*) scratch = intBits;
+                    valuePtr         = (nint) scratch;
+                    break;
             }
 
-            try
-            {
-                ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, uint, void>)
-                    encoderFn)(dst, fieldInfo, paramsPtr, (nint) scratch, 0u);
-            }
-            catch
-            {
-                *(int*) (dst + 0x10) = afterOriginal;
+            // Native save / rewind / emit — no managed throw-site between these calls.
+            var savedCursor = *(int*) (dst + 0x10);
+            var result      = CallOriginal(dst, src, bitcount);
+            *(int*) (dst + 0x10) = savedCursor;
 
-                return originalResult;
-            }
+            ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, uint, void>)
+                encoderFn)(dst, fieldInfo, paramsPtr, valuePtr, 0u);
 
-            if (ln <= MaxLogCount && _logger is { } fakeLog)
-            {
-                fakeLog.LogInformation(
-                    "SUBST-FAKE field=\"{Ser}::{Field}\" type={Type} client=0x{Client:X} ent={Ent} bitcount={Bits} "
-                    + "savedCursor={Saved} effectiveFake={Fake}",
-                    serName, fieldName, fieldType, client, entityIndex, bitcount, savedCursor, effectiveFake);
-            }
-
-            return originalResult;
+            return result;
         }
         catch
         {
-            // Never throw out of an unmanaged callback.
+            // Unmanaged-callback boundary: never let a managed exception escape into engine code. Reached
+            // only for failures BEFORE the native emit sequence above, so a plain passthrough is correct.
+            return CallOriginal(dst, src, bitcount);
+        }
+    }
+
+    private static bool TryGetRegistration(string serName, string fieldName, int entityIndex, out SpoofEntry reg)
+    {
+        if (entityIndex >= 0 && _registry.TryGetValue((serName, fieldName, entityIndex), out reg))
+        {
+            return true;
         }
 
-        Passthrough:
-        return CallOriginal(dst, src, bitcount);
+        return _registry.TryGetValue((serName, fieldName, -1), out reg);
+    }
+
+    private static bool InvokeCallback(
+        in SpoofEntry reg, nint client, int entityIndex,
+        ref int intBits, ref Vector3 vec, ref string? str, ref byte[]? bytes)
+    {
+        switch (reg.CallbackType)
+        {
+            case CallbackKind.Int:
+                return reg.IntCallback!(client, entityIndex, ref intBits);
+
+            case CallbackKind.Float:
+                var f = BitConverter.Int32BitsToSingle(intBits);
+                var rf = reg.FloatCallback!(client, entityIndex, ref f);
+                intBits = BitConverter.SingleToInt32Bits(f);
+
+                return rf;
+
+            case CallbackKind.Bool:
+                var b = intBits != 0;
+                var rb = reg.BoolCallback!(client, entityIndex, ref b);
+                intBits = b ? 1 : 0;
+
+                return rb;
+
+            case CallbackKind.Vector:
+                return reg.VectorCallback!(client, entityIndex, ref vec);
+
+            case CallbackKind.String:
+                var s = str ?? string.Empty;
+                var rs = reg.StringCallback!(client, entityIndex, ref s);
+                str = s;
+
+                return rs;
+
+            case CallbackKind.Bytes:
+                var by = bytes ?? Array.Empty<byte>();
+                var rby = reg.BytesCallback!(client, entityIndex, ref by);
+                bytes = by;
+
+                return rby;
+
+            default:
+                return false;
+        }
+    }
+
+    private static byte VerifyOnly(
+        nint dst, nint src, uint bitcount,
+        string serName, string fieldName, FieldType fieldType, nint client, int entityIndex)
+    {
+        var cursorBefore = (dst != 0) ? *(int*) (dst + 0x10) : -1;
+        var result       = CallOriginal(dst, src, bitcount);
+        var cursorAfter  = (dst != 0) ? *(int*) (dst + 0x10) : -1;
+
+        _logger?.LogInformation(
+            "SUBST-VERIFY field=\"{Ser}::{Field}\" type={Type} client=0x{Client:X} ent={Ent} "
+            + "bitcount={Bits} cursorBefore={Before} cursorAfter={After}",
+            serName, fieldName, fieldType, client, entityIndex, bitcount, cursorBefore, cursorAfter);
+
+        return result;
+    }
+
+    private static void LogDiscoveredField(string serName, string fieldName)
+    {
+        if (_logger is not { } log || _diagCount >= MaxDiagCount || !_diagSeen.TryAdd((serName, fieldName), 0))
+        {
+            return;
+        }
+
+        if (Interlocked.Increment(ref _diagCount) <= MaxDiagCount)
+        {
+            log.LogInformation("SendProxy field seen: \"{Ser}::{Field}\"", serName, fieldName);
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static byte CallOriginal(nint dst, nint src, uint bitcount)
         => ((delegate* unmanaged[Cdecl]<nint, nint, uint, byte>) _valueCopyTrampoline)(dst, src, bitcount);
 
+    // Walk the CFieldPath (filled by GetBitRange) through the flattened-serializer field array to the leaf
+    // record + its field name. Every dereference is IsUserPtr-guarded; a guard failure returns empty (the
+    // caller passes through). RE layout: docs/REVERSE_ENGINEERING.md §9b.
     private static string ResolveFieldName(nint serializer, nint hdr, out nint leafRec)
     {
         leafRec = 0;
@@ -838,129 +796,114 @@ internal static unsafe class FieldSubstitution
             return string.Empty;
         }
 
-        try
+        var count = *(short*) (hdr + 0x18);
+        if (count <= 0 || count > 7)
         {
-            var count = *(short*) (hdr + 0x18);
-            if (count <= 0 || count > 7)
-            {
-                return string.Empty;
-            }
-
-            nint idxArr;
-            if (*(byte*) (hdr + 0x1A) != 0)
-            {
-                idxArr = *(nint*) hdr;
-                if (!NativeUtil.IsUserPtr(idxArr))
-                {
-                    return string.Empty;
-                }
-            }
-            else
-            {
-                idxArr = hdr;
-            }
-
-            var idx0 = *(short*) (idxArr + 0 * 2);
-            if (idx0 == 0x7FFF)
-            {
-                return string.Empty;
-            }
-
-            var arr0 = *(nint*) (serializer + 0x30);
-            if (!NativeUtil.IsUserPtr(arr0))
-            {
-                return string.Empty;
-            }
-
-            var rec = arr0 + idx0 * 0x2E;
-
-            for (var k = 1; k < count; k++)
-            {
-                var idxK = *(short*) (idxArr + k * 2);
-                if (idxK == 0x7FFF)
-                {
-                    break;
-                }
-
-                var child = *(nint*) (rec + 0x08);
-                if (!NativeUtil.IsUserPtr(child))
-                {
-                    return string.Empty;
-                }
-
-                var arrK = *(nint*) (child + 0x30);
-                if (!NativeUtil.IsUserPtr(arrK))
-                {
-                    return string.Empty;
-                }
-
-                rec = arrK + idxK * 0x2E;
-            }
-
-            var pInfo = *(nint*) (rec + 0x00);
-            if (!NativeUtil.IsUserPtr(pInfo))
-            {
-                return string.Empty;
-            }
-
-            leafRec = rec;
-
-            return NativeUtil.ReadShortAscii(*(nint*) (pInfo + 0x08), 48);
-        }
-        catch
-        {
-            leafRec = 0;
-
             return string.Empty;
         }
+
+        nint idxArr;
+        if (*(byte*) (hdr + 0x1A) != 0)
+        {
+            idxArr = *(nint*) hdr;
+            if (!NativeUtil.IsUserPtr(idxArr))
+            {
+                return string.Empty;
+            }
+        }
+        else
+        {
+            idxArr = hdr;
+        }
+
+        var idx0 = *(short*) idxArr;
+        if (idx0 == 0x7FFF)
+        {
+            return string.Empty;
+        }
+
+        var arr0 = *(nint*) (serializer + 0x30);
+        if (!NativeUtil.IsUserPtr(arr0))
+        {
+            return string.Empty;
+        }
+
+        var rec = arr0 + idx0 * 0x2E;
+
+        for (var k = 1; k < count; k++)
+        {
+            var idxK = *(short*) (idxArr + k * 2);
+            if (idxK == 0x7FFF)
+            {
+                break;
+            }
+
+            var child = *(nint*) (rec + 0x08);
+            if (!NativeUtil.IsUserPtr(child))
+            {
+                return string.Empty;
+            }
+
+            var arrK = *(nint*) (child + 0x30);
+            if (!NativeUtil.IsUserPtr(arrK))
+            {
+                return string.Empty;
+            }
+
+            rec = arrK + idxK * 0x2E;
+        }
+
+        var pInfo = *(nint*) (rec + 0x00);
+        if (!NativeUtil.IsUserPtr(pInfo))
+        {
+            return string.Empty;
+        }
+
+        leafRec = rec;
+
+        return NativeUtil.ReadShortAscii(*(nint*) (pInfo + 0x08), 48);
     }
 
-    // Classify the field's encoder family by comparing its live dispatch fn (slot 0 of the dispatch
-    // object at fieldInfo+0x38) against the gamedata-resolved encoder map. Any fault or unknown fn
-    // yields Unsupported, so the caller passes through and never corrupts bits.
+    // Classify the field's encoder family by its live dispatch fn (slot 0 of the dispatch object at
+    // fieldInfo+0x38) against the gamedata-resolved encoder map. An unknown fn yields Unsupported, so the
+    // caller passes through and never corrupts bits. IsUserPtr-guarded, no try/catch.
     private static FieldType Classify(nint leafRec)
     {
-        if (!NativeUtil.IsUserPtr(leafRec))
-        {
-            return FieldType.Unsupported;
-        }
-
         var map = _encoderTypes;
-        if (map is null)
+        if (map is null || !NativeUtil.IsUserPtr(leafRec))
         {
             return FieldType.Unsupported;
         }
 
-        try
-        {
-            var fieldInfo = *(nint*) (leafRec + 0x00);
-            if (!NativeUtil.IsUserPtr(fieldInfo))
-            {
-                return FieldType.Unsupported;
-            }
-
-            var handler = *(nint*) (fieldInfo + 0x38);
-            if (!NativeUtil.IsUserPtr(handler))
-            {
-                return FieldType.Unsupported;
-            }
-
-            var encoderFn = *(nint*) (handler + 0x30);
-            if (!NativeUtil.IsUserPtr(encoderFn))
-            {
-                return FieldType.Unsupported;
-            }
-
-            return map.TryGetValue(encoderFn, out var t) ? t : FieldType.Unsupported;
-        }
-        catch
+        var fieldInfo = *(nint*) (leafRec + 0x00);
+        if (!NativeUtil.IsUserPtr(fieldInfo))
         {
             return FieldType.Unsupported;
         }
+
+        var handler = *(nint*) (fieldInfo + 0x38);
+        if (!NativeUtil.IsUserPtr(handler))
+        {
+            return FieldType.Unsupported;
+        }
+
+        var encoderFn = *(nint*) (handler + 0x30);
+        if (!NativeUtil.IsUserPtr(encoderFn))
+        {
+            return FieldType.Unsupported;
+        }
+
+        return map.TryGetValue(encoderFn, out var t) ? t : FieldType.Unsupported;
     }
 
-    // Largest quantized value struct layout observed in RE fits in 0x30 bytes.
+    // Largest value struct layout the substitute path builds (quant struct ~0x30; byte-array struct needs
+    // the count slot at +0x28) fits in 0x30 bytes.
     private const int LiveScratchSize = 0x30;
+
+    // Upper bound (bytes) for a string / byte-array substitute. The substitute buffer is stackalloc'd on
+    // the engine send worker thread, so a caller-controlled size must be bounded; oversized values pass
+    // the real value through. 4 KiB comfortably covers names and typical small arrays.
+    private const int MaxSubstituteBytes = 4096;
 
     // Data-region array at snapshotPtr+0x30 holds at most 15 entries (EncodeField stack buffer width).
     private const int MaxRegionId = 14;
@@ -968,7 +911,7 @@ internal static unsafe class FieldSubstitution
     // Reconstruct the live entity valuePtr for a quantized-float field from the captured snapshot:
     //   valuePtr = *(nint*)(snapshotPtr + 0x30 + regionId*8) + *(ushort*)(fieldInfo + 0x20)
     //   regionId = *(byte*)(leafRec + 0x2C)
-    // RE evidence: docs/REVERSE_ENGINEERING.md §15. IsUserPtr-gated; returns false on any failure.
+    // IsUserPtr-guarded; returns false on any guard failure.
     private static bool TryGetLiveValuePtr(nint leafRec, out nint valuePtr)
     {
         valuePtr = 0;
@@ -979,63 +922,49 @@ internal static unsafe class FieldSubstitution
             return false;
         }
 
-        try
-        {
-            var fieldInfo = *(nint*) (leafRec + 0x00);
-            if (!NativeUtil.IsUserPtr(fieldInfo))
-            {
-                return false;
-            }
-
-            var regionId = (uint) *(byte*) (leafRec + 0x2C);
-            if (regionId > MaxRegionId)
-            {
-                return false;
-            }
-
-            var fieldOffset    = (uint) *(ushort*) (fieldInfo + 0x20);
-            var regionArrayPtr = snapshotPtr + 0x30 + (nint) (regionId * 8);
-            if (!NativeUtil.IsUserPtr(regionArrayPtr))
-            {
-                return false;
-            }
-
-            var dataRegionBase = *(nint*) regionArrayPtr;
-            if (!NativeUtil.IsUserPtr(dataRegionBase))
-            {
-                return false;
-            }
-
-            var candidate = dataRegionBase + (nint) fieldOffset;
-            if (!NativeUtil.IsUserPtr(candidate))
-            {
-                return false;
-            }
-
-            valuePtr = candidate;
-
-            return true;
-        }
-        catch
+        var fieldInfo = *(nint*) (leafRec + 0x00);
+        if (!NativeUtil.IsUserPtr(fieldInfo))
         {
             return false;
         }
+
+        var regionId = (uint) *(byte*) (leafRec + 0x2C);
+        if (regionId > MaxRegionId)
+        {
+            return false;
+        }
+
+        var fieldOffset    = (uint) *(ushort*) (fieldInfo + 0x20);
+        var regionArrayPtr = snapshotPtr + 0x30 + (nint) (regionId * 8);
+        var dataRegionBase = *(nint*) regionArrayPtr;
+        if (!NativeUtil.IsUserPtr(dataRegionBase))
+        {
+            return false;
+        }
+
+        var candidate = dataRegionBase + (nint) fieldOffset;
+        if (!NativeUtil.IsUserPtr(candidate))
+        {
+            return false;
+        }
+
+        valuePtr = candidate;
+
+        return true;
     }
 
-    // Build the fn-pointer -> FieldType map once at Install, anchored on the gamedata-resolved bucket
-    // handler bases (no in-C# RegistryAddr + b*16 stride assumption for the handlers). Each bucket's
-    // encoder entries (stride 0x80) carry the encoder-name at +0x00 and the fn at +0x30; the (bucket,
-    // name) pair determines the FieldType, exactly as the engine's own InitFakeField wiring does. The
-    // bucket-1 default fn is cross-checked against the standalone EncodeInt32 sig (a warning logs on
-    // mismatch). These reads happen once here, not on the per-field hot path (Classify is a dict lookup).
-    // Returns a non-null (possibly empty) map; an empty map => all fields Unsupported (safe passthrough).
+    // Build the fn-pointer -> FieldType map once at Install from the gamedata-resolved bucket handler
+    // bases. Each bucket's encoder entries (stride 0x80) carry the encoder-name at +0x00 and the fn at
+    // +0x30; the (bucket, name) pair determines the FieldType, exactly as the engine's wiring does. These
+    // reads happen once here, off the hot path (Classify is then a dictionary lookup). The single
+    // install-time try guards the whole enumeration; a fault yields a partial/empty map (safe passthrough).
     private static Dictionary<nint, FieldType> BuildEncoderTypeMap(ILogger logger)
     {
         var map = new Dictionary<nint, FieldType>();
 
         if (_bucketAddrs.Length == 0)
         {
-            logger.LogWarning("FieldSubstitution: no encoder bucket bases resolved — encoder map will be empty (all fields Unsupported)");
+            logger.LogWarning("FieldSubstitution: no encoder bucket bases resolved — encoder map empty (all fields Unsupported)");
 
             return map;
         }
@@ -1060,45 +989,28 @@ internal static unsafe class FieldSubstitution
                 for (var e = 0; e < count; e++)
                 {
                     var entry = handler + e * 0x80;
-
-                    nint namePtr;
-                    nint fn;
-                    try
-                    {
-                        namePtr = *(nint*) (entry + 0x00);
-                        fn      = *(nint*) (entry + 0x30);
-                    }
-                    catch
-                    {
-                        continue;
-                    }
-
+                    var fn    = *(nint*) (entry + 0x30);
                     if (!NativeUtil.IsUserPtr(fn))
                     {
                         continue;
                     }
 
-                    var name = NativeUtil.ReadShortAscii(namePtr, 32);
+                    var name = NativeUtil.ReadShortAscii(*(nint*) (entry + 0x00), 32);
                     var type = ClassifyEntry(bucket, name);
                     if (type == FieldType.Unsupported)
                     {
                         continue;
                     }
 
-                    if (type == FieldType.Int32
-                        && NativeUtil.IsUserPtr(_encodeInt32Addr)
-                        && fn != _encodeInt32Addr)
+                    if (type == FieldType.Int32 && NativeUtil.IsUserPtr(_encodeInt32Addr) && fn != _encodeInt32Addr)
                     {
                         logger.LogWarning(
-                            "FieldSubstitution: bucket-1 default fn=0x{Fn:X} does not match the gamedata "
-                            + "EncodeInt32 sig (0x{Sig:X}) — int32 classification may be stale for this build",
+                            "FieldSubstitution: bucket-1 default fn=0x{Fn:X} != gamedata EncodeInt32 (0x{Sig:X}) — classification may be stale",
                             fn, _encodeInt32Addr);
                     }
 
                     map[fn] = type;
-                    logger.LogInformation(
-                        "FieldSubstitution encoder: bucket={B} name=\"{Name}\" fn=0x{Fn:X} -> {Type}",
-                        bucket, name, fn, type);
+                    logger.LogInformation("FieldSubstitution encoder: bucket={B} name=\"{Name}\" fn=0x{Fn:X} -> {Type}", bucket, name, fn, type);
                 }
             }
 
@@ -1112,109 +1024,31 @@ internal static unsafe class FieldSubstitution
         return map;
     }
 
-    // Entry count for a bucket = *(int*)(RegistryAddr + bucket*16 + 0x08). The registry base is gamedata-
-    // resolved; we read only the numeric count here. Falls back to a bounded default when unavailable.
     private static int ReadBucketCount(int bucket)
-    {
-        if (!NativeUtil.IsUserPtr(_registryAddr))
-        {
-            return 8;
-        }
-
-        try
-        {
-            return *(int*) (_registryAddr + bucket * 16 + 0x08);
-        }
-        catch
-        {
-            return 0;
-        }
-    }
+        => NativeUtil.IsUserPtr(_registryAddr) ? *(int*) (_registryAddr + bucket * 16 + 0x08) : 0;
 
     // Map (bucket, encoder-name) -> FieldType, matching the engine's encoder-registry semantics.
     private static FieldType ClassifyEntry(int bucket, string name)
-    {
-        switch (bucket)
+        => bucket switch
         {
-            case 1:
-                if (name == "default")
-                {
-                    return FieldType.Int32;
-                }
-
-                if (name == "fixed32")
-                {
-                    return FieldType.Fixed32;
-                }
-
-                if (name == "fixed64")
-                {
-                    return FieldType.Fixed64;
-                }
-
-                return FieldType.Unsupported;
-
-            case 2:
-                if (name == "default")
-                {
-                    return FieldType.UInt32;
-                }
-
-                if (name == "fixed32")
-                {
-                    return FieldType.Fixed32;
-                }
-
-                if (name == "fixed64")
-                {
-                    return FieldType.Fixed64;
-                }
-
-                return FieldType.Unsupported;
-
-            case 3:
-                if (name == "qangle")
-                {
-                    return FieldType.QAngle3;
-                }
-
-                if (name == "vector3")
-                {
-                    return FieldType.Vector3;
-                }
-
-                if (name == "coord")
-                {
-                    return FieldType.Coord3;
-                }
-
-                if (name == "normal")
-                {
-                    return FieldType.Normal3;
-                }
-
-                if (name == "coord_integral")
-                {
-                    return FieldType.CoordIntegral3;
-                }
-
-                if (name == "quantized")
-                {
-                    return FieldType.QuantizedFloat;
-                }
-
-                return FieldType.Unsupported;
-
-            case 4:
-                return name == "default" ? FieldType.Float32 : FieldType.Unsupported;
-
-            case 7:
-                return name == "default" ? FieldType.Bool : FieldType.Unsupported;
-
-            default:
-                return FieldType.Unsupported;
-        }
-    }
+            1 => name switch { "default" => FieldType.Int32, "fixed32" => FieldType.Fixed32, "fixed64" => FieldType.Fixed64, _ => FieldType.Unsupported },
+            2 => name switch { "default" => FieldType.UInt32, "fixed32" => FieldType.Fixed32, "fixed64" => FieldType.Fixed64, _ => FieldType.Unsupported },
+            3 => name switch
+            {
+                "qangle"         => FieldType.QAngle3,
+                "vector3"        => FieldType.Vector3,
+                "coord"          => FieldType.Coord3,
+                "normal"         => FieldType.Normal3,
+                "coord_integral" => FieldType.CoordIntegral3,
+                "quantized"      => FieldType.QuantizedFloat,
+                _                => FieldType.Unsupported,
+            },
+            4 => name == "default" ? FieldType.Float32 : FieldType.Unsupported,
+            5 => name == "default" ? FieldType.String : FieldType.Unsupported,
+            6 => name == "default" ? FieldType.ByteArray : FieldType.Unsupported,
+            7 => name == "default" ? FieldType.Bool : FieldType.Unsupported,
+            _ => FieldType.Unsupported,
+        };
 
     private static bool ValidateAddresses(ILogger logger)
     {

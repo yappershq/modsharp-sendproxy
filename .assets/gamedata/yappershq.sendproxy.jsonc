@@ -71,11 +71,13 @@
     // FieldSubstitution uses these gamedata-resolved bases to anchor its one-time encoder enumeration
     // and map each discovered encoder entry to its FieldType by bucket. Bucket semantics
     // (see docs/REVERSE_ENGINEERING.md §6): b1 signed int, b2 unsigned int,
-    // b3 qangle/vector/quantized-float family, b4 float32, b7 bool.
+    // b3 qangle/vector/quantized-float family, b4 float32, b5 string, b6 byte-array, b7 bool.
     "CFlattenedSerializer::EncoderBucket1": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +16 d" } },
     "CFlattenedSerializer::EncoderBucket2": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +32 d" } },
     "CFlattenedSerializer::EncoderBucket3": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +48 d" } },
     "CFlattenedSerializer::EncoderBucket4": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +64 d" } },
+    "CFlattenedSerializer::EncoderBucket5": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +80 d" } },
+    "CFlattenedSerializer::EncoderBucket6": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +96 d" } },
     "CFlattenedSerializer::EncoderBucket7": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +112 d" } }
   }
 }

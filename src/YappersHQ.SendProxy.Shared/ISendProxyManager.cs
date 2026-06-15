@@ -17,213 +17,153 @@
  * along with SendProxy. If not, see <https://www.gnu.org/licenses/>.
  */
 
-using System;
 using System.Numerics;
-using Sharp.Shared.Objects;
+using Sharp.Shared.GameEntities;
 
 namespace YappersHQ.SendProxy.Shared;
 
 /// <summary>
-///     Networked-field type a hook targets. Mirrors SourceMod SendProxy's <c>SendPropType</c>.
-/// </summary>
-public enum SendPropType
-{
-    Int    = 0,
-    Float  = 1,
-    String = 2,
-    Vector = 4,
-}
-
-/// <summary>
-///     Result of a proxy callback. <see cref="Changed"/> = the engine encodes the value the callback
-///     wrote back (by ref); <see cref="Unchanged"/> = the real value is encoded. Mirrors SourceMod's
-///     <c>Plugin_Changed</c> / <c>Plugin_Continue</c>.
-/// </summary>
-public enum SendProxyResult
-{
-    Unchanged = 0,
-    Changed   = 1,
-}
-
-/// <summary>
-///     Per-client int field substitution callback. Runs on the engine send worker threads — must be
-///     thread-safe and non-blocking. <paramref name="value"/> is seeded with the registered uniform
-///     spoof value (or 0); return true to substitute it, false to pass through the real value.
-///     <paramref name="client"/> is the raw <c>CServerSideClient*</c> (0 if recipient capture is
-///     inactive); <paramref name="entityIndex"/> is the entity being sent (-1 if not captured).
+///     Per-client substitution callback for an integer-family field (int / uint / bool / fixed). Runs on
+///     the engine send worker threads — must be thread-safe and non-blocking. <paramref name="value"/> is
+///     seeded with the registered uniform value (or 0); return <c>true</c> to encode it for this client,
+///     <c>false</c> to pass the real value through. <paramref name="client"/> is the raw
+///     <c>CServerSideClient*</c> recipient (0 if capture is inactive); <paramref name="entityIndex"/> is
+///     the entity being sent (-1 if not captured).
 /// </summary>
 public delegate bool PerClientIntProxy(nint client, int entityIndex, ref int value);
 
-/// <summary>
-///     Per-client float field substitution callback. <paramref name="value"/> is seeded 0f — write the
-///     desired float and return true to substitute, false to pass through. Runs on send threads.
-/// </summary>
+/// <summary>Per-client substitution callback for a float32 field. Seeded 0f. See <see cref="PerClientIntProxy"/>.</summary>
 public delegate bool PerClientFloatProxy(nint client, int entityIndex, ref float value);
 
-/// <summary>
-///     Per-client bool field substitution callback. <paramref name="value"/> is seeded false — write the
-///     desired bool and return true to substitute, false to pass through. Runs on send threads.
-/// </summary>
+/// <summary>Per-client substitution callback for a bool field. Seeded false. See <see cref="PerClientIntProxy"/>.</summary>
 public delegate bool PerClientBoolProxy(nint client, int entityIndex, ref bool value);
 
 /// <summary>
-///     Per-client vector/qangle field substitution callback. x/y/z are seeded 0f — write the desired
-///     components and return true to substitute, false to pass through. Applies to QAngle3 and Vector3
-///     fields (3 contiguous float32 in the engine layout). Runs on send threads.
+///     Per-client substitution callback for a vector / qangle field (three contiguous float32). Seeded
+///     <see cref="Vector3.Zero"/>. See <see cref="PerClientIntProxy"/>.
 /// </summary>
-public delegate bool PerClientVectorProxy(nint client, int entityIndex, ref float x, ref float y, ref float z);
+public delegate bool PerClientVectorProxy(nint client, int entityIndex, ref Vector3 value);
 
-/// <summary>Entity-scoped int proxy callback (value passed by ref).</summary>
-public delegate SendProxyResult SendProxyIntCallback(IGameClient? client, int entity, string prop, int element, ref int value);
+/// <summary>
+///     Per-client substitution callback for a string field (null-terminated, byte-stream encoded). Seeded
+///     with the registered uniform string (or empty). See <see cref="PerClientIntProxy"/>.
+/// </summary>
+public delegate bool PerClientStringProxy(nint client, int entityIndex, ref string value);
 
-/// <summary>Entity-scoped float proxy callback (value passed by ref).</summary>
-public delegate SendProxyResult SendProxyFloatCallback(IGameClient? client, int entity, string prop, int element, ref float value);
-
-/// <summary>Entity-scoped string proxy callback (value passed by ref).</summary>
-public delegate SendProxyResult SendProxyStringCallback(IGameClient? client, int entity, string prop, int element, ref string value);
-
-/// <summary>Entity-scoped vector proxy callback (value passed by ref).</summary>
-public delegate SendProxyResult SendProxyVectorCallback(IGameClient? client, int entity, string prop, int element, ref Vector3 value);
-
-/// <summary>Fired (polling diff) when a watched field's real value changes. Mirrors SM's PropChange hook.</summary>
-public delegate void PropChangeCallback(int entity, string prop, string oldValue, string newValue);
+/// <summary>
+///     Per-client substitution callback for a raw byte-array field (engine serializes element count then
+///     count bytes). Seeded with the registered uniform array (or empty). See <see cref="PerClientIntProxy"/>.
+/// </summary>
+public delegate bool PerClientBytesProxy(nint client, int entityIndex, ref byte[] value);
 
 /// <summary>
 ///     SendProxy for ModSharp / CS2 — intercept the per-client serialization of networked entity fields
-///     and substitute values, without changing the real server-side state. The public surface mirrors
-///     SourceMod's SendProxyManager (<c>sendproxy.inc</c>); the per-client overloads add the recipient
-///     (matrix) dimension.
+///     and substitute the value clients receive, without changing real server-side state.
+///     <para>
+///         Fields are addressed by <c>(serializerName, fieldName)</c> — e.g.
+///         <c>("CCSPlayerPawn", "m_iHealth")</c>. A registration is either <b>uniform</b> (every client
+///         sees the same value, via <see cref="SetUniform(string, string, int)"/>) or <b>per-client</b>
+///         (a callback computes the value per recipient, via <see cref="Hook(string, string, PerClientIntProxy)"/>).
+///         Each form has an <see cref="IBaseEntity"/> overload that scopes the registration to a single
+///         entity (per-entity wins over the all-entities registration for that entity). The substitution
+///         detours install lazily on first registration.
+///     </para>
 /// </summary>
 public interface ISendProxyManager
 {
     const string Identity = nameof(ISendProxyManager);
 
-    bool HookInt(int entity, string prop, SendProxyIntCallback callback);
+    // -- Per-client substitution, all entities of a serializer --------------------------------------
 
-    bool HookFloat(int entity, string prop, SendProxyFloatCallback callback);
+    /// <summary>Register a per-client value callback for every entity of <paramref name="serializerName"/>.</summary>
+    void Hook(string serializerName, string fieldName, PerClientIntProxy callback);
 
-    bool HookString(int entity, string prop, SendProxyStringCallback callback);
+    /// <inheritdoc cref="Hook(string, string, PerClientIntProxy)"/>
+    void Hook(string serializerName, string fieldName, PerClientFloatProxy callback);
 
-    bool HookVector(int entity, string prop, SendProxyVectorCallback callback);
+    /// <inheritdoc cref="Hook(string, string, PerClientIntProxy)"/>
+    void Hook(string serializerName, string fieldName, PerClientBoolProxy callback);
 
-    bool HookArrayInt(int entity, string prop, int element, SendProxyIntCallback callback);
+    /// <inheritdoc cref="Hook(string, string, PerClientIntProxy)"/>
+    void Hook(string serializerName, string fieldName, PerClientVectorProxy callback);
 
-    bool HookArrayFloat(int entity, string prop, int element, SendProxyFloatCallback callback);
+    /// <inheritdoc cref="Hook(string, string, PerClientIntProxy)"/>
+    void Hook(string serializerName, string fieldName, PerClientStringProxy callback);
 
-    bool HookGameRulesInt(string prop, SendProxyIntCallback callback);
+    /// <inheritdoc cref="Hook(string, string, PerClientIntProxy)"/>
+    void Hook(string serializerName, string fieldName, PerClientBytesProxy callback);
 
-    bool HookGameRulesFloat(string prop, SendProxyFloatCallback callback);
+    // -- Per-client substitution, single entity -----------------------------------------------------
 
-    bool Unhook(int entity, string prop, Delegate callback);
+    /// <summary>Register a per-client value callback scoped to a single <paramref name="entity"/>.</summary>
+    void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientIntProxy callback);
 
-    /// <summary>
-    ///     Remove ALL hooks on (entity, prop). Use this when you registered with a lambda (which can't be
-    ///     matched by reference in the delegate overload).
-    /// </summary>
-    bool Unhook(int entity, string prop);
+    /// <inheritdoc cref="Hook(IBaseEntity, string, string, PerClientIntProxy)"/>
+    void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientFloatProxy callback);
 
-    bool UnhookGameRules(string prop, Delegate callback);
+    /// <inheritdoc cref="Hook(IBaseEntity, string, string, PerClientIntProxy)"/>
+    void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientBoolProxy callback);
 
-    bool IsHooked(int entity, string prop);
+    /// <inheritdoc cref="Hook(IBaseEntity, string, string, PerClientIntProxy)"/>
+    void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientVectorProxy callback);
 
-    bool IsHookedGameRules(string prop);
+    /// <inheritdoc cref="Hook(IBaseEntity, string, string, PerClientIntProxy)"/>
+    void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientStringProxy callback);
 
-    bool HookPropChange(int entity, string prop, PropChangeCallback callback);
+    /// <inheritdoc cref="Hook(IBaseEntity, string, string, PerClientIntProxy)"/>
+    void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientBytesProxy callback);
 
-    bool UnhookPropChange(int entity, string prop, PropChangeCallback callback);
+    // -- Uniform substitution, all entities ---------------------------------------------------------
 
-    /// <summary>
-    ///     Register a per-client int substitution callback for (serializerName, fieldName). Fires for ALL
-    ///     entities of that serializer. Replaces any existing global callback for the same key. Installs
-    ///     the substitution detours on first use. The callback runs on engine send threads — keep it
-    ///     thread-safe and fast; a throwing callback is caught and treated as passthrough.
-    /// </summary>
-    void HookInt(string serializerName, string fieldName, PerClientIntProxy callback);
+    /// <summary>Make every client see <paramref name="value"/> for this field on every entity of the serializer.</summary>
+    void SetUniform(string serializerName, string fieldName, int value);
 
-    /// <summary>
-    ///     Register a per-client int substitution callback scoped to a SPECIFIC entity index. When both a
-    ///     per-entity and a global registration exist for the same (ser, field), the per-entity one wins
-    ///     for that entity. Installs the substitution detours on first use.
-    /// </summary>
-    void HookEntityInt(int entityIndex, string serializerName, string fieldName, PerClientIntProxy callback);
+    /// <inheritdoc cref="SetUniform(string, string, int)"/>
+    void SetUniform(string serializerName, string fieldName, float value);
 
-    /// <summary>
-    ///     Register a uniform (same value for every client) int spoof scoped to a SPECIFIC entity index.
-    ///     Installs the substitution detours on first use.
-    /// </summary>
-    void SetEntitySpoof(int entityIndex, string serializerName, string fieldName, int value);
+    /// <inheritdoc cref="SetUniform(string, string, int)"/>
+    void SetUniform(string serializerName, string fieldName, bool value);
 
-    /// <summary>
-    ///     Remove the entity-specific registration for (entityIndex, serializerName, fieldName). Does not
-    ///     affect the global registration for the same field, and does not uninstall the detours.
-    /// </summary>
-    void UnhookEntity(int entityIndex, string serializerName, string fieldName);
+    /// <inheritdoc cref="SetUniform(string, string, int)"/>
+    void SetUniform(string serializerName, string fieldName, Vector3 value);
 
-    /// <summary>
-    ///     Remove the global per-client callback for (serializerName, fieldName). Does not uninstall the
-    ///     detours (call <see cref="UnhookAllPerClient"/> for that).
-    /// </summary>
-    void UnhookInt(string serializerName, string fieldName);
+    /// <inheritdoc cref="SetUniform(string, string, int)"/>
+    void SetUniform(string serializerName, string fieldName, string value);
 
-    /// <summary>
-    ///     Register a per-client float substitution callback for (serializerName, fieldName), all entities.
-    ///     Use for fields classified Float32. Installs the substitution detours on first use.
-    /// </summary>
-    void HookFloat(string serializerName, string fieldName, PerClientFloatProxy callback);
+    /// <inheritdoc cref="SetUniform(string, string, int)"/>
+    void SetUniform(string serializerName, string fieldName, byte[] value);
 
-    /// <summary>
-    ///     Register a per-client float substitution callback scoped to a SPECIFIC entity index. Installs
-    ///     the substitution detours on first use.
-    /// </summary>
-    void HookEntityFloat(int entityIndex, string serializerName, string fieldName, PerClientFloatProxy callback);
+    // -- Uniform substitution, single entity --------------------------------------------------------
 
-    /// <summary>
-    ///     Register a per-client bool substitution callback for (serializerName, fieldName), all entities.
-    ///     Use for fields classified Bool. Installs the substitution detours on first use.
-    /// </summary>
-    void HookBool(string serializerName, string fieldName, PerClientBoolProxy callback);
+    /// <summary>Make every client see <paramref name="value"/> for this field on a single <paramref name="entity"/>.</summary>
+    void SetUniform(IBaseEntity entity, string serializerName, string fieldName, int value);
 
-    /// <summary>
-    ///     Register a per-client bool substitution callback scoped to a SPECIFIC entity index. Installs the
-    ///     substitution detours on first use.
-    /// </summary>
-    void HookEntityBool(int entityIndex, string serializerName, string fieldName, PerClientBoolProxy callback);
+    /// <inheritdoc cref="SetUniform(IBaseEntity, string, string, int)"/>
+    void SetUniform(IBaseEntity entity, string serializerName, string fieldName, float value);
 
-    /// <summary>
-    ///     Register a per-client vector/qangle substitution callback for (serializerName, fieldName), all
-    ///     entities. Use for fields classified QAngle3 or Vector3 (3 contiguous float32 in the engine
-    ///     layout). Installs the substitution detours on first use.
-    /// </summary>
-    void HookVector(string serializerName, string fieldName, PerClientVectorProxy callback);
+    /// <inheritdoc cref="SetUniform(IBaseEntity, string, string, int)"/>
+    void SetUniform(IBaseEntity entity, string serializerName, string fieldName, bool value);
 
-    /// <summary>
-    ///     Register a per-client vector/qangle substitution callback scoped to a SPECIFIC entity index.
-    ///     Installs the substitution detours on first use.
-    /// </summary>
-    void HookEntityVector(int entityIndex, string serializerName, string fieldName, PerClientVectorProxy callback);
+    /// <inheritdoc cref="SetUniform(IBaseEntity, string, string, int)"/>
+    void SetUniform(IBaseEntity entity, string serializerName, string fieldName, Vector3 value);
 
-    /// <summary>
-    ///     Remove the global per-client callback for (serializerName, fieldName) regardless of type.
-    ///     Type-agnostic alias for <see cref="UnhookInt"/>. Does not uninstall the detours.
-    /// </summary>
+    /// <inheritdoc cref="SetUniform(IBaseEntity, string, string, int)"/>
+    void SetUniform(IBaseEntity entity, string serializerName, string fieldName, string value);
+
+    /// <inheritdoc cref="SetUniform(IBaseEntity, string, string, int)"/>
+    void SetUniform(IBaseEntity entity, string serializerName, string fieldName, byte[] value);
+
+    // -- Removal ------------------------------------------------------------------------------------
+
+    /// <summary>Remove the all-entities registration for <paramref name="serializerName"/>::<paramref name="fieldName"/>.</summary>
     void Unhook(string serializerName, string fieldName);
 
-    /// <summary>
-    ///     Remove ALL registered per-client callbacks and entity-specific spoofs/callbacks, then uninstall
-    ///     the substitution detours. Use this during plugin shutdown if you registered any callbacks.
-    /// </summary>
-    void UnhookAllPerClient();
+    /// <summary>Remove the registration scoped to <paramref name="entity"/> for this field.</summary>
+    void Unhook(IBaseEntity entity, string serializerName, string fieldName);
 
-    /// <summary>
-    ///     Set a uniform int spoof on (serializerName, fieldName) for ALL entities of that serializer.
-    ///     Every client sees <paramref name="value"/> regardless of the real server value. Installs the
-    ///     substitution detours on first use.
-    /// </summary>
-    void SetUniformInt(string serializerName, string fieldName, int value);
+    /// <summary>Remove every registration and uninstall the substitution detours. Call on plugin shutdown.</summary>
+    void UnhookAll();
 
-    /// <summary>
-    ///     Set a uniform int spoof scoped to a SPECIFIC entity index. Installs the substitution detours on
-    ///     first use.
-    /// </summary>
-    void SetUniformIntForEntity(int entityIndex, string serializerName, string fieldName, int value);
+    /// <summary>True if any (uniform or per-client) registration exists for this field across all entities.</summary>
+    bool IsHooked(string serializerName, string fieldName);
 }

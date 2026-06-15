@@ -163,9 +163,21 @@ the bucket-1 `default` fn against the standalone `CFlattenedSerializer::EncodeIn
 per-field hot path is then a single dictionary lookup of the live dispatch fn
 (`*(*(fieldInfo+0x38)+0x30)`) — no string scraping on the send path, and no hardcoded table address.
 
-Bucket semantics: **b1** signed int (`default` varint, `fixed32`, `fixed64`), **b2** unsigned int,
-**b3** qangle / vector / quantized-float family (`default`, `qangle`, `normal`, `coord`,
-`coord_integral`, `qangle_pitch_yaw`, `qangle_precise`), **b4** float32, **b7** bool.
+Bucket semantics:
+
+| Bucket | Field type | Encoding |
+|---|---|---|
+| b0 | (stub / unused) | no encoder entries; skipped |
+| b1 | signed int (`default` varint, `fixed32`, `fixed64`) | signed zigzag varint |
+| b2 | unsigned int | raw varint |
+| b3 | qangle / vector / quantized-float family (`default`, `qangle`, `normal`, `coord`, `coord_integral`, `qangle_pitch_yaw`, `qangle_precise`) | 3× float32 or specialized |
+| b4 | float32 | 32 raw bits |
+| b5 | string | encoder reads `*valuePtr` as `char*`; emits `WriteString` 7-bit null-terminated |
+| b6 | byte array | valuePtr struct: `+0x00` = `uint8* data`, `+0x28` = `uint32 count`; emits `varint(count)` then `count × 8` raw bits |
+| b7 | bool | 1 bit |
+
+Buckets b5 and b6 are supported for both uniform and per-client substitution. Bucket b0 has no
+encoder entries and is never matched.
 
 ---
 
@@ -312,6 +324,8 @@ anchor needed.
 | `fieldInfo + 0x28` | recipients filter (presence only) |
 | encoder registry bucket record | `{ handler*(+0x00), count(+0x08) }`, stride `0x10` |
 | encoder entry | name `char*` `+0x00`, encode fn `+0x30`, stride `0x80` |
+| b5 (string) valuePtr | `*(char**)valuePtr` — pointer to null-terminated string; encoded as 7-bit bytes + null |
+| b6 (byte array) valuePtr | `+0x00` = `uint8* data`, `+0x28` = `uint32 count`; encoded as `varint(count)` + `count × 8` raw bits |
 | per-class field record (entity vtable[0]) | own fields only, name `+0x08`, type/size `+0x38`, no encoder |
 | `WriteDeltaEntity_Internal` ctx (`rsi`) | entIdx `+0x34`, `bf_write` `+0x88`, from-snap `+0x90`, to-snap `+0x98` |
 | `bf_write` bit cursor | `*(int*)(bf_write + 0x10)` |

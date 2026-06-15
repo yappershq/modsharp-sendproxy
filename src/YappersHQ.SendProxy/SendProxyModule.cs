@@ -45,6 +45,8 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         "CFlattenedSerializer::EncoderBucket2",
         "CFlattenedSerializer::EncoderBucket3",
         "CFlattenedSerializer::EncoderBucket4",
+        "CFlattenedSerializer::EncoderBucket5",
+        "CFlattenedSerializer::EncoderBucket6",
         "CFlattenedSerializer::EncoderBucket7",
     };
 
@@ -120,7 +122,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     int IEntityListener.ListenerPriority => 0;
 
     void IEntityListener.OnEntityDeleted(IBaseEntity entity)
-        => _manager.RemoveEntityHooks((int) entity.Index);
+        => _manager.RemoveEntityRegistrations((int) entity.Index);
 
     #endregion
 

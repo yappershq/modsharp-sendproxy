@@ -31,8 +31,10 @@ internal static unsafe class NativeUtil
         => p > 0 && ((ulong) p >> 40) == 0x7F;
 
     /// <summary>
-    ///     Read up to <paramref name="maxLen"/> printable ASCII bytes from <paramref name="p"/>.
-    ///     Returns <see cref="string.Empty"/> on any non-printable byte, NUL, or access exception.
+    ///     Read up to <paramref name="maxLen"/> printable ASCII bytes from <paramref name="p"/>. Returns
+    ///     <see cref="string.Empty"/> on a NUL/non-printable byte or a non-user pointer. The IsUserPtr gate
+    ///     is the safety boundary — a bad dereference faults the process (uncatchable), so there is no
+    ///     try/catch here.
     /// </summary>
     public static string ReadShortAscii(nint p, int maxLen)
     {
@@ -41,57 +43,34 @@ internal static unsafe class NativeUtil
             return string.Empty;
         }
 
-        try
+        var buf = stackalloc byte[maxLen + 1];
+        var len = 0;
+        for (; len < maxLen; len++)
         {
-            var buf = stackalloc byte[maxLen + 1];
-            var len = 0;
-            for (; len < maxLen; len++)
+            var ch = *(byte*) (p + len);
+            if (ch == 0)
             {
-                var ch = *(byte*) (p + len);
-                if (ch == 0)
-                {
-                    break;
-                }
-
-                if (ch < 0x20 || ch > 0x7E)
-                {
-                    return string.Empty;
-                }
-
-                buf[len] = ch;
+                break;
             }
 
-            buf[len] = 0;
+            if (ch < 0x20 || ch > 0x7E)
+            {
+                return string.Empty;
+            }
 
-            return len == 0
-                ? string.Empty
-                : new string((sbyte*) buf, 0, len, Encoding.ASCII);
+            buf[len] = ch;
         }
-        catch
-        {
-            return string.Empty;
-        }
+
+        buf[len] = 0;
+
+        return len == 0
+            ? string.Empty
+            : new string((sbyte*) buf, 0, len, Encoding.ASCII);
     }
 
     /// <summary>
     ///     Read the field name from a CNetworkSerializerFieldInfo record (+0x08 = char* m_pszFieldName).
     /// </summary>
     public static string ReadFieldName(nint fieldInfo)
-    {
-        if (!IsUserPtr(fieldInfo))
-        {
-            return string.Empty;
-        }
-
-        try
-        {
-            var np = *(nint*) (fieldInfo + 0x08);
-
-            return ReadShortAscii(np, 40);
-        }
-        catch
-        {
-            return string.Empty;
-        }
-    }
+        => IsUserPtr(fieldInfo) ? ReadShortAscii(*(nint*) (fieldInfo + 0x08), 40) : string.Empty;
 }
