@@ -235,7 +235,9 @@ public sealed class ExampleModule : IModSharpModule
         {
             case "int":
             case "uint":
-                sp.Hook(ser, field, (nint c, int _, ref int v) => { v = (int) (c & 0xFF); return true; });
+                // 1..64 — small + obvious + varies per client (low value keeps the varint the same byte
+                // length as a typical small field so the substitute fits the slot).
+                sp.Hook(ser, field, (nint c, int _, ref int v) => { v = 1 + (int) (c & 0x3F); return true; });
                 break;
             case "float":
                 sp.Hook(ser, field, (nint c, int _, ref float v) => { v = c & 0xFF; return true; });

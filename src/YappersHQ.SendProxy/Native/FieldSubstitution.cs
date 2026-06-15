@@ -775,15 +775,17 @@ internal static unsafe class FieldSubstitution
                     break;
             }
 
-            // Native save / rewind / emit — no managed throw-site between these calls.
-            var savedCursor = *(int*) (dst + 0x10);
-            var result      = CallOriginal(dst, src, bitcount);
-            *(int*) (dst + 0x10) = savedCursor;
+            // Emit the fake FRESH instead of copy-then-rewrite. Calling the original writes the real
+            // value's bits into dst; re-emitting over them did not take. Instead: advance the source
+            // read-cursor (bf_read cursor @ +0x10, same as bf_write — confirmed in BitCopyPrimitive) past
+            // the real value so the next field still reads correctly, and let the field's own encoder
+            // write the fake at dst's current write-cursor. No managed throw-site between these calls.
+            *(int*) (src + 0x10) += (int) bitcount;
 
             ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, uint, void>)
                 encoderFn)(dst, fieldInfo, paramsPtr, valuePtr, 0u);
 
-            return result;
+            return 1;
         }
         catch
         {
