@@ -292,6 +292,9 @@ internal static unsafe class FieldSubstitution
     private const  int       MaxDiagCount = 25;
     private static readonly ConcurrentDictionary<(string, string), byte> _diagSeen = new();
 
+    private static int      _substLogCount;
+    private const  int      MaxSubstLog = 40;
+
     private static IDetourHook? _getBitRangeHook;
     private static nint         _getBitRangeTrampoline;
     private static IDetourHook? _valueCopyHook;
@@ -608,6 +611,15 @@ internal static unsafe class FieldSubstitution
             if (mode == SubstitutionMode.Verify)
             {
                 return VerifyOnly(dst, src, bitcount, serName, fieldName, fieldType, client, entityIndex);
+            }
+
+            // Capped diagnostic: confirms a substitution reached the emit step (pre-dance, no throw risk).
+            if (_substLogCount < MaxSubstLog && _logger is { } sLog)
+            {
+                Interlocked.Increment(ref _substLogCount);
+                sLog.LogInformation(
+                    "SUBST-FAKE \"{Ser}::{Field}\" type={Type} client=0x{Client:X} ent={Ent} bits={Bits} vec=<{X},{Y},{Z}> bitcount={BC}",
+                    serName, fieldName, fieldType, client, entityIndex, intBits, vec.X, vec.Y, vec.Z, bitcount);
             }
 
             // Resolve the field's own engine encoder (dispatch slot 0 at fieldInfo+0x38) and its params.

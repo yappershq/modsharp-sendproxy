@@ -396,11 +396,18 @@ public sealed class ExampleModule : IModSharpModule
     #region Per-encoder real-use demos (sp_encoder1..7)
 
     // One canned demo per encoder bucket, each on a real networked field. sp_encoders_off reverts.
-    // bucket 1 — signed int — m_iHealth: every client sees 1337 HP (real HP untouched).
+    // bucket 1 — signed int — fake HP. The HUD reads CCSPlayerController::m_iPawnHealth (not the pawn's
+    // m_iHealth), so spoof both: m_iPawnHealth drives the on-screen number, m_iHealth the pawn value.
     private void OnEncoder1(IGameClient? issuer, StringCommand command)
     {
-        _sendProxy?.SetUniform("CCSPlayerPawn", "m_iHealth", 1337);
-        Reply(issuer, "enc1 (int b1): CCSPlayerPawn::m_iHealth = 1337 for all clients");
+        if (_sendProxy is not { } sp)
+        {
+            return;
+        }
+
+        sp.SetUniform("CCSPlayerController", "m_iPawnHealth", 1337);
+        sp.SetUniform("CCSPlayerPawn", "m_iHealth", 1337);
+        Reply(issuer, "enc1 (int b1): m_iPawnHealth (HUD) + m_iHealth = 1337. Run after it changes (e.g. slap @me 1) — static values aren't re-sent.");
     }
 
     // bucket 2 — unsigned int — m_iTeamNum (uint8): every player shows as CT to all clients (radar
@@ -454,6 +461,7 @@ public sealed class ExampleModule : IModSharpModule
             return;
         }
 
+        sp.Unhook("CCSPlayerController", "m_iPawnHealth");
         sp.Unhook("CCSPlayerPawn", "m_iHealth");
         sp.Unhook("CCSPlayerPawn", "m_iTeamNum");
         sp.Unhook("CCSPlayerPawn", "m_angEyeAngles");
