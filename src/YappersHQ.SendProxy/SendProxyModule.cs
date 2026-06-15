@@ -191,6 +191,10 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
     public void PostInit()
     {
+        // Wire the Phase-2 detour installer into SendProxyManager so HookInt(ser,field,cb) can
+        // lazily install sub-detours without needing a direct reference to SendProxyModule.
+        _manager.SetSubDetourInstaller(EnsureSubDetours);
+
         _bridge.SharpModuleManager.RegisterSharpModuleInterface<ISendProxyManager>(
             this, ISendProxyManager.Identity, _manager);
 
@@ -401,6 +405,8 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         FieldSubstitution.ValueCopyAddr      = _bitCopyAddr;
         FieldSubstitution.VarintWriterAddr   = _varintWriterAddr;
         FieldSubstitution.WriteFieldListAddr = _writeFieldListAddr;
+        // WDE address for entity-index capture (optional; 0 = skip, entityIndex in callbacks will be -1).
+        FieldSubstitution.WdeAddr            = _wdeAddr;
 
         // Also ensure RecipientCapture is running so CurrentClient is valid during substitution.
         if (_perClientEncodeAddr != 0)
@@ -445,6 +451,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private ECommandAction OnSubOff(StringCommand command)
     {
         FieldSubstitution.ClearSpoofs();
+        FieldSubstitution.ClearCallbacks();
         FieldSubstitution.Uninstall();
         _logger.LogInformation("Phase-2 field substitution OFF — all sub-detours uninstalled");
         return ECommandAction.Stopped;

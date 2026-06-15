@@ -5,6 +5,7 @@ using System.Runtime.InteropServices;
 using System.Threading;
 using Microsoft.Extensions.Logging;
 using Sharp.Shared.Hooks;
+using YappersHQ.SendProxy.Shared;
 
 namespace YappersHQ.SendProxy.Native;
 
@@ -89,6 +90,38 @@ internal static unsafe class FieldSubstitution
     public static void ClearSpoofs() => _spoofs.Clear();
     public static bool HasSpoofs    => !_spoofs.IsEmpty;
 
+    // ── Per-client callback registry ─────────────────────────────────────────
+    //
+    //  Key: (serializerName, fieldName) → PerClientIntProxy delegate.
+    //  When a callback is registered for a field, it is invoked INSTEAD of (or in addition to)
+    //  the uniform spoof.  The callback receives:
+    //    client      — raw CServerSideClient* (from RecipientCapture, 0 if not captured)
+    //    entityIndex — from WDE ctx+0x34 (captured per-entity in this thread, -1 if unknown)
+    //    value       — ref int, pre-seeded with the uniform spoof value (if any, else 0)
+    //  Return true → substitute the (possibly modified) value; false → pass through original.
+    //
+    //  THREAD SAFETY: ConcurrentDictionary; callbacks run on ~6 engine worker threads.
+    //  Consumers MUST ensure their callbacks are thread-safe and do NOT block.
+    //
+    //  EXCEPTION SAFETY: a throwing callback is silently caught → passthrough for that field.
+
+    private static readonly ConcurrentDictionary<(string ser, string field), PerClientIntProxy> _callbacks = new();
+
+    /// <summary>
+    ///     Register a per-client callback for a (serializerName, fieldName) pair.
+    ///     Replaces any previously registered callback for the same key.
+    ///     The callback MUST be thread-safe and fast — it runs on engine send threads.
+    /// </summary>
+    public static void SetCallback(string serializerName, string fieldName, PerClientIntProxy callback)
+        => _callbacks[(serializerName, fieldName)] = callback;
+
+    /// <summary>Remove a per-client callback for a (serializerName, fieldName) pair.</summary>
+    public static void ClearCallback(string serializerName, string fieldName)
+        => _callbacks.TryRemove((serializerName, fieldName), out _);
+
+    public static void ClearCallbacks() => _callbacks.Clear();
+    public static bool HasCallbacks     => !_callbacks.IsEmpty;
+
     // ── [ThreadStatic] per-call context ─────────────────────────────────────
 
     // Set in GetBitRange detour AFTER the original runs (so pathOut is filled).
@@ -99,6 +132,11 @@ internal static unsafe class FieldSubstitution
     // Set in WriteFieldList context — the serializer ptr is WFL param_1.
     // We capture it in the WFL shim installed in Install().
     [ThreadStatic] private static nint _currentSerializer;  // CFlattenedSerializer* (WFL param_1 / rdi)
+
+    // Set in the WDE entity-index capture hook: *(int*)(ctx+0x34) from WriteDeltaEntity_Internal.
+    // Valid for the duration of one entity's full encode (all WFL+value-copy calls for that entity).
+    // Cleared back to -1 after the WDE trampoline returns.
+    [ThreadStatic] private static int _currentEntityIndex;  // entity index (-1 = unknown)
 
     // Diagnostic: log first N distinct (ser, leaf) pairs seen.
     private static int _diagCount;
@@ -122,6 +160,10 @@ internal static unsafe class FieldSubstitution
     private static IDetourHook? _wflShimHook;
     private static nint         _wflShimTrampoline;
 
+    // WDE entity-index capture: reads *(int*)(ctx+0x34) into _currentEntityIndex [ThreadStatic].
+    private static IDetourHook? _wdeEntityCaptureHook;
+    private static nint         _wdeEntityCaptureTrampoline;
+
     // Native fn ptrs (resolved once on Install, never changed after).
     private static delegate* unmanaged[Cdecl]<nint, uint, void> _varintWriter;   // FUN_00500890
     private static ILogger? _logger;
@@ -132,6 +174,7 @@ internal static unsafe class FieldSubstitution
     public static nint ValueCopyAddr;      // file-vaddr 0x400b70
     public static nint VarintWriterAddr;   // file-vaddr 0x400890
     public static nint WriteFieldListAddr; // file-vaddr 0x343b60 (for WFL shim)
+    public static nint WdeAddr;            // CNetworkGameServerBase::WriteDeltaEntity_Internal (for entity index capture; 0 = skip)
 
     // ── Install / Uninstall ──────────────────────────────────────────────────
 
@@ -199,6 +242,29 @@ internal static unsafe class FieldSubstitution
             logger.LogInformation("FieldSubstitution: value-copy hook installed @ 0x{Addr:X}", ValueCopyAddr);
         }
 
+        // 4. WDE entity-index capture — optional; skip gracefully if address not set.
+        //    Hooks WriteDeltaEntity_Internal (rdi=this, rsi=ctx), reads *(int*)(ctx+0x34) into
+        //    _currentEntityIndex [ThreadStatic] before the trampoline, clears to -1 after.
+        //    This gives per-entity context to the value-copy hook for per-client callbacks.
+        if (_wdeEntityCaptureHook is null && WdeAddr != 0)
+        {
+            var wdeHook   = bridge.HookManager.CreateDetourHook();
+            var wdeHookFn = (nint) (delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nint, nint, nint>) &WdeEntityCaptureHook;
+            wdeHook.Prepare(WdeAddr, wdeHookFn);
+            if (wdeHook.Install())
+            {
+                _wdeEntityCaptureHook        = wdeHook;
+                _wdeEntityCaptureTrampoline  = wdeHook.Trampoline;
+                logger.LogInformation("FieldSubstitution: WDE entity-index capture installed @ 0x{Addr:X}", WdeAddr);
+            }
+            else
+            {
+                // Non-fatal: per-client callbacks still work but entityIndex will be -1.
+                logger.LogWarning("FieldSubstitution: WDE entity-index capture Install() failed — entityIndex will be -1 in callbacks");
+                wdeHook.Dispose();
+            }
+        }
+
         Interlocked.Exchange(ref _logCount, 0);
         Interlocked.Exchange(ref _diagCount, 0);
         _diagSeen.Clear();
@@ -209,9 +275,10 @@ internal static unsafe class FieldSubstitution
     {
         Mode = SubstitutionMode.Off;
 
-        _valueCopyHook?.Uninstall(); _valueCopyHook?.Dispose();     _valueCopyHook   = null; _valueCopyTrampoline   = 0;
-        _getBitRangeHook?.Uninstall(); _getBitRangeHook?.Dispose(); _getBitRangeHook = null; _getBitRangeTrampoline = 0;
-        _wflShimHook?.Uninstall(); _wflShimHook?.Dispose();         _wflShimHook     = null; _wflShimTrampoline     = 0;
+        _valueCopyHook?.Uninstall(); _valueCopyHook?.Dispose();               _valueCopyHook            = null; _valueCopyTrampoline            = 0;
+        _getBitRangeHook?.Uninstall(); _getBitRangeHook?.Dispose();           _getBitRangeHook          = null; _getBitRangeTrampoline          = 0;
+        _wflShimHook?.Uninstall(); _wflShimHook?.Dispose();                   _wflShimHook              = null; _wflShimTrampoline              = 0;
+        _wdeEntityCaptureHook?.Uninstall(); _wdeEntityCaptureHook?.Dispose(); _wdeEntityCaptureHook     = null; _wdeEntityCaptureTrampoline     = 0;
 
         _logger?.LogInformation("FieldSubstitution: all hooks uninstalled");
         _logger = null;
@@ -235,6 +302,43 @@ internal static unsafe class FieldSubstitution
             uint, nint, uint,
             nint>) _wflShimTrampoline)(a, b, c, d, e, p6, p7, p8, p9);
         _currentSerializer = 0;
+        return result;
+    }
+
+    // ── WDE entity-index capture hook ────────────────────────────────────────
+    //
+    //  ABI: rdi=a (CNetworkGameServerBase*), rsi=b (delta ctx*).
+    //  *(int*)(b+0x34) = entityIndex (verified by WriteDeltaProbe RE).
+    //
+    //  Strategy: read entityIndex BEFORE calling the trampoline; restore _currentEntityIndex
+    //  to -1 AFTER (in finally) so no stale index leaks to the next entity on this thread.
+    //  6 args declared (like WriteDeltaProbe / RecipientCapture) for ABI correctness.
+
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static nint WdeEntityCaptureHook(nint a, nint b, nint c, nint d, nint e, nint f)
+    {
+        // Read entity index from ctx+0x34 before calling original.
+        // Guard: b must be a plausible heap pointer; read is exception-guarded.
+        var entityIndex = -1;
+        if (IsUserPtr(b))
+        {
+            try { entityIndex = *(int*) (b + 0x34); }
+            catch { /* best-effort; -1 sentinel used if read fails */ }
+        }
+
+        _currentEntityIndex = entityIndex;
+        nint result;
+        try
+        {
+            result = ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nint, nint, nint>)
+                _wdeEntityCaptureTrampoline)(a, b, c, d, e, f);
+        }
+        finally
+        {
+            // Always clear — prevents stale entity index leaking to unrelated WFL calls
+            // that might run on this thread after this entity's encode completes.
+            _currentEntityIndex = -1;
+        }
         return result;
     }
 
@@ -311,12 +415,17 @@ internal static unsafe class FieldSubstitution
             if (fieldName.Length == 0)
                 goto Passthrough;
 
-            // Look up the spoof registry.
-            if (!_spoofs.TryGetValue((serName, fieldName), out var fakeValue))
+            // Look up spoof registry and per-client callback registry.
+            _spoofs.TryGetValue((serName, fieldName), out var uniformFakeValue);
+            _callbacks.TryGetValue((serName, fieldName), out var clientCallback);
+
+            // If neither a uniform spoof nor a callback is registered, pass through.
+            if (clientCallback is null && !_spoofs.ContainsKey((serName, fieldName)))
                 goto Passthrough;
 
-            // Client identity (for future per-client divergence).
-            var client = RecipientCapture.CurrentClient;
+            // Client identity and entity index (both [ThreadStatic], valid on this thread).
+            var client      = RecipientCapture.CurrentClient;
+            var entityIndex = _currentEntityIndex;
 
             var ln = Interlocked.Increment(ref _logCount);
 
@@ -331,14 +440,53 @@ internal static unsafe class FieldSubstitution
                 if (ln <= MaxLogCount && _logger is { } log)
                 {
                     log.LogInformation(
-                        "SUBST-VERIFY field=\"{Ser}::{Field}\" client=0x{Client:X} bitcount={Bits} "
+                        "SUBST-VERIFY field=\"{Ser}::{Field}\" client=0x{Client:X} ent={Ent} bitcount={Bits} "
                         + "cursorBefore={Before} cursorAfter={After} (fake would be {Fake})",
-                        serName, fieldName, client, bitcount, cursorBefore, cursorAfter, fakeValue);
+                        serName, fieldName, client, entityIndex, bitcount, cursorBefore, cursorAfter, uniformFakeValue);
                 }
                 return result;
             }
             else  // Fake
             {
+                // Determine the effective fake value:
+                //   1. Start with the uniform spoof value (or 0 if none registered).
+                //   2. If a per-client callback is registered, invoke it — it can overwrite
+                //      the value and return true (substitute) or false (pass through original).
+                //
+                // EXCEPTION SAFETY: a throwing callback must NOT crash the send path.
+                //   On exception → passthrough for this field on this client.
+
+                int effectiveFake   = uniformFakeValue;  // pre-seeded (0 if no uniform spoof)
+                bool shouldSubstitute = clientCallback is null; // true when only uniform spoof; overridden below
+
+                if (clientCallback is not null)
+                {
+                    try
+                    {
+                        shouldSubstitute = clientCallback(client, entityIndex, ref effectiveFake);
+                    }
+                    catch (Exception ex)
+                    {
+                        // Log once on first exception per field, then suppress.
+                        if (ln <= MaxLogCount && _logger is { } errLog)
+                        {
+                            try
+                            {
+                                errLog.LogWarning(ex,
+                                    "SUBST-FAKE per-client callback threw for \"{Ser}::{Field}\" "
+                                    + "client=0x{Client:X} ent={Ent} — passing through original",
+                                    serName, fieldName, client, entityIndex);
+                            }
+                            catch { /* logging must never fault the hook */ }
+                        }
+                        // Pass through original — do NOT substitute.
+                        return CallOriginal(dst, src, bitcount);
+                    }
+                }
+
+                if (!shouldSubstitute)
+                    return CallOriginal(dst, src, bitcount);
+
                 // FAKE: save dst cursor, call original (advances src + dst, writes real bits),
                 // rewind dst cursor, write our zigzag-encoded value via the varint writer.
                 int savedCursor = *(int*) (dst + 0x10);
@@ -347,16 +495,16 @@ internal static unsafe class FieldSubstitution
                 // Rewind dst cursor to where it was before — our write starts here.
                 *(int*) (dst + 0x10) = savedCursor;
 
-                // Zigzag-encode the fake value: (uint)((v<<1)^(v>>31))
-                uint zigzag = (uint) ((fakeValue << 1) ^ (fakeValue >> 31));
+                // Zigzag-encode the effective fake value: (uint)((v<<1)^(v>>31))
+                uint zigzag = (uint) ((effectiveFake << 1) ^ (effectiveFake >> 31));
                 _varintWriter(dst, zigzag);
 
                 if (ln <= MaxLogCount && _logger is { } log)
                 {
                     log.LogInformation(
-                        "SUBST-FAKE field=\"{Ser}::{Field}\" client=0x{Client:X} bitcount={Bits} "
-                        + "savedCursor={Saved} fakeValue={Fake} zigzag=0x{Zz:X}",
-                        serName, fieldName, client, bitcount, savedCursor, fakeValue, zigzag);
+                        "SUBST-FAKE field=\"{Ser}::{Field}\" client=0x{Client:X} ent={Ent} bitcount={Bits} "
+                        + "savedCursor={Saved} effectiveFake={Fake} zigzag=0x{Zz:X}",
+                        serName, fieldName, client, entityIndex, bitcount, savedCursor, effectiveFake, zigzag);
                 }
                 return originalResult;
             }

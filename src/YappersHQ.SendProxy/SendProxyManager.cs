@@ -21,7 +21,17 @@ internal sealed class SendProxyManager : ISendProxyManager
     private readonly Dictionary<(int Entity, string Prop), List<HookEntry>> _hooks = new();
     private readonly Dictionary<(int Entity, string Prop), List<PropChangeCallback>> _changeHooks = new();
 
+    // Injected by SendProxyModule — installs Phase-2 sub-detours and returns true on success.
+    // Called lazily when the first per-client callback is registered.
+    private Func<bool>? _ensureSubDetours;
+
     public SendProxyManager(ILogger logger) => _logger = logger;
+
+    /// <summary>
+    ///     Called by SendProxyModule during PostInit to wire the Phase-2 detour installer.
+    ///     The func is idempotent (hooks are only installed once).
+    /// </summary>
+    internal void SetSubDetourInstaller(Func<bool> installer) => _ensureSubDetours = installer;
 
     private sealed record HookEntry(SendPropType Type, Delegate Callback, int Element);
 
@@ -146,6 +156,65 @@ internal sealed class SendProxyManager : ISendProxyManager
     private void RemoveEncoderSwap(int entity, string prop)
     {
         // TODO(phase1-live): restore the original encoder pointer.
+    }
+
+    // ── Phase-2 per-client raw callback API ──────────────────────────────────
+
+    /// <inheritdoc/>
+    public void HookInt(string serializerName, string fieldName, PerClientIntProxy callback)
+    {
+        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null)
+            return;
+
+        // Install Phase-2 sub-detours on first use (idempotent if already installed).
+        if (_ensureSubDetours is { } installer)
+        {
+            if (!installer())
+            {
+                _logger.LogWarning(
+                    "SendProxy: HookInt(ser, field, callback) — Phase-2 sub-detours failed to install; "
+                    + "callback for \"{Ser}::{Field}\" NOT registered",
+                    serializerName, fieldName);
+                return;
+            }
+        }
+        else
+        {
+            _logger.LogWarning(
+                "SendProxy: HookInt(ser, field, callback) — Phase-2 installer not wired yet; "
+                + "callback for \"{Ser}::{Field}\" NOT registered",
+                serializerName, fieldName);
+            return;
+        }
+
+        FieldSubstitution.SetCallback(serializerName, fieldName, callback);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+
+        _logger.LogInformation(
+            "SendProxy: per-client callback registered for \"{Ser}::{Field}\"",
+            serializerName, fieldName);
+    }
+
+    /// <inheritdoc/>
+    public void UnhookInt(string serializerName, string fieldName)
+    {
+        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName))
+            return;
+
+        FieldSubstitution.ClearCallback(serializerName, fieldName);
+        _logger.LogInformation(
+            "SendProxy: per-client callback removed for \"{Ser}::{Field}\"",
+            serializerName, fieldName);
+    }
+
+    /// <inheritdoc/>
+    public void UnhookAllPerClient()
+    {
+        FieldSubstitution.ClearCallbacks();
+        // Only uninstall if there are no uniform spoofs left either.
+        if (!FieldSubstitution.HasSpoofs)
+            FieldSubstitution.Uninstall();
+        _logger.LogInformation("SendProxy: all per-client callbacks removed");
     }
 
     internal void Clear()
