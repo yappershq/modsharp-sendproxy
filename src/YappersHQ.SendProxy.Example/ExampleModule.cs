@@ -142,6 +142,16 @@ public sealed class ExampleModule : IModSharpModule
             registry.RegisterAdminCommand("sp_fakehp",   OnFakeHp,   [SendProxyPermission]);
             registry.RegisterAdminCommand("sp_fakename", OnFakeName, [SendProxyPermission]);
 
+            // One canned real-use demo per encoder bucket (sp_encoder1..7) + a single off switch.
+            registry.RegisterAdminCommand("sp_encoder1", OnEncoder1, [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_encoder2", OnEncoder2, [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_encoder3", OnEncoder3, [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_encoder4", OnEncoder4, [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_encoder5", OnEncoder5, [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_encoder6", OnEncoder6, [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_encoder7", OnEncoder7, [SendProxyPermission]);
+            registry.RegisterAdminCommand("sp_encoders_off", OnEncodersOff, [SendProxyPermission]);
+
             // Read-only serializer probe (discover which fields exist and their encoder type).
             registry.RegisterAdminCommand("sp_probe_scan",  OnProbeScan,  [SendProxyPermission]);
             registry.RegisterAdminCommand("sp_probe_dump",  OnProbeDump,  [SendProxyPermission]);
@@ -334,6 +344,7 @@ public sealed class ExampleModule : IModSharpModule
         Reply(issuer, "  sp_set CCSPlayerController m_iszPlayerName string Hacker");
         Reply(issuer, "  sp_setpc CCSPlayerPawn m_iHealth int        (each client a different HP)");
         Reply(issuer, "  sp_setent 3 CCSPlayerPawn m_iHealth int 1   (only entity #3)");
+        Reply(issuer, "canned per-bucket demos: sp_encoder1..7 (1=int 2=uint 3=qangle 4=float 5=string 6=bytes 7=bool), sp_encoders_off to revert");
         Reply(issuer, "discover fields/types with sp_probe_dump <entityIndex> / sp_probe_field <ser> <field>");
     }
 
@@ -378,6 +389,77 @@ public sealed class ExampleModule : IModSharpModule
         var name = RestOfArgs(command, 1);
         sp.SetUniform("CCSPlayerController", "m_iszPlayerName", name);
         Reply(issuer, $"all clients now see \"{name}\" as every player's name");
+    }
+
+    #endregion
+
+    #region Per-encoder real-use demos (sp_encoder1..7)
+
+    // One canned demo per encoder bucket, each on a real networked field. sp_encoders_off reverts.
+    // bucket 1 — signed int — m_iHealth: every client sees 1337 HP (real HP untouched).
+    private void OnEncoder1(IGameClient? issuer, StringCommand command)
+    {
+        _sendProxy?.SetUniform("CCSPlayerPawn", "m_iHealth", 1337);
+        Reply(issuer, "enc1 (int b1): CCSPlayerPawn::m_iHealth = 1337 for all clients");
+    }
+
+    // bucket 2 — unsigned int — m_unCurrentEquipmentValue: hide every player's loadout worth.
+    private void OnEncoder2(IGameClient? issuer, StringCommand command)
+    {
+        _sendProxy?.SetUniform("CCSPlayerPawn", "m_unCurrentEquipmentValue", 16000);
+        Reply(issuer, "enc2 (uint b2): CCSPlayerPawn::m_unCurrentEquipmentValue = 16000 for all clients");
+    }
+
+    // bucket 3 — qangle/vector — m_angEyeAngles: every player appears to look backwards.
+    private void OnEncoder3(IGameClient? issuer, StringCommand command)
+    {
+        _sendProxy?.SetUniform("CCSPlayerPawn", "m_angEyeAngles", new Vector3(0f, 180f, 0f));
+        Reply(issuer, "enc3 (qangle b3): CCSPlayerPawn::m_angEyeAngles = (0,180,0) — players look backwards to all clients");
+    }
+
+    // bucket 4 — float32 — m_flVelocityModifier: every player appears at half speed-modifier.
+    private void OnEncoder4(IGameClient? issuer, StringCommand command)
+    {
+        _sendProxy?.SetUniform("CCSPlayerPawn", "m_flVelocityModifier", 0.5f);
+        Reply(issuer, "enc4 (float b4): CCSPlayerPawn::m_flVelocityModifier = 0.5 for all clients");
+    }
+
+    // bucket 5 — string — m_iszPlayerName: every player shows the same name.
+    private void OnEncoder5(IGameClient? issuer, StringCommand command)
+    {
+        _sendProxy?.SetUniform("CCSPlayerController", "m_iszPlayerName", "SendProxyTest");
+        Reply(issuer, "enc5 (string b5): CCSPlayerController::m_iszPlayerName = \"SendProxyTest\" for all clients");
+    }
+
+    // bucket 6 — byte-array — no common byte-array netvar exists on the player schema; point the tester
+    // at the generic path so they can exercise b6 on whatever field they find via the probe.
+    private void OnEncoder6(IGameClient? issuer, StringCommand command)
+    {
+        Reply(issuer, "enc6 (bytes b6): no common byte-array field on players. Find one via sp_probe_dump,");
+        Reply(issuer, "then: sp_set <serializer> <field> bytes <hexstring>   (e.g. bytes DEADBEEF)");
+    }
+
+    // bucket 7 — bool — m_bIsScoped: every player appears scoped.
+    private void OnEncoder7(IGameClient? issuer, StringCommand command)
+    {
+        _sendProxy?.SetUniform("CCSPlayerPawn", "m_bIsScoped", true);
+        Reply(issuer, "enc7 (bool b7): CCSPlayerPawn::m_bIsScoped = true — all players appear scoped to all clients");
+    }
+
+    private void OnEncodersOff(IGameClient? issuer, StringCommand command)
+    {
+        if (_sendProxy is not { } sp)
+        {
+            return;
+        }
+
+        sp.Unhook("CCSPlayerPawn", "m_iHealth");
+        sp.Unhook("CCSPlayerPawn", "m_unCurrentEquipmentValue");
+        sp.Unhook("CCSPlayerPawn", "m_angEyeAngles");
+        sp.Unhook("CCSPlayerPawn", "m_flVelocityModifier");
+        sp.Unhook("CCSPlayerController", "m_iszPlayerName");
+        sp.Unhook("CCSPlayerPawn", "m_bIsScoped");
+        Reply(issuer, "sp_encoders_off: reverted all sp_encoder1..7 demos");
     }
 
     #endregion
