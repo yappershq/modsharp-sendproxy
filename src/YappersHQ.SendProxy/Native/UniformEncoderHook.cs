@@ -189,7 +189,46 @@ internal static unsafe class UniformEncoderHook
                     var scratch    = stackalloc byte[0x30];
                     var stringSlot = stackalloc nint[1];
 
-                    if (TryBuildScratch(in sp, entry.Type, scratch, stringSlot, out var fakeValuePtr))
+                    // String and byte-array payloads must be allocated HERE, in SharedHook's own frame:
+                    // the engine encoder dereferences the value pointer during Invoke, so a buffer
+                    // stackalloc'd in a callee (TryBuildScratch) would already be reclaimed and the
+                    // encoder would walk freed stack → garbage on the wire. Scalars are written straight
+                    // into `scratch`, so they have no such lifetime issue and stay in TryBuildScratch.
+                    if (sp.Kind == ValueKind.String && entry.Type == FieldType.String)
+                    {
+                        var s       = sp.Str ?? string.Empty;
+                        var byteLen = Encoding.UTF8.GetByteCount(s);
+                        if (byteLen <= MaxSubstituteBytes)
+                        {
+                            var strBuf = stackalloc byte[byteLen + 1];
+                            Encoding.UTF8.GetBytes(s, new Span<byte>(strBuf, byteLen));
+                            strBuf[byteLen] = 0;
+                            *stringSlot    = (nint) strBuf;   // encoder reads *valuePtr as char*
+                            return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) stringSlot, extra);
+                        }
+                    }
+                    else if (sp.Kind == ValueKind.Bytes && entry.Type == FieldType.ByteArray)
+                    {
+                        var b = sp.Bytes ?? Array.Empty<byte>();
+                        if (b.Length <= MaxSubstituteBytes)
+                        {
+                            var buf = stackalloc byte[b.Length == 0 ? 1 : b.Length];
+                            for (var i = 0; i < b.Length; i++)
+                            {
+                                buf[i] = b[i];
+                            }
+
+                            for (var i = 0; i < 0x30; i++)
+                            {
+                                scratch[i] = 0;
+                            }
+
+                            *(nint*) (scratch + 0x00) = (nint) buf;     // {data*, +0x28 count}
+                            *(uint*) (scratch + 0x28) = (uint) b.Length;
+                            return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
+                        }
+                    }
+                    else if (TryBuildScratch(in sp, entry.Type, scratch, stringSlot, out var fakeValuePtr))
                     {
                         return Invoke(tramp, bf, fieldInfo, paramsPtr, fakeValuePtr, extra);
                     }
@@ -269,59 +308,10 @@ internal static unsafe class UniformEncoderHook
                         return false;
                 }
 
+            // String / ByteArray are handled in SharedHook (their payload buffer must live in the calling
+            // frame because the engine encoder dereferences it after this method would have returned).
             case ValueKind.String:
-            {
-                if (targetType != FieldType.String)
-                {
-                    return false;
-                }
-
-                var s       = sp.Str ?? string.Empty;
-                var byteLen = Encoding.UTF8.GetByteCount(s);
-                if (byteLen > MaxSubstituteBytes)
-                {
-                    return false;
-                }
-
-                var strBuf = stackalloc byte[byteLen + 1];
-                Encoding.UTF8.GetBytes(s, new Span<byte>(strBuf, byteLen));
-                strBuf[byteLen] = 0;
-                *stringSlot     = (nint) strBuf;   // encoder reads *valuePtr as char*
-                valuePtr        = (nint) stringSlot;
-
-                return true;
-            }
-
             case ValueKind.Bytes:
-            {
-                if (targetType != FieldType.ByteArray)
-                {
-                    return false;
-                }
-
-                var b = sp.Bytes ?? Array.Empty<byte>();
-                if (b.Length > MaxSubstituteBytes)
-                {
-                    return false;
-                }
-
-                var buf = stackalloc byte[b.Length == 0 ? 1 : b.Length];
-                for (var i = 0; i < b.Length; i++)
-                {
-                    buf[i] = b[i];
-                }
-
-                for (var i = 0; i < 0x30; i++)
-                {
-                    scratch[i] = 0;
-                }
-
-                *(nint*) (scratch + 0x00) = (nint) buf;
-                *(uint*) (scratch + 0x28) = (uint) b.Length;
-
-                return true;
-            }
-
             default:
                 return false;
         }
