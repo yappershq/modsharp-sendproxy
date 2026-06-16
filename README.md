@@ -186,10 +186,13 @@ floats; `string` takes free text; `bytes` takes a contiguous hex string (e.g. `D
 | `sp_unset <ser> <field>` | `Unhook` the all-entities registration for a field |
 | `sp_clear` | `UnhookAll` — clear everything, uninstall the substitution detours |
 | `sp_help` | Print the matrix + ready-to-paste examples |
+| `sp_sendfake <value>` | **SendFake** one-shot — push a fake HP to the issuer once (force-dirty + fire once), no persistent hook |
+| `sp_fakeaim <target>` | **Per-client + per-entity** showcase — resolve a target string via TargetingManager (`@aim`, a nick, `@t`, multi) and fake each target's HP/team/cycling-colour/glow **only to the issuer** |
+| `sp_fakeaim_off` | Tear down `sp_fakeaim` + re-send the real values |
 | `sp_fakehp <value>` | Preset — `SetUniform("CCSPlayerPawn","m_iHealth", value)` |
 | `sp_fakename <text>` | Preset — `SetUniform("CCSPlayerController","m_iszPlayerName", text)` (b5 string) |
-| `sp_encoder1`..`sp_encoder7` | One canned real-use demo per encoder bucket on a real field — 1 int `m_iHealth`=1337, 2 uint `m_iTeamNum` (all appear CT — radar/outline flip), 3 qangle `m_angEyeAngles`, 4 float `m_flVelocityModifier`, 5 string `m_iszPlayerName`, 6 bytes (none common — guidance), 7 bool `m_bIsScoped` |
-| `sp_encoders_off` | Revert all `sp_encoder1..7` demos |
+| `sp_encoder1`..`sp_encoder7` | One canned visible demo per encoder bucket — 1 int `m_iPawnHealth`+`m_iHealth`=1337, 2 uint `m_iTeamNum` (pawn+controller — all appear CT), 3 qangle `m_angEyeAngles` (spectate a target to see), 4 float `m_flScale`=0.3 (tiny players), 5 string `m_iszPlayerName`, 6 bytes (none common — guidance), 7 bool `m_bIsScoped`. Each force-resends so it shows at once |
+| `sp_encoders_off` | Revert all `sp_encoder1..7` demos (re-sends real values) |
 | `sp_probe_scan` | Read-only serializer probe — list live entities + classes, dump the first |
 | `sp_probe_dump <entityIndex>` | Read-only — dump one entity's serializer class info / field[0] |
 | `sp_probe_field <serializerClass> <fieldName>` | Read-only — dump a field record's qword window (RE aid) |
