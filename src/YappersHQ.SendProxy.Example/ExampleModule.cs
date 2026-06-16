@@ -381,6 +381,8 @@ public sealed class ExampleModule : IModSharpModule
         Reply(issuer, "  sp_setpc CCSPlayerPawn m_iHealth int        (each client a different HP)");
         Reply(issuer, "  sp_setent 3 CCSPlayerPawn m_iHealth int 1   (only entity #3)");
         Reply(issuer, "canned per-bucket demos: sp_encoder1..7 (1=int 2=uint 3=qangle 4=float 5=string 6=bytes 7=bool), sp_encoders_off to revert");
+        Reply(issuer, "  sp_fakeaim <target>   per-client+per-entity: fake HP/team/colour/glow on a target (@aim/nick/@t), only YOU see it; sp_fakeaim_off");
+        Reply(issuer, "  sp_fakehp <n> | sp_fakename <text>            quick uniform presets");
         Reply(issuer, "discover fields/types with sp_probe_dump <entityIndex> / sp_probe_field <ser> <field>");
     }
 
@@ -514,21 +516,32 @@ public sealed class ExampleModule : IModSharpModule
             _aimControllers.Add((int) ctrl.Index);
             sp.Hook(ctrl, "CCSPlayerController", "m_iPawnHealth", (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 1; return true; });
             sp.Hook(ctrl, "CCSPlayerController", "m_iTeamNum",    (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
+            ctrl.NetworkStateChanged("m_iPawnHealth");   // force an initial re-send so it shows at once
+            ctrl.NetworkStateChanged("m_iTeamNum");
 
             if (ctrl.GetPlayerPawn() is { } pawn)
             {
                 _aimPawns.Add((int) pawn.Index);
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iHealth",   (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 1; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iTeamNum",  (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_clrRender", (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = unchecked((int) _aimColor); return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_iHealth",          (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 1; return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_iTeamNum",         (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_clrRender",        (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = unchecked((int) _aimColor); return true; });
+                // Glow: enable a coloured outline (m_iGlowType nonzero) tinted by the same cycling colour.
+                // Both are nested under m_Glow; best-effort (enable mechanics / color-encoder may vary).
+                sp.Hook(pawn, "CCSPlayerPawn", "m_iGlowType",        (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_glowColorOverride", (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = unchecked((int) _aimColor); return true; });
+                pawn.NetworkStateChanged("m_iHealth");
+                pawn.NetworkStateChanged("m_iTeamNum");
+                pawn.NetworkStateChanged("m_clrRender");
+                pawn.NetworkStateChanged("m_iGlowType");
+                pawn.NetworkStateChanged("m_glowColorOverride");
             }
         }
 
-        // Drive the colour cycle: every 100ms advance the hue and re-dirty m_clrRender on each target so the
-        // engine re-sends it (the per-client hook then writes the new colour). Repeatable timer.
+        // Drive the colour cycle: every 100ms advance the hue and re-dirty the colour fields on each target
+        // so the engine re-sends them (the per-client hook then writes the new colour). Repeatable timer.
         _aimTimer = _modSharp.PushTimer(CycleFakeAim, 0.1, GameTimerFlags.Repeatable);
 
-        Reply(issuer, $"sp_fakeaim: faking HP/team/colour on {targets.Count} target(s) — only YOU see it. sp_fakeaim_off to clear.");
+        Reply(issuer, $"sp_fakeaim: faking HP/team/colour/glow on {targets.Count} target(s) — only YOU see it. sp_fakeaim_off to clear.");
     }
 
     private void OnFakeAimOff(IGameClient? issuer, StringCommand command)
@@ -552,6 +565,7 @@ public sealed class ExampleModule : IModSharpModule
             if (_entityManager.FindEntityByIndex((EntityIndex) pidx) is { } pawn)
             {
                 pawn.NetworkStateChanged("m_clrRender");
+                pawn.NetworkStateChanged("m_glowColorOverride");
             }
         }
     }
@@ -589,9 +603,13 @@ public sealed class ExampleModule : IModSharpModule
             sp.Unhook(pawn, "CCSPlayerPawn", "m_iHealth");
             sp.Unhook(pawn, "CCSPlayerPawn", "m_iTeamNum");
             sp.Unhook(pawn, "CCSPlayerPawn", "m_clrRender");
+            sp.Unhook(pawn, "CCSPlayerPawn", "m_iGlowType");
+            sp.Unhook(pawn, "CCSPlayerPawn", "m_glowColorOverride");
             pawn.NetworkStateChanged("m_iHealth");
             pawn.NetworkStateChanged("m_iTeamNum");
             pawn.NetworkStateChanged("m_clrRender");
+            pawn.NetworkStateChanged("m_iGlowType");
+            pawn.NetworkStateChanged("m_glowColorOverride");
         }
 
         _aimControllers.Clear();
