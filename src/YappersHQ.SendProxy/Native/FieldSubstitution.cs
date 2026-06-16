@@ -47,7 +47,6 @@ namespace YappersHQ.SendProxy.Native;
 internal enum SubstitutionMode
 {
     Off,
-    Verify,
     Fake,
 }
 
@@ -297,20 +296,6 @@ internal static unsafe class FieldSubstitution
         }
     }
 
-    // True if any registration exists for this field name (any serializer/entity). Diagnostic helper.
-    private static bool IsFieldNameRegistered(string field)
-    {
-        foreach (var key in _registry.Keys)
-        {
-            if (key.field == field)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
     public static bool IsHooked(string ser, string field)
     {
         foreach (var key in _registry.Keys)
@@ -339,13 +324,6 @@ internal static unsafe class FieldSubstitution
     // To-snapshot CFrameSnapshotEntry* (ctx+0x90), data regions at +0x30 — used by the live-struct path.
     [ThreadStatic]
     private static nint _currentSnapshotPtr;
-
-    private static int       _diagCount;
-    private const  int       MaxDiagCount = 25;
-    private static readonly ConcurrentDictionary<(string, string), byte> _diagSeen = new();
-
-    private static int      _substLogCount;
-    private const  int      MaxSubstLog = 40;
 
     private static IDetourHook? _getBitRangeHook;
     private static nint         _getBitRangeTrampoline;
@@ -503,9 +481,6 @@ internal static unsafe class FieldSubstitution
             }
         }
 
-        Interlocked.Exchange(ref _diagCount, 0);
-        _diagSeen.Clear();
-
         return true;
     }
 
@@ -608,8 +583,6 @@ internal static unsafe class FieldSubstitution
                 return CallOriginal(dst, src, bitcount);
             }
 
-            LogDiscoveredField(serName, fieldName);
-
             var client      = RecipientCapture.CurrentClient;
             var entityIndex = _currentEntityIndex;
 
@@ -620,16 +593,6 @@ internal static unsafe class FieldSubstitution
             if (hasReg && reg.OneShot && client != reg.TargetClient)
             {
                 return CallOriginal(dst, src, bitcount);
-            }
-
-            // Diagnostic: for any field whose NAME is registered, log the decision path so a bail between
-            // "field seen" and the emit is visible (reg-key match? classify type? per-client client?).
-            if (_substLogCount < MaxSubstLog && _logger is { } pcd && IsFieldNameRegistered(fieldName))
-            {
-                Interlocked.Increment(ref _substLogCount);
-                pcd.LogInformation(
-                    "PCDIAG ser=\"{S}\" field=\"{F}\" ent={E} client=0x{C:X} hasReg={H} type={T}",
-                    serName, fieldName, entityIndex, client, hasReg, hasReg ? Classify(leafRec) : FieldType.Unsupported);
             }
 
             if (!hasReg)
@@ -677,20 +640,6 @@ internal static unsafe class FieldSubstitution
             if (!substitute)
             {
                 return CallOriginal(dst, src, bitcount);
-            }
-
-            if (mode == SubstitutionMode.Verify)
-            {
-                return VerifyOnly(dst, src, bitcount, serName, fieldName, fieldType, client, entityIndex);
-            }
-
-            // Capped diagnostic: confirms a substitution reached the emit step (pre-dance, no throw risk).
-            if (_substLogCount < MaxSubstLog && _logger is { } sLog)
-            {
-                Interlocked.Increment(ref _substLogCount);
-                sLog.LogInformation(
-                    "SUBST-FAKE \"{Ser}::{Field}\" type={Type} client=0x{Client:X} ent={Ent} bits={Bits} vec=<{X},{Y},{Z}> bitcount={BC}",
-                    serName, fieldName, fieldType, client, entityIndex, intBits, vec.X, vec.Y, vec.Z, bitcount);
             }
 
             // Resolve the field's own engine encoder (dispatch slot 0 at fieldInfo+0x38) and its params.
@@ -880,32 +829,12 @@ internal static unsafe class FieldSubstitution
                 return CallOriginal(dst, src, bitcount);
             }
 
-            // Conclusive capped diagnostic: did the scratch encode produce bits, and does the dst cursor
-            // advance when we copy them? (Strip once confirmed live.)
-            if (_substLogCount < MaxSubstLog && _logger is { } eLog)
-            {
-                Interlocked.Increment(ref _substLogCount);
-                var b0 = dataBuf[0];
-                var b1 = encBound > 1 ? dataBuf[1] : (byte) 0;
-                var dstCursorBefore = *(int*) (dst + 0x10);
-                eLog.LogInformation(
-                    "SUBST-EMIT \"{Ser}::{Field}\" encodedBits={N} bitcount={BC} scratch=[{B0:X2} {B1:X2}] dstCursorBefore={DB}",
-                    serName, fieldName, encodedBits, bitcount, b0, b1, dstCursorBefore);
-            }
-
             // Skip the real value in the source, then copy our fake bits into dst via the engine's own
             // primitive (rewind scratch to read from bit 0 first).
             *(int*) (src + 0x10) += (int) bitcount;
             *(int*) (bw + 0x10) = 0;
 
             var copyOk = CallOriginal(dst, (nint) bw, (uint) encodedBits);
-
-            if (_substLogCount < MaxSubstLog && _logger is { } e2Log)
-            {
-                e2Log.LogInformation(
-                    "SUBST-EMIT-DONE \"{Ser}::{Field}\" copyOk={OK} dstCursorAfter={DA}",
-                    serName, fieldName, copyOk, *(int*) (dst + 0x10));
-            }
 
             // One-shot fired for its target client — remove it so it doesn't recur. Other clients on this
             // snapshot already passed through (client-match gate above), so they never see the fake.
@@ -980,35 +909,6 @@ internal static unsafe class FieldSubstitution
 
             default:
                 return false;
-        }
-    }
-
-    private static byte VerifyOnly(
-        nint dst, nint src, uint bitcount,
-        string serName, string fieldName, FieldType fieldType, nint client, int entityIndex)
-    {
-        var cursorBefore = (dst != 0) ? *(int*) (dst + 0x10) : -1;
-        var result       = CallOriginal(dst, src, bitcount);
-        var cursorAfter  = (dst != 0) ? *(int*) (dst + 0x10) : -1;
-
-        _logger?.LogInformation(
-            "SUBST-VERIFY field=\"{Ser}::{Field}\" type={Type} client=0x{Client:X} ent={Ent} "
-            + "bitcount={Bits} cursorBefore={Before} cursorAfter={After}",
-            serName, fieldName, fieldType, client, entityIndex, bitcount, cursorBefore, cursorAfter);
-
-        return result;
-    }
-
-    private static void LogDiscoveredField(string serName, string fieldName)
-    {
-        if (_logger is not { } log || _diagCount >= MaxDiagCount || !_diagSeen.TryAdd((serName, fieldName), 0))
-        {
-            return;
-        }
-
-        if (Interlocked.Increment(ref _diagCount) <= MaxDiagCount)
-        {
-            log.LogInformation("SendProxy field seen: \"{Ser}::{Field}\"", serName, fieldName);
         }
     }
 
@@ -1247,12 +1147,6 @@ internal static unsafe class FieldSubstitution
             {
                 var bucket  = BucketIndices[i];
                 var handler = _bucketAddrs[i];
-                var rawCount = NativeUtil.IsUserPtr(_registryAddr) ? *(int*) (_registryAddr + bucket * 16 + 0x08) : -1;
-                var name0   = NativeUtil.IsUserPtr(handler) ? NativeUtil.ReadShortAscii(*(nint*) handler, 32) : "<bad>";
-                var fn0     = NativeUtil.IsUserPtr(handler) ? *(nint*) (handler + 0x30) : 0;
-                logger.LogInformation(
-                    "FieldSubstitution diag: bucket={B} handler=0x{H:X} userPtr={U} rawCount={C} entry0.name=\"{N}\" entry0.fn=0x{F:X} (registry=0x{R:X})",
-                    bucket, handler, NativeUtil.IsUserPtr(handler), rawCount, name0, fn0, _registryAddr);
 
                 if (!NativeUtil.IsUserPtr(handler))
                 {
@@ -1289,7 +1183,6 @@ internal static unsafe class FieldSubstitution
                     }
 
                     map[fn] = type;
-                    logger.LogInformation("FieldSubstitution encoder: bucket={B} name=\"{Name}\" fn=0x{Fn:X} -> {Type}", bucket, name, fn, type);
                 }
             }
 

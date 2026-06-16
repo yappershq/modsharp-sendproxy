@@ -76,9 +76,6 @@ internal static unsafe class UniformEncoderHook
     private static volatile bool _installed;
     private static ILogger?      _logger;
 
-    // DIAG (strip later): field names already logged by the per-field encoder-type diagnostic.
-    private static readonly ConcurrentDictionary<string, byte> _diagFields = new();
-
     private const int MaxSubstituteBytes = 4096;
 
     public static bool HasAny => !_byName.IsEmpty;
@@ -189,20 +186,6 @@ internal static unsafe class UniformEncoderHook
                 var name = NativeUtil.ReadFieldName(fieldInfo);
                 if (name.Length > 0 && _byName.TryGetValue(name, out var sp))
                 {
-                    // DIAG (strip later): log the resolved encoder type per registered field once, so we
-                    // can see exactly what each field classifies as (and a field that never logs is using
-                    // an UNHOOKED/Unsupported encoder).
-                    if (_logger is { } dlog && _diagFields.TryAdd(name, 0))
-                    {
-                        var cnt = NativeUtil.IsUserPtr(valuePtr) ? *(int*) (valuePtr + 0x28) : -1;
-                        var f0  = NativeUtil.IsUserPtr(valuePtr) ? ((float*) valuePtr)[0] : 0f;
-                        var f1  = NativeUtil.IsUserPtr(valuePtr) ? ((float*) valuePtr)[1] : 0f;
-                        var f2  = NativeUtil.IsUserPtr(valuePtr) ? ((float*) valuePtr)[2] : 0f;
-                        dlog.LogInformation(
-                            "UENC-DIAG field=\"{F}\" encFn=0x{Fn:X} type={T} kind={K} struct[+0x28 count={C}, f0={F0}, f1={F1}, f2={F2}]",
-                            name, encFn, entry.Type, sp.Kind, cnt, f0, f1, f2);
-                    }
-
                     var scratch    = stackalloc byte[0x30];
                     var stringSlot = stackalloc nint[1];
 

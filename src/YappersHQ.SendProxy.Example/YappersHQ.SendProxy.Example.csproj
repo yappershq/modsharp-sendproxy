@@ -4,5 +4,6 @@
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="ModSharp.Sharp.Modules.AdminManager.Shared" Version="2.1.123" Private="false" ExcludeAssets="runtime" />
+    <PackageReference Include="ModSharp.Sharp.Modules.TargetingManager.Shared" Version="2.1.123" Private="false" ExcludeAssets="runtime" />
   </ItemGroup>
 </Project>
