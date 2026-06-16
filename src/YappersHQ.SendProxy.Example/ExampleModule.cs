@@ -501,13 +501,27 @@ public sealed class ExampleModule : IModSharpModule
         Reply(issuer, "enc2 (uint b2): m_iTeamNum = 3 (CT) on pawn + controller — all players appear CT (radar/outline + scoreboard)");
     }
 
-    // bucket 3-family float — m_flScale (model scale): every player renders tiny (0.3x) to all clients.
-    // Dramatic + actually rendered from the netvar (server keeps real scale=1, so hitboxes/collision are
-    // unchanged — purely visual). Observe another player or a bot to see it. m_flScale is a networked leaf
-    // (unlike m_vecViewOffset, whose three quantized sub-fields share the bare names m_vecX/Y/Z with
-    // m_vecOrigin — uniform matches by name only, so spoofing it would also teleport everyone — and whose
-    // Z clamps to 0..64). The qangle/coord/quantized encoder itself is proven by the quantized struct-dump.
+    // bucket 3 — qangle — m_angEyeAngles (encoder qangle_precise): flips where every player appears to be
+    // looking. An "others see you" field — your OWN view is client-controlled, so observe another player or
+    // a bot (or spectate) to see it. The b3 family (qangle/coord/quantized) is also proven on the wire by
+    // the quantized struct-dump diag. (m_vecViewOffset can't be uniform-spoofed: its three quantized
+    // sub-fields share the bare names m_vecX/Y/Z with m_vecOrigin, and uniform matches by name only.)
     private void OnEncoder3(IGameClient? issuer, StringCommand command)
+    {
+        if (_sendProxy is not { } sp)
+        {
+            return;
+        }
+
+        sp.SetUniform("CCSPlayerPawn", "m_angEyeAngles", new Vector3(0f, 180f, 0f));
+        ForceResendAll("CCSPlayerPawn", "m_angEyeAngles");
+        Reply(issuer, "enc3 (qangle b3): m_angEyeAngles = (0,180,0) — flips where players look. Observe another player/bot (your own view is client-controlled).");
+    }
+
+    // bucket 4 — float — m_flScale (model scale): every player renders tiny (0.3x) to all clients.
+    // Dramatic + actually rendered from the netvar; server keeps real scale = 1, so hitboxes/collision are
+    // unchanged (purely visual). A networked leaf, so the resend resolves. Observe another player or a bot.
+    private void OnEncoder4(IGameClient? issuer, StringCommand command)
     {
         if (_sendProxy is not { } sp)
         {
@@ -516,25 +530,7 @@ public sealed class ExampleModule : IModSharpModule
 
         sp.SetUniform("CCSPlayerPawn", "m_flScale", 0.3f);
         ForceResendAll("CCSPlayerPawn", "m_flScale");
-        Reply(issuer, "enc3 (float): m_flScale = 0.3 — every player renders tiny to all clients (real size unchanged). Observe another player/bot. sp_encoders_off to clear.");
-    }
-
-    // bucket 4 — float — m_flFlashDuration: every client renders a flash-blind white-out. A genuinely
-    // float-encoded field whose effect is unmistakable (unlike m_flViewmodelFOV, a quantized float that
-    // substitutes correctly on the wire but isn't visibly rendered — own-view + client viewmodel_fov cvar).
-    private void OnEncoder4(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        // Flash render needs both: max alpha (intensity 0..255) AND duration (how long it holds/fades).
-        sp.SetUniform("CCSPlayerPawn", "m_flFlashMaxAlpha", 255f);
-        sp.SetUniform("CCSPlayerPawn", "m_flFlashDuration", 5f);
-        ForceResendAll("CCSPlayerPawn", "m_flFlashMaxAlpha");
-        ForceResendAll("CCSPlayerPawn", "m_flFlashDuration");
-        Reply(issuer, "enc4 (float b4): m_flFlashMaxAlpha=255 + m_flFlashDuration=5 — every client flashed white (visible float). sp_encoders_off to clear.");
+        Reply(issuer, "enc4 (float b4): m_flScale = 0.3 — every player renders tiny to all clients (real size unchanged). Observe another player/bot. sp_encoders_off to clear.");
     }
 
     // bucket 5 — string — m_iszPlayerName: every player shows the same name.
@@ -582,9 +578,8 @@ public sealed class ExampleModule : IModSharpModule
         sp.Unhook("CCSPlayerPawn", "m_iHealth");
         sp.Unhook("CCSPlayerPawn", "m_iTeamNum");
         sp.Unhook("CCSPlayerController", "m_iTeamNum");
+        sp.Unhook("CCSPlayerPawn", "m_angEyeAngles");
         sp.Unhook("CCSPlayerPawn", "m_flScale");
-        sp.Unhook("CCSPlayerPawn", "m_flFlashMaxAlpha");
-        sp.Unhook("CCSPlayerPawn", "m_flFlashDuration");
         sp.Unhook("CCSPlayerController", "m_iszPlayerName");
         sp.Unhook("CCSPlayerPawn", "m_bIsScoped");
         Reply(issuer, "sp_encoders_off: reverted all sp_encoder1..7 demos");
