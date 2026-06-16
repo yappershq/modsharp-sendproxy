@@ -228,6 +228,37 @@ internal static unsafe class UniformEncoderHook
                             return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
                         }
                     }
+                    else if (sp.Kind == ValueKind.Vector && IsVectorScratchType(entry.Type))
+                    {
+                        // The vector family splits in two: qangle/normal/vector3 read 3 bare floats at
+                        // valuePtr+0; coord/coord_integral/quantized read a value STRUCT with a
+                        // component-count/mode at +0x28 and extra float lanes. Writing only 3 floats into a
+                        // bare scratch leaves +0x28 garbage → the struct encoders loop a garbage count and
+                        // corrupt the stream. So copy the REAL value struct (the original valuePtr, which
+                        // carries the correct +0x28 and layout) and patch the leading x/y/z. Correct for the
+                        // 3-float encoders (they read exactly the patched lanes) and safe for the struct
+                        // encoders (count/extra lanes preserved). Falls back to a zeroed scratch if the real
+                        // pointer is unreadable.
+                        if (NativeUtil.IsUserPtr(valuePtr))
+                        {
+                            for (var i = 0; i < 0x30; i++)
+                            {
+                                scratch[i] = *(byte*) (valuePtr + i);
+                            }
+                        }
+                        else
+                        {
+                            for (var i = 0; i < 0x30; i++)
+                            {
+                                scratch[i] = 0;
+                            }
+                        }
+
+                        ((float*) scratch)[0] = sp.Vec.X;
+                        ((float*) scratch)[1] = sp.Vec.Y;
+                        ((float*) scratch)[2] = sp.Vec.Z;
+                        return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
+                    }
                     else if (TryBuildScratch(in sp, entry.Type, scratch, stringSlot, out var fakeValuePtr))
                     {
                         return Invoke(tramp, bf, fieldInfo, paramsPtr, fakeValuePtr, extra);
@@ -290,23 +321,10 @@ internal static unsafe class UniformEncoderHook
 
                 return true;
 
+            // Vector family is handled in SharedHook (it needs the original value struct to preserve the
+            // component-count/mode at +0x28 that coord/coord_integral/quantized read).
             case ValueKind.Vector:
-                switch (targetType)
-                {
-                    case FieldType.QAngle3:
-                    case FieldType.Vector3:
-                    case FieldType.Coord3:
-                    case FieldType.Normal3:
-                    case FieldType.CoordIntegral3:
-                    case FieldType.QuantizedFloat:
-                        ((float*) scratch)[0] = sp.Vec.X;
-                        ((float*) scratch)[1] = sp.Vec.Y;
-                        ((float*) scratch)[2] = sp.Vec.Z;
-
-                        return true;
-                    default:
-                        return false;
-                }
+                return false;
 
             // String / ByteArray are handled in SharedHook (their payload buffer must live in the calling
             // frame because the engine encoder dereferences it after this method would have returned).
@@ -316,6 +334,12 @@ internal static unsafe class UniformEncoderHook
                 return false;
         }
     }
+
+    // The encoder families a Vector spoof can drive — all read their components from valuePtr as floats
+    // (the struct ones also carry a count/mode at +0x28, preserved by copying the real value struct).
+    private static bool IsVectorScratchType(FieldType t)
+        => t is FieldType.QAngle3 or FieldType.Vector3 or FieldType.Coord3
+            or FieldType.Normal3 or FieldType.CoordIntegral3 or FieldType.QuantizedFloat;
 
     private static nint Invoke(nint tramp, nint bf, nint fieldInfo, nint paramsPtr, nint valuePtr, uint extra)
         => ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, uint, nint>) tramp)(bf, fieldInfo, paramsPtr, valuePtr, extra);
