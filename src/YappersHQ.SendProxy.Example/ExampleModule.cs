@@ -501,7 +501,10 @@ public sealed class ExampleModule : IModSharpModule
         Reply(issuer, "enc2 (uint b2): m_iTeamNum = 3 (CT) on pawn + controller — all players appear CT (radar/outline + scoreboard)");
     }
 
-    // bucket 3 — qangle/vector — m_angEyeAngles: every player appears to look backwards.
+    // bucket 3 — vector — m_vecViewOffset: raise every client's own eye/camera height so they look down
+    // on themselves from above. Self-visible even solo (m_angEyeAngles, the other b3 demo, only changes
+    // how OTHERS see your aim — invisible when testing alone). View offset may be client-predicted from
+    // duck state, so this is also a test of whether the spoof wins that fight.
     private void OnEncoder3(IGameClient? issuer, StringCommand command)
     {
         if (_sendProxy is not { } sp)
@@ -509,9 +512,9 @@ public sealed class ExampleModule : IModSharpModule
             return;
         }
 
-        sp.SetUniform("CCSPlayerPawn", "m_angEyeAngles", new Vector3(0f, 180f, 0f));
-        ForceResendAll("CCSPlayerPawn", "m_angEyeAngles");
-        Reply(issuer, "enc3 (qangle b3): CCSPlayerPawn::m_angEyeAngles = (0,180,0) — players look backwards to all clients");
+        sp.SetUniform("CCSPlayerPawn", "m_vecViewOffset", new Vector3(0f, 0f, 150f));
+        ForceResendAll("CCSPlayerPawn", "m_vecViewOffset");
+        Reply(issuer, "enc3 (vector b3): CCSPlayerPawn::m_vecViewOffset = (0,0,150) — camera raised high (visible to you). sp_encoders_off to clear.");
     }
 
     // bucket 4 — float — m_flFlashDuration: every client renders a flash-blind white-out. A genuinely
@@ -577,7 +580,8 @@ public sealed class ExampleModule : IModSharpModule
         sp.Unhook("CCSPlayerPawn", "m_iHealth");
         sp.Unhook("CCSPlayerPawn", "m_iTeamNum");
         sp.Unhook("CCSPlayerController", "m_iTeamNum");
-        sp.Unhook("CCSPlayerPawn", "m_angEyeAngles");
+        sp.Unhook("CCSPlayerPawn", "m_vecViewOffset");
+        sp.Unhook("CCSPlayerPawn", "m_flFlashMaxAlpha");
         sp.Unhook("CCSPlayerPawn", "m_flFlashDuration");
         sp.Unhook("CCSPlayerController", "m_iszPlayerName");
         sp.Unhook("CCSPlayerPawn", "m_bIsScoped");
