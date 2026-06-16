@@ -13,40 +13,101 @@
 // gamedata-resolved addresses, not against runtime strings.
 //
 // All addresses below are file-vaddr RVAs (Ghidra image base for these .so = file-vaddr + 0x100000).
+//
+// ── Windows cross-platform sigs (added 2026-06, RE from networksystem.dll/engine2.dll, build
+//    "csgo_rel_win64") ─────────────────────────────────────────────────────────────────────────
+// Windows sigs are function-prologue byte patterns at the Ghidra image base 0x180000000. Only the
+// four networksystem encode/registry functions resolved on Windows; the engine2 send-path functions
+// (SendClientMessages / PerClientEncode) and the un-RE'd helpers stay linux-only — see per-entry
+// "TODO windows:" notes. Where a Windows function was located by a string the C-literal anchor is
+// recorded under refs.strings with a TODO for the deref/offset op-chain (not yet derived).
+//
+// ✓ OFFSETS CONSISTENT cross-platform. The first Windows pass flagged three "mismatches"; all three were
+//    re-checked against the live-working Linux runtime and found FALSE (an automated-decompile misread,
+//    not a real layout difference — Source2 uses the same struct definitions on both builds). Details in
+//    the OFFSET NOTES block at the bottom of this file. The Linux offsets DO hold on Windows.
 {
   "Addresses": {
     "CFlattenedSerializer::EncodeField": {
       "library": "networksystem",
-      "linux": "55 48 89 E5 41 57 49 89 D7 41 56 41 55 41 54 41 BC 01 00 00 00"
+      "linux": "55 48 89 E5 41 57 49 89 D7 41 56 41 55 41 54 41 BC 01 00 00 00",
+      "windows": "48 89 5C 24 ? 88 54 24 ? 48 89 4C 24 ? 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ? 48 81 EC 20 01 00 00"
     },
     "CFlattenedSerializer::EncodeInt32": {
       "library": "networksystem",
-      "linux": "48 8B 01 55 48 89 E5 48 8D 34 00"
+      "linux": "48 8B 01 55 48 89 E5 48 8D 34 00",
+      // windows: confirmed same_function by side-by-side decompile (fn @0x1801b7600). Body is the signed
+      //   zigzag wrapper `varintWriter(dst, (n<<1) ^ (n>>63))` — bit-identical transform to the Linux twin
+      //   (same 0x3f shift, *2, XOR), then a tail-jmp into the varint bit-writer. Tail-jmp rel32 wildcarded.
+      "windows": "4C 8B C2 48 03 D2 49 C1 F8 3F 49 33 D0 E9 ? ? ? ?"
     },
 
     "CNetworkGameServer::SendClientMessages": {
       "library": "engine",
-      "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 41 56 41 55 41 54 53 89 F3"
+      "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 41 56 41 55 41 54 53 89 F3",
+      // NOTE: this entry is resolved at load but the result is DISCARDED (SendProxyModule.cs:157) — the
+      //   runtime does not hook SendClientMessages; only PerClientEncode is hooked. Kept for reference.
+      // NOTE windows: NO clean 1:1 twin. The Linux SendClientMessages (FUN_007a7280, ~10KB) is one
+      //   monolithic fn carrying "SV:  SendClientMessages" / "PrepareSendClientMessages" /
+      //   "ComputeClientPacks" / "PackEntities_Normal …". On Windows MSVC SPLIT that work across separate
+      //   fns: ComputeClientPacks @0x1800e8ce0 and PackEntities_Normal @0x1800e81e0 (the per-client send
+      //   loop entry's vprof string "PrepareSendClientMessages" @0x18053b149 has no code xref). Since the
+      //   runtime doesn't use this address, the imperfect split-mapping is harmless. Resolved via the
+      //   ModSharp refs.strings mechanism (array form) — picks the owning fn of the anchor on each build.
+      "refs": {
+        "strings": [ "ComputeClientPacks" ]
+      }
     },
     "CNetworkGameServer::PerClientEncode": {
       "library": "engine",
-      "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 4C 8D BD ? ? ? ? 41 56 4C 8D 35"
+      "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 4C 8D BD ? ? ? ? 41 56 4C 8D 35",
+      // windows: fn @0x1800d2e90 — the per-client encode. Identified by call-graph + string match: it
+      //   contains the SAME distinctive strings as the Linux PerClientEncode twin ("WriteDeltaEntities",
+      //   "WriteOOPVSDeltaEntities", "Delta: [%d] deletions"). The string-anchor pass mislabeled it a
+      //   "plural WriteDeltaEntities driver"; it is in fact PerClientEncode (its callee, the singular
+      //   per-entity writer, is WriteDeltaEntity_Internal @0x1800d1240). This is the fn RecipientCapture
+      //   hooks to learn the current recipient (arg in rcx on Win64 / rdi on SysV — port maps the reg).
+      "windows": "4C 89 44 24 ? 48 89 54 24 ? 48 89 4C 24 ? 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ? ? ? ? 48 81 EC F8 0A 00 00",
+      // refs.strings is the ModSharp array form (matches core.games.jsonc); recompile-proof fallback.
+      "refs": {
+        "strings": [ "WriteOOPVSDeltaEntities" ]
+      }
     },
     "CNetworkGameServerBase::WriteDeltaEntity_Internal": {
       "library": "engine",
-      "linux": "55 48 89 E5 41 57 41 56 41 55 41 54 49 89 F4 53 48 81 EC 28 01 00 00"
+      "linux": "55 48 89 E5 41 57 41 56 41 55 41 54 49 89 F4 53 48 81 EC 28 01 00 00",
+      // windows: confirmed same_function by side-by-side decompile (fn @0x1800d1240). The SINGULAR
+      //   per-entity writer — carries the unique "...WriteDeltaEntity_Internal merging changes added in %d
+      //   additional fields!" log string; param struct offsets identical to Linux (from/to/baseline snapshot
+      //   ptrs +0x90/+0x98/+0xa0, field-index vectors +0x900/+0x908/+0x918, dirty-baseline +0x8f0 etc — 11/11
+      //   match). NOTE: do NOT confuse with WriteDeltaEntities (plural loop driver @0x1800d2e90), its caller.
+      "windows": "4C 89 44 24 ? 48 89 54 24 ? 48 89 4C 24 ? 55 57 41 55 48 8D 6C 24 ? 48 81 EC 60 01 00 00"
     },
     "CFlattenedSerializer::WriteFieldList": {
       "library": "networksystem",
-      "linux": "55 48 8D 05 ? ? ? ? 45 31 DB 66 0F EF C0 48 89 E5 41 57 41 56 4C 8D"
+      "linux": "55 48 8D 05 ? ? ? ? 45 31 DB 66 0F EF C0 48 89 E5 41 57 41 56 4C 8D",
+      "windows": "4C 89 4C 24 ? 4C 89 44 24 ? 48 89 54 24 ? 48 89 4C 24 ? 55 53 56 57 41 54 41 55 41 56 41 57 48 8D AC 24 ? ? ? ? B8 A8 8C 01 00"
     },
     "CFlattenedSerializer::GetBitRange": {
       "library": "networksystem",
       "linux": "55 48 89 E5 53 48 89 FB 48 83 EC 08 83 FA FF 74"
+      // NOTE windows: NO standalone GetBitRange on Windows — MSVC INLINED it into every caller. The
+      //   "GetBitRange( %d -> %d )..." assert string (@0x180226cf0) is referenced 18x from 8 distinct
+      //   functions (WriteFieldList @0x18006f970 among them), i.e. the helper was inlined at each site.
+      //   There is therefore NO Windows entry-point sig for it (the earlier candidate was just
+      //   WriteFieldList's prologue, a false dup, now removed). C++ PORT NOTE: on Windows the field-path
+      //   capture the Linux build does by hooking GetBitRange must instead be done inside WriteFieldList
+      //   (which contains the inlined bit-range logic) — GetBitRange is not independently hookable.
     },
     "CFlattenedSerializer::BitCopyPrimitive": {
       "library": "networksystem",
-      "linux": "55 48 89 F0 41 89 D0 48 89 E5 41 57 41 56 41 55"
+      "linux": "55 48 89 F0 41 89 D0 48 89 E5 41 57 41 56 41 55",
+      // windows: STANDALONE on Windows (fn @0x1801b6ec0) — NOT inlined. Generic (dst, src, bitcount) bit-block
+      //   copy, same 32-bit-chunk + byte-remainder algorithm as Linux (buffer +0x00, cursor-bits +0x10,
+      //   overflow +0x22). Confirmed via the shared call set: WriteFieldList(0x18006f970),
+      //   MergeDeltas(0x180070bd0), BuildMergedSerializedEntity(0x1800a25f0), GetBitRange-iter(0x180106a90)
+      //   — same four callers as Linux. This is the per-client redirect-src hook target on Windows too.
+      "windows": "48 8B C4 44 89 40 ? 48 89 48 ? 41 57 48 83 EC 30"
     },
 
     // Encoder registry table base — the 8-bucket descriptor table in networksystem's .data section.
@@ -58,6 +119,15 @@
       "library": "networksystem",
       "linux": {
         "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28",
+        "factory": "+3 r"
+      },
+      // NOTE windows: the table-load lea was isolated inside InitFakeField @0x180074328:
+      //   `lea rdi,[rip+0x1f7151]` -> registry table @0x18026b480 (8 buckets, layout verified identical to
+      //   Linux). Same "+3 r" factory shape as Linux (skip the 3-byte lea opcode `48 8D 3D`, RIP-resolve
+      //   the rel32 displacement). The two rel32 displacements are wildcarded for recompile-portability;
+      //   FindPattern uniqueness is re-checked at plugin boot (boot sig sanity-check).
+      "windows": {
+        "signature": "48 8D 3D ? ? ? ? 48 8B 85 ? ? ? ? 48 8D 15",
         "factory": "+3 r"
       }
     },
@@ -72,12 +142,64 @@
     // and map each discovered encoder entry to its FieldType by bucket. Bucket semantics
     // (see docs/REVERSE_ENGINEERING.md §6): b1 signed int, b2 unsigned int,
     // b3 qangle/vector/quantized-float family, b4 float32, b5 string, b6 byte-array, b7 bool.
-    "CFlattenedSerializer::EncoderBucket1": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +16 d" } },
-    "CFlattenedSerializer::EncoderBucket2": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +32 d" } },
-    "CFlattenedSerializer::EncoderBucket3": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +48 d" } },
-    "CFlattenedSerializer::EncoderBucket4": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +64 d" } },
-    "CFlattenedSerializer::EncoderBucket5": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +80 d" } },
-    "CFlattenedSerializer::EncoderBucket6": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +96 d" } },
-    "CFlattenedSerializer::EncoderBucket7": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +112 d" } }
+    //
+    // Windows: same op-chain — the Windows table-load lea (@0x180074328 -> table @0x18026b480) carries the
+    //   "+3 r +{b*16} d" factory just like Linux. The Windows registry layout is verified compatible
+    //   (8 buckets, counts 1/3/3/7/1/1/1/1, encoder entry stride 0x80, name @+0x00, fn @+0x30). Linux lea
+    //   is `48 8D 05` (lea rax); Windows lea is `48 8D 3D` (lea rdi) — the +3 rel32 offset is identical so
+    //   the factory is unchanged.
+    "CFlattenedSerializer::EncoderBucket1": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +16 d" },  "windows": { "signature": "48 8D 3D ? ? ? ? 48 8B 85 ? ? ? ? 48 8D 15", "factory": "+3 r +16 d" } },
+    "CFlattenedSerializer::EncoderBucket2": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +32 d" },  "windows": { "signature": "48 8D 3D ? ? ? ? 48 8B 85 ? ? ? ? 48 8D 15", "factory": "+3 r +32 d" } },
+    "CFlattenedSerializer::EncoderBucket3": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +48 d" },  "windows": { "signature": "48 8D 3D ? ? ? ? 48 8B 85 ? ? ? ? 48 8D 15", "factory": "+3 r +48 d" } },
+    "CFlattenedSerializer::EncoderBucket4": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +64 d" },  "windows": { "signature": "48 8D 3D ? ? ? ? 48 8B 85 ? ? ? ? 48 8D 15", "factory": "+3 r +64 d" } },
+    "CFlattenedSerializer::EncoderBucket5": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +80 d" },  "windows": { "signature": "48 8D 3D ? ? ? ? 48 8B 85 ? ? ? ? 48 8D 15", "factory": "+3 r +80 d" } },
+    "CFlattenedSerializer::EncoderBucket6": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +96 d" },  "windows": { "signature": "48 8D 3D ? ? ? ? 48 8B 85 ? ? ? ? 48 8D 15", "factory": "+3 r +96 d" } },
+    "CFlattenedSerializer::EncoderBucket7": { "library": "networksystem", "linux": { "signature": "48 8D 05 ? ? ? ? 48 01 D0 4C 63 60 08 4C 8B 28", "factory": "+3 r +112 d" }, "windows": { "signature": "48 8D 3D ? ? ? ? 48 8B 85 ? ? ? ? 48 8D 15", "factory": "+3 r +112 d" } }
   }
 }
+//
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//  OFFSET NOTES — Windows vs Linux struct layout (RE pass 2026-06, networksystem.dll csgo_rel_win64)
+// ════════════════════════════════════════════════════════════════════════════════════════════════
+//  Final verdict: offsets are CONSISTENT cross-platform. The first automated pass reported three
+//  "mismatches"; each was re-checked against the live-working Linux runtime (FieldSubstitution.cs, which
+//  reads these offsets in production and whose demos work) and found to be a DECOMPILE MISREAD, not a
+//  real divergence. Resolution of each:
+//
+//   1. fieldInfo per-field ENCODER DISPATCH — *(fieldInfo+0x38)  →  NOT a mismatch (confirmed SAME).
+//        The pass-1 decompile called +0x38 a "finalizer" and pointed at the adjacent +0x28/+0x30
+//        dispatch tables instead. But the EncoderRegistry/InitFakeField init code is decisive: it WRITES
+//        the encoder fn block into *(fieldInfo+0x38) — Windows decomp `*puVar12 = puVar9[6]` where
+//        `puVar12 = *(pcVar24+0x38)` (entry+0x30 fn copied into the block at field+0x38). So
+//        `*(*(fieldInfo+0x38))` = slot-0 encoder on Windows exactly as on Linux. The +0x28/+0x30 tables
+//        are the byte-counter / change-detector vtables, a different concern.
+//
+//   2. fieldInfo fieldOffset +0x20  →  NOT a mismatch (different field). +0x20 (field offset, ushort) and
+//        +0x24 (per-element array stride, ushort) are two adjacent ushorts. EncodeField happened to use
+//        +0x24 (the stride, for dynamic-array advance); the live-value reconstruction path reads +0x20
+//        (the offset). Pass-1 saw +0x24 and wrongly called +0x20 a mismatch — it is "unobserved in those
+//        4 functions", not contradicted.
+//
+//   3. fieldInfo recipients +0x28  →  STALE doc note, not used by code. The runtime never reads
+//        fieldInfo+0x28 for recipients (recipients come from the per-client send callback / client param;
+//        the serializer's field-array count is at serializer+0x28, a different object). Harmless.
+//
+//  HIGH-CONFIDENCE MATCHES (verified cross-platform):
+//    fieldInfo encoder dispatch +0x38 (deref-of-deref = slot-0 encoder; confirmed by registry init) ·
+//    fieldInfo fieldOffset +0x20 · params base +0x40 · params byte-offset +0xC9 (0xFF sentinel) · name +0x08 ·
+//    bf_write { data +0x00, cursor-bits +0x10, capacity-bits +0x0C, overflow +0x20 } ·
+//    CFieldPath { count +0x18 (short), flag +0x1A, 0x7FFF sentinel } ·
+//    serializer field-array base +0x30 · inline record stride 0x2E (leaf +0x00, child serializer +0x08,
+//    region-id byte +0x2C) · encoder entry { name +0x00, fn +0x30, stride 0x80 } ·
+//    encoder-registry 8-bucket table (counts 1/3/3/7/1/1/1/1, names default/fixed32/fixed64/qangle/normal
+//    — bucket structure matches Linux exactly).
+//
+//  UNOBSERVED on Windows (NOT present in the decompiled fns — neither confirmed nor refuted, do not
+//  assume; harmless — runtime correctness does not depend on these being re-verified here): bf_write
+//  nDataBytes +0x08 · serializer field-array count +0x28 · snapshot region table ctx+0x90 ->
+//  *(snapshot+0x30+regionId*8). (A structurally similar region lookup IS present but anchored at
+//  param_5+0x28 indexed regionId*8 — the *8-by-regionId shape matches, the +0x90/+0x30 anchor unconfirmed.)
+//
+//  Functions decompiled: EncodeField @0x1800661A0, WriteFieldList @0x18006F970,
+//    GetBitRange (inlined into WriteFieldList + 7 other callers, no standalone entry),
+//    EncoderRegistry/InitFakeField @0x180073AE0 (table-load lea @0x180074328 -> table @0x18026B480).

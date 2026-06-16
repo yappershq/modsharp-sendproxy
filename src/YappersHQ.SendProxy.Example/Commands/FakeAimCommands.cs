@@ -20,9 +20,11 @@
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using Microsoft.Extensions.Logging;
 using Sharp.Modules.AdminManager.Shared;
 using Sharp.Modules.TargetingManager.Shared;
 using Sharp.Shared.Enums;
+using Sharp.Shared.GameEntities;
 using Sharp.Shared.Objects;
 using Sharp.Shared.Types;
 using Sharp.Shared.Units;
@@ -109,8 +111,8 @@ internal sealed class FakeAimCommands : ISpCommandCategory
             _aimControllers.Add((int) ctrl.Index);
             sp.Hook(ctrl, "CCSPlayerController", "m_iPawnHealth", (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 1; return true; });
             sp.Hook(ctrl, "CCSPlayerController", "m_iTeamNum",    (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
-            ctrl.NetworkStateChanged("m_iPawnHealth");   // force an initial re-send so it shows at once
-            ctrl.NetworkStateChanged("m_iTeamNum");
+            SafeDirty(ctrl, "m_iPawnHealth");   // force an initial re-send so it shows at once
+            SafeDirty(ctrl, "m_iTeamNum");
 
             if (ctrl.GetPlayerPawn() is { } pawn)
             {
@@ -118,15 +120,16 @@ internal sealed class FakeAimCommands : ISpCommandCategory
                 sp.Hook(pawn, "CCSPlayerPawn", "m_iHealth",          (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 1; return true; });
                 sp.Hook(pawn, "CCSPlayerPawn", "m_iTeamNum",         (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
                 sp.Hook(pawn, "CCSPlayerPawn", "m_clrRender",        (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = unchecked((int) _aimColor); return true; });
-                // Glow: enable a coloured outline (m_iGlowType nonzero) tinted by the same cycling colour.
-                // Both are nested under m_Glow; best-effort (enable mechanics / color-encoder may vary).
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iGlowType",        (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
+                // Glow: a coloured outline. The fields live on the EMBEDDED CGlowProperty (m_Glow), not on
+                // the pawn class — so the per-client hook matches by leaf name but the force-dirty goes
+                // through the parent m_Glow + sub-offset (see ReDirtyPawn). Full enable set (mirrors the
+                // known glow recipe: type=3, team=-1 all-see, wide range): type/team/range/rangemin/colour.
+                sp.Hook(pawn, "CCSPlayerPawn", "m_iGlowType",         (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_iGlowTeam",         (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = -1; return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_nGlowRange",        (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 99999; return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_nGlowRangeMin",     (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 0; return true; });
                 sp.Hook(pawn, "CCSPlayerPawn", "m_glowColorOverride", (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = unchecked((int) _aimColor); return true; });
-                pawn.NetworkStateChanged("m_iHealth");
-                pawn.NetworkStateChanged("m_iTeamNum");
-                pawn.NetworkStateChanged("m_clrRender");
-                pawn.NetworkStateChanged("m_iGlowType");
-                pawn.NetworkStateChanged("m_glowColorOverride");
+                ReDirtyPawn(pawn);
             }
         }
 
@@ -147,7 +150,59 @@ internal sealed class FakeAimCommands : ISpCommandCategory
         _ctx.Reply(issuer, "sp_fakeaim_off: cleared (real values re-sent)");
     }
 
-    // Timer tick: advance the cycling colour and re-dirty m_clrRender on every target so it re-transmits.
+    // CGlowProperty sub-field offsets within the embedded m_Glow. NOT hardcoded — resolved from the live
+    // schema at first use (offsets shift across CS2 updates, so reading them at runtime is recompile-proof).
+    // These are offsets WITHIN CGlowProperty; the force-dirty applies them as extraOffset on top of m_Glow.
+    private ushort _glowTypeOffset, _glowTeamOffset, _glowRangeOffset, _glowRangeMinOffset, _glowColorOffset;
+    private bool   _glowOffsetsResolved;
+
+    private void EnsureGlowOffsets()
+    {
+        if (_glowOffsetsResolved)
+        {
+            return;
+        }
+
+        _glowTypeOffset     = (ushort) _ctx.Schema.GetNetVarOffset("CGlowProperty", "m_iGlowType");
+        _glowTeamOffset     = (ushort) _ctx.Schema.GetNetVarOffset("CGlowProperty", "m_iGlowTeam");
+        _glowRangeOffset    = (ushort) _ctx.Schema.GetNetVarOffset("CGlowProperty", "m_nGlowRange");
+        _glowRangeMinOffset = (ushort) _ctx.Schema.GetNetVarOffset("CGlowProperty", "m_nGlowRangeMin");
+        _glowColorOffset    = (ushort) _ctx.Schema.GetNetVarOffset("CGlowProperty", "m_glowColorOverride");
+        _glowOffsetsResolved = true;
+    }
+
+    // Force a field to re-transmit without changing its real value, guarded so a name that isn't a
+    // netvar on this class can never abort the command (the embedded glow fields are the reason —
+    // they're not direct pawn netvars).
+    private void SafeDirty(IBaseEntity entity, string field, ushort extraOffset = 0)
+    {
+        try
+        {
+            entity.NetworkStateChanged(field, false, extraOffset);
+        }
+        catch (Exception e)
+        {
+            _ctx.Logger.LogWarning("sp_fakeaim: NetworkStateChanged({Field},+{Off}) failed: {Msg}", field, extraOffset, e.Message);
+        }
+    }
+
+    // Re-dirty all spoofed fields on a target pawn so they re-transmit at once. Glow lives on the
+    // embedded m_Glow (CGlowProperty), so it's dirtied through the parent field + the sub-field offset.
+    private void ReDirtyPawn(IBaseEntity pawn)
+    {
+        EnsureGlowOffsets();
+        SafeDirty(pawn, "m_iHealth");
+        SafeDirty(pawn, "m_iTeamNum");
+        SafeDirty(pawn, "m_clrRender");
+        SafeDirty(pawn, "m_Glow", _glowTypeOffset);
+        SafeDirty(pawn, "m_Glow", _glowTeamOffset);
+        SafeDirty(pawn, "m_Glow", _glowRangeOffset);
+        SafeDirty(pawn, "m_Glow", _glowRangeMinOffset);
+        SafeDirty(pawn, "m_Glow", _glowColorOffset);
+    }
+
+    // Timer tick: advance the cycling colour and re-dirty the colour/glow on every target so they
+    // re-transmit (the per-client hooks then write the new colour).
     private void CycleFakeAim()
     {
         _aimHue   = (_aimHue + 15) % 360;
@@ -157,8 +212,8 @@ internal sealed class FakeAimCommands : ISpCommandCategory
         {
             if (_ctx.EntityManager.FindEntityByIndex((EntityIndex) pidx) is { } pawn)
             {
-                pawn.NetworkStateChanged("m_clrRender");
-                pawn.NetworkStateChanged("m_glowColorOverride");
+                SafeDirty(pawn, "m_clrRender");
+                SafeDirty(pawn, "m_Glow", _glowColorOffset);
             }
         }
     }
@@ -182,8 +237,8 @@ internal sealed class FakeAimCommands : ISpCommandCategory
 
             sp.Unhook(ctrl, "CCSPlayerController", "m_iPawnHealth");
             sp.Unhook(ctrl, "CCSPlayerController", "m_iTeamNum");
-            ctrl.NetworkStateChanged("m_iPawnHealth");
-            ctrl.NetworkStateChanged("m_iTeamNum");
+            SafeDirty(ctrl, "m_iPawnHealth");
+            SafeDirty(ctrl, "m_iTeamNum");
         }
 
         foreach (var pidx in _aimPawns)
@@ -197,12 +252,11 @@ internal sealed class FakeAimCommands : ISpCommandCategory
             sp.Unhook(pawn, "CCSPlayerPawn", "m_iTeamNum");
             sp.Unhook(pawn, "CCSPlayerPawn", "m_clrRender");
             sp.Unhook(pawn, "CCSPlayerPawn", "m_iGlowType");
+            sp.Unhook(pawn, "CCSPlayerPawn", "m_iGlowTeam");
+            sp.Unhook(pawn, "CCSPlayerPawn", "m_nGlowRange");
+            sp.Unhook(pawn, "CCSPlayerPawn", "m_nGlowRangeMin");
             sp.Unhook(pawn, "CCSPlayerPawn", "m_glowColorOverride");
-            pawn.NetworkStateChanged("m_iHealth");
-            pawn.NetworkStateChanged("m_iTeamNum");
-            pawn.NetworkStateChanged("m_clrRender");
-            pawn.NetworkStateChanged("m_iGlowType");
-            pawn.NetworkStateChanged("m_glowColorOverride");
+            ReDirtyPawn(pawn);
         }
 
         _aimControllers.Clear();

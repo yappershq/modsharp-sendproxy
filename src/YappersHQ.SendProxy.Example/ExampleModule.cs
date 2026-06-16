@@ -71,6 +71,7 @@ public sealed class ExampleModule : IModSharpModule
             sharedSystem.GetEntityManager(),
             sharedSystem.GetClientManager(),
             sharedSystem.GetModSharp(),
+            sharedSystem.GetSchemaManager(),
             _logger);
     }
 

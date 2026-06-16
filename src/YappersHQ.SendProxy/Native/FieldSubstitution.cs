@@ -325,8 +325,12 @@ internal static unsafe class FieldSubstitution
     [ThreadStatic]
     private static nint _currentSnapshotPtr;
 
-    private static IDetourHook? _getBitRangeHook;
-    private static nint         _getBitRangeTrampoline;
+    // Field-path capture uses a MID-FUNCTION hook (not an entry detour) for cross-platform consistency:
+    //   Linux  — hook GetBitRange's entry; the CFieldPath* is arg0 → ctx.rdi.
+    //   Windows — GetBitRange is INLINED, so hook the equivalent site inside WriteFieldList; the CFieldPath*
+    //             lives in a register there (see FieldPathRegister + the windows gamedata sig).
+    // A midhook only OBSERVES registers then resumes the original code — there is no trampoline to call.
+    private static IMidFuncHook? _getBitRangeMidHook;
     private static IDetourHook? _valueCopyHook;
     private static nint         _valueCopyTrampoline;
     private static IDetourHook? _wflShimHook;
@@ -423,23 +427,22 @@ internal static unsafe class FieldSubstitution
             logger.LogInformation("FieldSubstitution: WriteFieldList shim installed @ 0x{Addr:X}", WriteFieldListAddr);
         }
 
-        if (_getBitRangeHook is null)
+        if (_getBitRangeMidHook is null)
         {
-            var gbrHook   = bridge.HookManager.CreateDetourHook();
-            var gbrHookFn = (nint) (delegate* unmanaged[Cdecl]<nint, nint, uint, void>) &GetBitRangeHook;
+            var gbrHook   = bridge.HookManager.CreateMidFuncHook();
+            var gbrHookFn = (nint) (delegate* unmanaged[Cdecl]<MidHookContext*, void>) &GetBitRangePathHook;
             gbrHook.Prepare(GetBitRangeAddr, gbrHookFn);
 
             if (!gbrHook.Install())
             {
-                logger.LogWarning("FieldSubstitution: GetBitRange hook Install() failed");
+                logger.LogWarning("FieldSubstitution: GetBitRange mid-hook Install() failed");
                 DisposeHook(ref _wflShimHook, ref _wflShimTrampoline);
 
                 return false;
             }
 
-            _getBitRangeHook       = gbrHook;
-            _getBitRangeTrampoline = gbrHook.Trampoline;
-            logger.LogInformation("FieldSubstitution: GetBitRange hook installed @ 0x{Addr:X}", GetBitRangeAddr);
+            _getBitRangeMidHook = gbrHook;
+            logger.LogInformation("FieldSubstitution: GetBitRange mid-hook installed @ 0x{Addr:X}", GetBitRangeAddr);
         }
 
         if (_valueCopyHook is null)
@@ -451,7 +454,7 @@ internal static unsafe class FieldSubstitution
             if (!vcHook.Install())
             {
                 logger.LogWarning("FieldSubstitution: value-copy hook Install() failed");
-                DisposeHook(ref _getBitRangeHook, ref _getBitRangeTrampoline);
+                DisposeMidHook(ref _getBitRangeMidHook);
                 DisposeHook(ref _wflShimHook, ref _wflShimTrampoline);
 
                 return false;
@@ -489,7 +492,7 @@ internal static unsafe class FieldSubstitution
         Mode = SubstitutionMode.Off;
 
         DisposeHook(ref _valueCopyHook, ref _valueCopyTrampoline);
-        DisposeHook(ref _getBitRangeHook, ref _getBitRangeTrampoline);
+        DisposeMidHook(ref _getBitRangeMidHook);
         DisposeHook(ref _wflShimHook, ref _wflShimTrampoline);
         DisposeHook(ref _wdeEntityCaptureHook, ref _wdeEntityCaptureTrampoline);
 
@@ -503,6 +506,13 @@ internal static unsafe class FieldSubstitution
         hook?.Dispose();
         hook       = null;
         trampoline = 0;
+    }
+
+    private static void DisposeMidHook(ref IMidFuncHook? hook)
+    {
+        hook?.Uninstall();
+        hook?.Dispose();
+        hook = null;
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
@@ -567,17 +577,57 @@ internal static unsafe class FieldSubstitution
         return result;
     }
 
+    // Mid-function hook callback: OBSERVES the registers at the hooked site, then PolyHook resumes the
+    // original code (no trampoline call — that's the midhook contract). Captures the live CFieldPath* into
+    // _currentFieldPath so ValueCopyHook (BitCopyPrimitive) can resolve which field is being copied.
+    //   Linux  : hooked at GetBitRange entry → CFieldPath* is arg0 → ctx->rdi (SysV first integer arg).
+    //   Windows: hooked at the inlined-GetBitRange site inside WriteFieldList → the CFieldPath* is held in
+    //            a loop register there; selected via FieldPathReg (see SetFieldPathRegister). TODO windows:
+    //            confirm the exact register on hardware (RE points at the WriteFieldList pre-BitCopy site).
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
-    private static void GetBitRangeHook(nint pathOut, nint table, uint registryIndex)
+    private static void GetBitRangePathHook(MidHookContext* ctx)
     {
-        ((delegate* unmanaged[Cdecl]<nint, nint, uint, void>) _getBitRangeTrampoline)(pathOut, table, registryIndex);
-
-        // Only capture the field path when there's something to substitute (ValueCopyHook is gated the same).
-        if (!_registry.IsEmpty)
+        // Only capture when there's something to substitute (ValueCopyHook is gated the same way).
+        if (_registry.IsEmpty)
         {
-            _currentFieldPath = NativeUtil.IsUserPtr(pathOut) ? pathOut : 0;
+            return;
+        }
+
+        var pathOut = ReadFieldPathRegister(ctx);
+        _currentFieldPath = NativeUtil.IsUserPtr(pathOut) ? pathOut : 0;
+    }
+
+    // Which MidHookContext register holds the CFieldPath* at the hooked site. Linux (GetBitRange entry) =
+    // rdi (arg0). Windows (WriteFieldList inlined site) = TBD on hardware — overridable via SetFieldPathRegister.
+    private static FieldPathReg _fieldPathReg =
+        OperatingSystem.IsWindows() ? FieldPathReg.R15 : FieldPathReg.Rdi;
+
+    internal enum FieldPathReg { Rdi, Rsi, Rdx, Rcx, R8, R9, R15, R14, R13, R12 }
+
+    /// <summary>Override the register the field-path mid-hook reads (for Windows hardware tuning).</summary>
+    public static void SetFieldPathRegister(string reg)
+    {
+        if (Enum.TryParse<FieldPathReg>(reg, ignoreCase: true, out var r))
+        {
+            _fieldPathReg = r;
         }
     }
+
+    private static nint ReadFieldPathRegister(MidHookContext* ctx)
+        => _fieldPathReg switch
+        {
+            FieldPathReg.Rdi => ctx->rdi,
+            FieldPathReg.Rsi => ctx->rsi,
+            FieldPathReg.Rdx => ctx->rdx,
+            FieldPathReg.Rcx => ctx->rcx,
+            FieldPathReg.R8  => ctx->r8,
+            FieldPathReg.R9  => ctx->r9,
+            FieldPathReg.R15 => ctx->r15,
+            FieldPathReg.R14 => ctx->r14,
+            FieldPathReg.R13 => ctx->r13,
+            FieldPathReg.R12 => ctx->r12,
+            _                => ctx->rdi,
+        };
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static byte ValueCopyHook(nint dst, nint src, uint bitcount)

@@ -44,6 +44,7 @@ internal sealed class ExampleContext
     public IEntityManager                              EntityManager { get; }
     public IClientManager                              ClientManager { get; }
     public IModSharp                                   ModSharp      { get; }
+    public ISchemaManager                              Schema        { get; }
     public IModSharpModuleInterface<ITargetingManager>? Targeting    { get; set; }
     public ILogger                                     Logger        { get; }
 
@@ -51,11 +52,13 @@ internal sealed class ExampleContext
         IEntityManager entityManager,
         IClientManager clientManager,
         IModSharp      modSharp,
+        ISchemaManager schema,
         ILogger        logger)
     {
         EntityManager = entityManager;
         ClientManager = clientManager;
         ModSharp      = modSharp;
+        Schema        = schema;
         Logger        = logger;
     }
 
