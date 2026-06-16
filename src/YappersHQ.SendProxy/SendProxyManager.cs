@@ -21,6 +21,7 @@ using System;
 using System.Numerics;
 using Microsoft.Extensions.Logging;
 using Sharp.Shared.GameEntities;
+using Sharp.Shared.Objects;
 using YappersHQ.SendProxy.Native;
 using YappersHQ.SendProxy.Shared;
 
@@ -320,6 +321,86 @@ internal sealed class SendProxyManager : ISendProxyManager
         FieldSubstitution.SetEntitySpoof(idx, serializerName, fieldName, value);
         FieldSubstitution.Mode = SubstitutionMode.Fake;
         _logger.LogInformation("SendProxy: uniform bytes spoof ent={Ent} \"{Ser}::{Field}\" ({Len} bytes)", idx, serializerName, fieldName, value.Length);
+    }
+
+    // -- SendFake (one-shot push to a single client) ----------------------------------------------
+
+    // Register a one-shot entity-scoped substitution bound to this client, then force the field dirty so
+    // the engine re-transmits it on the next snapshot (NetworkStateChanged sets the per-field dirty bit,
+    // which drives the entity into the change-list regardless of whether the real value changed). The
+    // substitution fires once for that client and self-removes; other clients pass through untouched.
+    private bool BeginSendFake(IGameClient? client, IBaseEntity? entity, string serializerName, string fieldName, out int idx, out nint clientPtr)
+    {
+        idx       = -1;
+        clientPtr = 0;
+        if (client is null || entity is null || string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName))
+        {
+            return false;
+        }
+
+        if (!EnsureDetours($"SendFake(\"{serializerName}::{fieldName}\")"))
+        {
+            return false;
+        }
+
+        idx       = (int) entity.Index;
+        clientPtr = client.GetAbsPtr();
+
+        return clientPtr != 0;
+    }
+
+    public void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, int value)
+    {
+        if (!BeginSendFake(client, entity, serializerName, fieldName, out var idx, out var clientPtr)) return;
+        FieldSubstitution.SetOneShot(idx, serializerName, fieldName, clientPtr, value);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+        entity.NetworkStateChanged(fieldName);
+        _logger.LogInformation("SendProxy: one-shot int fake ent={Ent} client=0x{C:X} \"{Ser}::{Field}\" → {Value}", idx, clientPtr, serializerName, fieldName, value);
+    }
+
+    public void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, float value)
+    {
+        if (!BeginSendFake(client, entity, serializerName, fieldName, out var idx, out var clientPtr)) return;
+        FieldSubstitution.SetOneShot(idx, serializerName, fieldName, clientPtr, BitConverter.SingleToInt32Bits(value));
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+        entity.NetworkStateChanged(fieldName);
+        _logger.LogInformation("SendProxy: one-shot float fake ent={Ent} client=0x{C:X} \"{Ser}::{Field}\" → {Value}", idx, clientPtr, serializerName, fieldName, value);
+    }
+
+    public void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, bool value)
+    {
+        if (!BeginSendFake(client, entity, serializerName, fieldName, out var idx, out var clientPtr)) return;
+        FieldSubstitution.SetOneShot(idx, serializerName, fieldName, clientPtr, value ? 1 : 0);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+        entity.NetworkStateChanged(fieldName);
+        _logger.LogInformation("SendProxy: one-shot bool fake ent={Ent} client=0x{C:X} \"{Ser}::{Field}\" → {Value}", idx, clientPtr, serializerName, fieldName, value);
+    }
+
+    public void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, Vector3 value)
+    {
+        if (!BeginSendFake(client, entity, serializerName, fieldName, out var idx, out var clientPtr)) return;
+        FieldSubstitution.SetOneShot(idx, serializerName, fieldName, clientPtr, value);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+        entity.NetworkStateChanged(fieldName);
+        _logger.LogInformation("SendProxy: one-shot vector fake ent={Ent} client=0x{C:X} \"{Ser}::{Field}\" → {Value}", idx, clientPtr, serializerName, fieldName, value);
+    }
+
+    public void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, string value)
+    {
+        if (!BeginSendFake(client, entity, serializerName, fieldName, out var idx, out var clientPtr)) return;
+        FieldSubstitution.SetOneShot(idx, serializerName, fieldName, clientPtr, value);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+        entity.NetworkStateChanged(fieldName);
+        _logger.LogInformation("SendProxy: one-shot string fake ent={Ent} client=0x{C:X} \"{Ser}::{Field}\" → \"{Value}\"", idx, clientPtr, serializerName, fieldName, value);
+    }
+
+    public void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, byte[] value)
+    {
+        if (!BeginSendFake(client, entity, serializerName, fieldName, out var idx, out var clientPtr)) return;
+        FieldSubstitution.SetOneShot(idx, serializerName, fieldName, clientPtr, value);
+        FieldSubstitution.Mode = SubstitutionMode.Fake;
+        entity.NetworkStateChanged(fieldName);
+        _logger.LogInformation("SendProxy: one-shot bytes fake ent={Ent} client=0x{C:X} \"{Ser}::{Field}\" ({Len} bytes)", idx, clientPtr, serializerName, fieldName, value.Length);
     }
 
     // -- Removal ----------------------------------------------------------------------------------

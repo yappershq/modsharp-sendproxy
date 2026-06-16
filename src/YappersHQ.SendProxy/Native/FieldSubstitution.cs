@@ -111,6 +111,12 @@ internal static unsafe class FieldSubstitution
         // into an unloaded AssemblyLoadContext would crash the server.
         public readonly string? Owner;
 
+        // One-shot (SendFake) support. When OneShot is set the registration fires for exactly the
+        // TargetClient on its next transmit and is then removed; sends to other clients pass through
+        // untouched. TargetClient is the CServerSideClient* (matched against RecipientCapture.CurrentClient).
+        public readonly bool OneShot;
+        public readonly nint TargetClient;
+
         public SpoofEntry(int value) : this()
         {
             HasIntSpoof = true;
@@ -128,6 +134,31 @@ internal static unsafe class FieldSubstitution
 
         public SpoofEntry(byte[] value) : this()
             => BytesSpoof = value;
+
+        // One-shot constructors (SendFake): a uniform-style value bound to a single target client.
+        public SpoofEntry(int value, nint targetClient) : this(value)
+        {
+            OneShot      = true;
+            TargetClient = targetClient;
+        }
+
+        public SpoofEntry(Vector3 value, nint targetClient) : this(value)
+        {
+            OneShot      = true;
+            TargetClient = targetClient;
+        }
+
+        public SpoofEntry(string value, nint targetClient) : this(value)
+        {
+            OneShot      = true;
+            TargetClient = targetClient;
+        }
+
+        public SpoofEntry(byte[] value, nint targetClient) : this(value)
+        {
+            OneShot      = true;
+            TargetClient = targetClient;
+        }
 
         public SpoofEntry(PerClientIntProxy callback) : this()
         {
@@ -219,6 +250,13 @@ internal static unsafe class FieldSubstitution
     public static void SetEntityCallback(int ent, string ser, string field, PerClientVectorProxy cb) => _registry[(ser, field, ent)] = new SpoofEntry(cb);
     public static void SetEntityCallback(int ent, string ser, string field, PerClientStringProxy cb) => _registry[(ser, field, ent)] = new SpoofEntry(cb);
     public static void SetEntityCallback(int ent, string ser, string field, PerClientBytesProxy cb)  => _registry[(ser, field, ent)] = new SpoofEntry(cb);
+
+    // One-shot (SendFake): fire once for targetClient on the next transmit, then auto-remove. Entity-scoped
+    // (ent >= 0) so it never lingers across entity-index reuse; the force-dirty is issued by the caller.
+    public static void SetOneShot(int ent, string ser, string field, nint client, int value)     => _registry[(ser, field, ent)] = new SpoofEntry(value, client);
+    public static void SetOneShot(int ent, string ser, string field, nint client, Vector3 value) => _registry[(ser, field, ent)] = new SpoofEntry(value, client);
+    public static void SetOneShot(int ent, string ser, string field, nint client, string value)  => _registry[(ser, field, ent)] = new SpoofEntry(value, client);
+    public static void SetOneShot(int ent, string ser, string field, nint client, byte[] value)  => _registry[(ser, field, ent)] = new SpoofEntry(value, client);
 
     public static void ClearGlobal(string ser, string field)            => _registry.TryRemove((ser, field, -1), out _);
     public static void ClearEntity(int ent, string ser, string field)   => _registry.TryRemove((ser, field, ent), out _);
@@ -575,7 +613,14 @@ internal static unsafe class FieldSubstitution
             var client      = RecipientCapture.CurrentClient;
             var entityIndex = _currentEntityIndex;
 
-            var hasReg = TryGetRegistration(serName, fieldName, entityIndex, out var reg);
+            var hasReg = TryGetRegistration(serName, fieldName, entityIndex, out var reg, out var matchedEnt);
+
+            // One-shot (SendFake): only the target client gets the fake; everyone else passes through and
+            // the registration survives until its target is served. Matched on CServerSideClient*.
+            if (hasReg && reg.OneShot && client != reg.TargetClient)
+            {
+                return CallOriginal(dst, src, bitcount);
+            }
 
             // Diagnostic: for any field whose NAME is registered, log the decision path so a bail between
             // "field seen" and the emit is visible (reg-key match? classify type? per-client client?).
@@ -775,17 +820,101 @@ internal static unsafe class FieldSubstitution
                     break;
             }
 
-            // Emit the fake FRESH instead of copy-then-rewrite. Calling the original writes the real
-            // value's bits into dst; re-emitting over them did not take. Instead: advance the source
-            // read-cursor (bf_read cursor @ +0x10, same as bf_write — confirmed in BitCopyPrimitive) past
-            // the real value so the next field still reads correctly, and let the field's own encoder
-            // write the fake at dst's current write-cursor. No managed throw-site between these calls.
-            *(int*) (src + 0x10) += (int) bitcount;
+            // Emit via the SAME mechanism the (working) uniform path uses: the engine's own
+            // BitCopyPrimitive copying fake bits into the value buffer. RE: docs/RE_PERCLIENT_EMIT.md.
+            //
+            //   1. encode the fake into a fresh, zeroed, byte-aligned scratch bf_write (cursor 0),
+            //   2. advance the real src cursor past the real value (so following fields still read right),
+            //   3. rewind scratch to bit 0 and call the ORIGINAL BitCopyPrimitive(dst, scratch, N).
+            //
+            // dst (the WriteFieldList intermediate value buffer) is then written by unchanged engine code,
+            // identical to uniform — only the source of the fake bits differs (a per-client scratch built
+            // here vs. the shared pre-encoded snapshot). All work below is pure native: no managed
+            // throw-site between the scratch encode and the copy.
 
+            // Upper bound on the encoded byte length: scalars/vectors/quantized fit in a few words; string
+            // and byte-array encoders emit a length prefix + payload. Bounded by MaxSubstituteBytes (the
+            // value buffer was already capped above for those families).
+            var encBound = fieldType switch
+            {
+                FieldType.String    => Encoding.UTF8.GetByteCount(str ?? string.Empty) + 16,
+                FieldType.ByteArray => (bytes?.Length ?? 0) + 16,
+                _                   => 32,
+            };
+            if (encBound > MaxSubstituteBytes + 16)
+            {
+                return CallOriginal(dst, src, bitcount);
+            }
+
+            var dataBuf = stackalloc byte[encBound];
+            for (var i = 0; i < encBound; i++)
+            {
+                dataBuf[i] = 0;
+            }
+
+            // Scratch bf_write header (verified layout): data @+0x00, nDataBytes @+0x08, nDataBits @+0x0c,
+            // cursor @+0x10, overflow @+0x20, flag @+0x22. ScratchBfSize covers it with slack.
+            var bw = stackalloc byte[ScratchBfSize];
+            for (var i = 0; i < ScratchBfSize; i++)
+            {
+                bw[i] = 0;
+            }
+
+            *(nint*) (bw + 0x00) = (nint) dataBuf;
+            *(int*) (bw + 0x08)  = encBound;
+            *(int*) (bw + 0x0C)  = encBound * 8;
+            *(int*) (bw + 0x10)  = 0;      // cursor: byte-aligned at 0 -> encoder takes its simple fast path
+            *(bw + 0x20)         = 0;      // overflow
+            *(bw + 0x22)         = 0;      // flag (0 = normal)
+
+            // Encode the fake into the scratch. The field's own encoder reads valuePtr and writes its
+            // wire form (varint / fixed / length-prefixed) at the scratch cursor, advancing it.
             ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, uint, void>)
-                encoderFn)(dst, fieldInfo, paramsPtr, valuePtr, 0u);
+                encoderFn)((nint) bw, fieldInfo, paramsPtr, valuePtr, 0u);
 
-            return 1;
+            var encodedBits = *(int*) (bw + 0x10);
+            var overflowed  = *(bw + 0x20);
+            if (overflowed != 0 || encodedBits <= 0)
+            {
+                // Encoder overflowed the scratch or wrote nothing — don't risk a corrupt stream.
+                return CallOriginal(dst, src, bitcount);
+            }
+
+            // Conclusive capped diagnostic: did the scratch encode produce bits, and does the dst cursor
+            // advance when we copy them? (Strip once confirmed live.)
+            if (_substLogCount < MaxSubstLog && _logger is { } eLog)
+            {
+                Interlocked.Increment(ref _substLogCount);
+                var b0 = dataBuf[0];
+                var b1 = encBound > 1 ? dataBuf[1] : (byte) 0;
+                var dstCursorBefore = *(int*) (dst + 0x10);
+                eLog.LogInformation(
+                    "SUBST-EMIT \"{Ser}::{Field}\" encodedBits={N} bitcount={BC} scratch=[{B0:X2} {B1:X2}] dstCursorBefore={DB}",
+                    serName, fieldName, encodedBits, bitcount, b0, b1, dstCursorBefore);
+            }
+
+            // Skip the real value in the source, then copy our fake bits into dst via the engine's own
+            // primitive (rewind scratch to read from bit 0 first).
+            *(int*) (src + 0x10) += (int) bitcount;
+            *(int*) (bw + 0x10) = 0;
+
+            var copyOk = CallOriginal(dst, (nint) bw, (uint) encodedBits);
+
+            if (_substLogCount < MaxSubstLog && _logger is { } e2Log)
+            {
+                e2Log.LogInformation(
+                    "SUBST-EMIT-DONE \"{Ser}::{Field}\" copyOk={OK} dstCursorAfter={DA}",
+                    serName, fieldName, copyOk, *(int*) (dst + 0x10));
+            }
+
+            // One-shot fired for its target client — remove it so it doesn't recur. Other clients on this
+            // snapshot already passed through (client-match gate above), so they never see the fake.
+            if (reg.OneShot)
+            {
+                _registry.TryRemove((serName, fieldName, matchedEnt), out _);
+            }
+
+            return copyOk;
         }
         catch
         {
@@ -795,12 +924,16 @@ internal static unsafe class FieldSubstitution
         }
     }
 
-    private static bool TryGetRegistration(string serName, string fieldName, int entityIndex, out SpoofEntry reg)
+    private static bool TryGetRegistration(string serName, string fieldName, int entityIndex, out SpoofEntry reg, out int matchedEnt)
     {
         if (entityIndex >= 0 && _registry.TryGetValue((serName, fieldName, entityIndex), out reg))
         {
+            matchedEnt = entityIndex;
+
             return true;
         }
+
+        matchedEnt = -1;
 
         return _registry.TryGetValue((serName, fieldName, -1), out reg);
     }
@@ -1035,6 +1168,9 @@ internal static unsafe class FieldSubstitution
     // Largest value struct layout the substitute path builds (quant struct ~0x30; byte-array struct needs
     // the count slot at +0x28) fits in 0x30 bytes.
     private const int LiveScratchSize = 0x30;
+
+    // Scratch bf_write header size. Real bf_write uses fields through +0x22 (flag); 0x40 gives slack.
+    private const int ScratchBfSize = 0x40;
 
     // Upper bound (bytes) for a string / byte-array substitute. The substitute buffer is stackalloc'd on
     // the engine send worker thread, so a caller-controlled size must be bounded; oversized values pass
