@@ -501,10 +501,12 @@ public sealed class ExampleModule : IModSharpModule
         Reply(issuer, "enc2 (uint b2): m_iTeamNum = 3 (CT) on pawn + controller — all players appear CT (radar/outline + scoreboard)");
     }
 
-    // bucket 3 — vector — m_vecViewOffset: raise every client's own eye/camera height so they look down
-    // on themselves from above. Self-visible even solo (m_angEyeAngles, the other b3 demo, only changes
-    // how OTHERS see your aim — invisible when testing alone). View offset may be client-predicted from
-    // duck state, so this is also a test of whether the spoof wins that fight.
+    // bucket 3-family float — m_flScale (model scale): every player renders tiny (0.3x) to all clients.
+    // Dramatic + actually rendered from the netvar (server keeps real scale=1, so hitboxes/collision are
+    // unchanged — purely visual). Observe another player or a bot to see it. m_flScale is a networked leaf
+    // (unlike m_vecViewOffset, whose three quantized sub-fields share the bare names m_vecX/Y/Z with
+    // m_vecOrigin — uniform matches by name only, so spoofing it would also teleport everyone — and whose
+    // Z clamps to 0..64). The qangle/coord/quantized encoder itself is proven by the quantized struct-dump.
     private void OnEncoder3(IGameClient? issuer, StringCommand command)
     {
         if (_sendProxy is not { } sp)
@@ -512,9 +514,9 @@ public sealed class ExampleModule : IModSharpModule
             return;
         }
 
-        sp.SetUniform("CCSPlayerPawn", "m_vecViewOffset", new Vector3(0f, 0f, 150f));
-        ForceResendAll("CCSPlayerPawn", "m_vecViewOffset");
-        Reply(issuer, "enc3 (vector b3): CCSPlayerPawn::m_vecViewOffset = (0,0,150) — camera raised high (visible to you). sp_encoders_off to clear.");
+        sp.SetUniform("CCSPlayerPawn", "m_flScale", 0.3f);
+        ForceResendAll("CCSPlayerPawn", "m_flScale");
+        Reply(issuer, "enc3 (float): m_flScale = 0.3 — every player renders tiny to all clients (real size unchanged). Observe another player/bot. sp_encoders_off to clear.");
     }
 
     // bucket 4 — float — m_flFlashDuration: every client renders a flash-blind white-out. A genuinely
@@ -580,7 +582,7 @@ public sealed class ExampleModule : IModSharpModule
         sp.Unhook("CCSPlayerPawn", "m_iHealth");
         sp.Unhook("CCSPlayerPawn", "m_iTeamNum");
         sp.Unhook("CCSPlayerController", "m_iTeamNum");
-        sp.Unhook("CCSPlayerPawn", "m_vecViewOffset");
+        sp.Unhook("CCSPlayerPawn", "m_flScale");
         sp.Unhook("CCSPlayerPawn", "m_flFlashMaxAlpha");
         sp.Unhook("CCSPlayerPawn", "m_flFlashDuration");
         sp.Unhook("CCSPlayerController", "m_iszPlayerName");
