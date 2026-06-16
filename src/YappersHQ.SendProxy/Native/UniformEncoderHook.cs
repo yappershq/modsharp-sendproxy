@@ -194,7 +194,13 @@ internal static unsafe class UniformEncoderHook
                     // an UNHOOKED/Unsupported encoder).
                     if (_logger is { } dlog && _diagFields.TryAdd(name, 0))
                     {
-                        dlog.LogInformation("UENC-DIAG field=\"{F}\" encFn=0x{Fn:X} type={T} kind={K}", name, encFn, entry.Type, sp.Kind);
+                        var cnt = NativeUtil.IsUserPtr(valuePtr) ? *(int*) (valuePtr + 0x28) : -1;
+                        var f0  = NativeUtil.IsUserPtr(valuePtr) ? ((float*) valuePtr)[0] : 0f;
+                        var f1  = NativeUtil.IsUserPtr(valuePtr) ? ((float*) valuePtr)[1] : 0f;
+                        var f2  = NativeUtil.IsUserPtr(valuePtr) ? ((float*) valuePtr)[2] : 0f;
+                        dlog.LogInformation(
+                            "UENC-DIAG field=\"{F}\" encFn=0x{Fn:X} type={T} kind={K} struct[+0x28 count={C}, f0={F0}, f1={F1}, f2={F2}]",
+                            name, encFn, entry.Type, sp.Kind, cnt, f0, f1, f2);
                     }
 
                     var scratch    = stackalloc byte[0x30];

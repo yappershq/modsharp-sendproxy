@@ -104,10 +104,16 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bridge.SharpModuleManager.RegisterSharpModuleInterface<ISendProxyManager>(
             this, ISendProxyManager.Identity, _manager);
 
-        // Build the encoder classification map eagerly at load (resolution was set in Init; the
-        // substitution detours still install lazily on first registration) so classification is ready
-        // and diagnosable from the boot log.
+        // Build the encoder classification map eagerly at load (resolution was set in Init) so
+        // classification is ready and diagnosable from the boot log.
         FieldSubstitution.PrebuildEncoderMap(_logger);
+
+        // Install all detours now, at load, instead of lazily on first registration. A lazy install of
+        // ~17 encoder detours mid-game stalls a whole frame (~120 ms) the first time a spoof is set;
+        // doing it at startup keeps gameplay smooth. Both installers are idempotent, so the lazy
+        // Ensure* paths (still wired above) become no-ops after this.
+        EnsureUniformHook();
+        EnsureSubDetours();
 
         _bridge.EntityManager.InstallEntityListener(this);
     }
