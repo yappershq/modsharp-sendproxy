@@ -514,9 +514,10 @@ public sealed class ExampleModule : IModSharpModule
         Reply(issuer, "enc3 (qangle b3): CCSPlayerPawn::m_angEyeAngles = (0,180,0) — players look backwards to all clients");
     }
 
-    // bucket 4 — float32 — m_flViewmodelFOV: every client's own viewmodel (gun) renders at a wide FOV —
-    // clearly visible (the gun looks stretched/pulled-in), unlike m_flVelocityModifier which is a
-    // prediction input the server stays authoritative on (no visible effect on other players).
+    // FOV zoom — m_iDesiredFOV (CBasePlayerController, uint): every client's view zooms in. This is the
+    // visible FOV field (the one game code uses to zoom, e.g. binoculars). NOTE m_flViewmodelFOV (the gun
+    // FOV) is a quantized float that substitutes correctly on the wire but isn't visibly rendered (own-view
+    // + client viewmodel_fov cvar), so it's a poor demo despite the encoder working — see docs.
     private void OnEncoder4(IGameClient? issuer, StringCommand command)
     {
         if (_sendProxy is not { } sp)
@@ -524,9 +525,9 @@ public sealed class ExampleModule : IModSharpModule
             return;
         }
 
-        sp.SetUniform("CCSPlayerPawn", "m_flViewmodelFOV", 120f);
-        ForceResendAll("CCSPlayerPawn", "m_flViewmodelFOV");
-        Reply(issuer, "enc4 (float b4): CCSPlayerPawn::m_flViewmodelFOV = 120 — every client's gun renders at a wide FOV (visible)");
+        sp.SetUniform("CCSPlayerController", "m_iDesiredFOV", 40);
+        ForceResendAll("CCSPlayerController", "m_iDesiredFOV");
+        Reply(issuer, "enc4: CCSPlayerController::m_iDesiredFOV = 40 — every client's view zooms in (visible FOV)");
     }
 
     // bucket 5 — string — m_iszPlayerName: every player shows the same name.
@@ -575,7 +576,7 @@ public sealed class ExampleModule : IModSharpModule
         sp.Unhook("CCSPlayerPawn", "m_iTeamNum");
         sp.Unhook("CCSPlayerController", "m_iTeamNum");
         sp.Unhook("CCSPlayerPawn", "m_angEyeAngles");
-        sp.Unhook("CCSPlayerPawn", "m_flViewmodelFOV");
+        sp.Unhook("CCSPlayerController", "m_iDesiredFOV");
         sp.Unhook("CCSPlayerController", "m_iszPlayerName");
         sp.Unhook("CCSPlayerPawn", "m_bIsScoped");
         Reply(issuer, "sp_encoders_off: reverted all sp_encoder1..7 demos");
