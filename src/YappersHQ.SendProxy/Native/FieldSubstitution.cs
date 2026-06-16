@@ -1312,15 +1312,21 @@ internal static unsafe class FieldSubstitution
         {
             1 => name switch { "default" => FieldType.Int32, "fixed32" => FieldType.Fixed32, "fixed64" => FieldType.Fixed64, _ => FieldType.Unsupported },
             2 => name switch { "default" => FieldType.UInt32, "fixed32" => FieldType.Fixed32, "fixed64" => FieldType.Fixed64, _ => FieldType.Unsupported },
+            // Bucket-3 entry names are exactly (verified from the registry dump): default, qangle, normal,
+            // coord, coord_integral, qangle_pitch_yaw, qangle_precise. The "default" entry IS the quantized
+            // float encoder (single-component quantized floats like m_flViewmodelFOV); the two extra qangle
+            // variants read the same 2–3 float lanes as qangle. (Earlier "vector3"/"quantized" names were
+            // wrong — they don't exist in the registry — which left default/pitch_yaw/precise unhooked.)
             3 => name switch
             {
-                "qangle"         => FieldType.QAngle3,
-                "vector3"        => FieldType.Vector3,
-                "coord"          => FieldType.Coord3,
-                "normal"         => FieldType.Normal3,
-                "coord_integral" => FieldType.CoordIntegral3,
-                "quantized"      => FieldType.QuantizedFloat,
-                _                => FieldType.Unsupported,
+                "default"          => FieldType.QuantizedFloat,
+                "qangle"           => FieldType.QAngle3,
+                "qangle_pitch_yaw" => FieldType.QAngle3,
+                "qangle_precise"   => FieldType.QAngle3,
+                "normal"           => FieldType.Normal3,
+                "coord"            => FieldType.Coord3,
+                "coord_integral"   => FieldType.CoordIntegral3,
+                _                  => FieldType.Unsupported,
             },
             4 => name == "default" ? FieldType.Float32 : FieldType.Unsupported,
             5 => name == "default" ? FieldType.String : FieldType.Unsupported,

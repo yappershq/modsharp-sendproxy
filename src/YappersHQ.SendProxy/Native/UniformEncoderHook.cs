@@ -76,6 +76,9 @@ internal static unsafe class UniformEncoderHook
     private static volatile bool _installed;
     private static ILogger?      _logger;
 
+    // DIAG (strip later): field names already logged by the per-field encoder-type diagnostic.
+    private static readonly ConcurrentDictionary<string, byte> _diagFields = new();
+
     private const int MaxSubstituteBytes = 4096;
 
     public static bool HasAny => !_byName.IsEmpty;
@@ -186,6 +189,14 @@ internal static unsafe class UniformEncoderHook
                 var name = NativeUtil.ReadFieldName(fieldInfo);
                 if (name.Length > 0 && _byName.TryGetValue(name, out var sp))
                 {
+                    // DIAG (strip later): log the resolved encoder type per registered field once, so we
+                    // can see exactly what each field classifies as (and a field that never logs is using
+                    // an UNHOOKED/Unsupported encoder).
+                    if (_logger is { } dlog && _diagFields.TryAdd(name, 0))
+                    {
+                        dlog.LogInformation("UENC-DIAG field=\"{F}\" encFn=0x{Fn:X} type={T} kind={K}", name, encFn, entry.Type, sp.Kind);
+                    }
+
                     var scratch    = stackalloc byte[0x30];
                     var stringSlot = stackalloc nint[1];
 
@@ -257,6 +268,30 @@ internal static unsafe class UniformEncoderHook
                         ((float*) scratch)[0] = sp.Vec.X;
                         ((float*) scratch)[1] = sp.Vec.Y;
                         ((float*) scratch)[2] = sp.Vec.Z;
+                        return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
+                    }
+                    else if (sp.Kind == ValueKind.Float && IsStructFloatType(entry.Type))
+                    {
+                        // A float spoof on a struct-float encoder (single-component quantized float such as
+                        // m_flViewmodelFOV, or coord/normal). These read a value STRUCT (floats + a
+                        // count/mode at +0x28), NOT a bare double like the b4 float32 encoder — so copy the
+                        // real struct to preserve +0x28 and patch the leading component with the fake float.
+                        if (NativeUtil.IsUserPtr(valuePtr))
+                        {
+                            for (var i = 0; i < 0x30; i++)
+                            {
+                                scratch[i] = *(byte*) (valuePtr + i);
+                            }
+                        }
+                        else
+                        {
+                            for (var i = 0; i < 0x30; i++)
+                            {
+                                scratch[i] = 0;
+                            }
+                        }
+
+                        ((float*) scratch)[0] = BitConverter.Int32BitsToSingle(sp.IntBits);
                         return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
                     }
                     else if (TryBuildScratch(in sp, entry.Type, scratch, stringSlot, out var fakeValuePtr))
@@ -340,6 +375,12 @@ internal static unsafe class UniformEncoderHook
     private static bool IsVectorScratchType(FieldType t)
         => t is FieldType.QAngle3 or FieldType.Vector3 or FieldType.Coord3
             or FieldType.Normal3 or FieldType.CoordIntegral3 or FieldType.QuantizedFloat;
+
+    // Float-family encoders that read a value STRUCT (quantized/coord/normal) rather than a bare double
+    // (b4 float32). A single-float spoof patches component[0] of the copied real struct.
+    private static bool IsStructFloatType(FieldType t)
+        => t is FieldType.QuantizedFloat or FieldType.Coord3
+            or FieldType.Normal3 or FieldType.CoordIntegral3;
 
     private static nint Invoke(nint tramp, nint bf, nint fieldInfo, nint paramsPtr, nint valuePtr, uint extra)
         => ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, uint, nint>) tramp)(bf, fieldInfo, paramsPtr, valuePtr, extra);
