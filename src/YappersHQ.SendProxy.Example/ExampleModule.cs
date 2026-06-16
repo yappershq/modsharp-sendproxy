@@ -50,6 +50,7 @@ public sealed class ExampleModule : IModSharpModule
 
     private readonly ILogger<ExampleModule> _logger;
     private readonly IEntityManager         _entityManager;
+    private readonly IClientManager         _clientManager;
     private readonly ISharpModuleManager    _modules;
 
     private ISendProxyManager?                       _sendProxy;
@@ -66,6 +67,7 @@ public sealed class ExampleModule : IModSharpModule
     {
         _logger        = sharedSystem.GetLoggerFactory().CreateLogger<ExampleModule>();
         _entityManager = sharedSystem.GetEntityManager();
+        _clientManager = sharedSystem.GetClientManager();
         _modules       = sharedSystem.GetSharpModuleManager();
     }
 
@@ -432,6 +434,39 @@ public sealed class ExampleModule : IModSharpModule
 
     #region Per-encoder real-use demos (sp_encoder1..7)
 
+    // Force a field to re-transmit right now (mark it dirty on every player) so a uniform spoof shows
+    // immediately — no need to wait for the value to change naturally (a slap, a move, etc.). This is the
+    // "do it from the plugin alone" trigger: NetworkStateChanged sets the engine's per-field dirty bit, so
+    // the field lands in the next snapshot and the uniform encoder hook fakes whatever is re-sent. Routes
+    // to the controller for CCSPlayerController fields and to the pawn otherwise.
+    private void ForceResendAll(string serializerName, string fieldName)
+    {
+        var onController = serializerName.Contains("Controller", StringComparison.Ordinal);
+        foreach (var client in _clientManager.GetGameClients(inGame: true))
+        {
+            // Bots have no screen and the engine never sends them snapshots, so there's nothing to
+            // re-transmit on their behalf — skip them.
+            if (client.IsFakeClient || client.IsHltv)
+            {
+                continue;
+            }
+
+            if (client.GetPlayerController() is not { } controller)
+            {
+                continue;
+            }
+
+            if (onController)
+            {
+                controller.NetworkStateChanged(fieldName);
+            }
+            else if (controller.GetPlayerPawn() is { } pawn)
+            {
+                pawn.NetworkStateChanged(fieldName);
+            }
+        }
+    }
+
     // One canned demo per encoder bucket, each on a real networked field. sp_encoders_off reverts.
     // bucket 1 — signed int — fake HP. The HUD reads CCSPlayerController::m_iPawnHealth (not the pawn's
     // m_iHealth), so spoof both: m_iPawnHealth drives the on-screen number, m_iHealth the pawn value.
@@ -444,35 +479,61 @@ public sealed class ExampleModule : IModSharpModule
 
         sp.SetUniform("CCSPlayerController", "m_iPawnHealth", 1337);
         sp.SetUniform("CCSPlayerPawn", "m_iHealth", 1337);
-        Reply(issuer, "enc1 (int b1): m_iPawnHealth (HUD) + m_iHealth = 1337. Run after it changes (e.g. slap @me 1) — static values aren't re-sent.");
+        ForceResendAll("CCSPlayerController", "m_iPawnHealth");
+        ForceResendAll("CCSPlayerPawn", "m_iHealth");
+        Reply(issuer, "enc1 (int b1): m_iPawnHealth (HUD) + m_iHealth = 1337 — shown immediately (no slap needed)");
     }
 
     // bucket 2 — unsigned int — m_iTeamNum (uint8): every player shows as CT to all clients (radar
     // colour / outline flip — very visible). Real use: disguise team membership.
     private void OnEncoder2(IGameClient? issuer, StringCommand command)
     {
-        _sendProxy?.SetUniform("CCSPlayerPawn", "m_iTeamNum", 3);
+        if (_sendProxy is not { } sp)
+        {
+            return;
+        }
+
+        sp.SetUniform("CCSPlayerPawn", "m_iTeamNum", 3);
+        ForceResendAll("CCSPlayerPawn", "m_iTeamNum");
         Reply(issuer, "enc2 (uint b2): CCSPlayerPawn::m_iTeamNum = 3 (CT) — all players appear CT to every client (radar/outline)");
     }
 
     // bucket 3 — qangle/vector — m_angEyeAngles: every player appears to look backwards.
     private void OnEncoder3(IGameClient? issuer, StringCommand command)
     {
-        _sendProxy?.SetUniform("CCSPlayerPawn", "m_angEyeAngles", new Vector3(0f, 180f, 0f));
+        if (_sendProxy is not { } sp)
+        {
+            return;
+        }
+
+        sp.SetUniform("CCSPlayerPawn", "m_angEyeAngles", new Vector3(0f, 180f, 0f));
+        ForceResendAll("CCSPlayerPawn", "m_angEyeAngles");
         Reply(issuer, "enc3 (qangle b3): CCSPlayerPawn::m_angEyeAngles = (0,180,0) — players look backwards to all clients");
     }
 
     // bucket 4 — float32 — m_flVelocityModifier: every player appears at half speed-modifier.
     private void OnEncoder4(IGameClient? issuer, StringCommand command)
     {
-        _sendProxy?.SetUniform("CCSPlayerPawn", "m_flVelocityModifier", 0.5f);
+        if (_sendProxy is not { } sp)
+        {
+            return;
+        }
+
+        sp.SetUniform("CCSPlayerPawn", "m_flVelocityModifier", 0.5f);
+        ForceResendAll("CCSPlayerPawn", "m_flVelocityModifier");
         Reply(issuer, "enc4 (float b4): CCSPlayerPawn::m_flVelocityModifier = 0.5 for all clients");
     }
 
     // bucket 5 — string — m_iszPlayerName: every player shows the same name.
     private void OnEncoder5(IGameClient? issuer, StringCommand command)
     {
-        _sendProxy?.SetUniform("CCSPlayerController", "m_iszPlayerName", "SendProxyTest");
+        if (_sendProxy is not { } sp)
+        {
+            return;
+        }
+
+        sp.SetUniform("CCSPlayerController", "m_iszPlayerName", "SendProxyTest");
+        ForceResendAll("CCSPlayerController", "m_iszPlayerName");
         Reply(issuer, "enc5 (string b5): CCSPlayerController::m_iszPlayerName = \"SendProxyTest\" for all clients");
     }
 
@@ -487,7 +548,13 @@ public sealed class ExampleModule : IModSharpModule
     // bucket 7 — bool — m_bIsScoped: every player appears scoped.
     private void OnEncoder7(IGameClient? issuer, StringCommand command)
     {
-        _sendProxy?.SetUniform("CCSPlayerPawn", "m_bIsScoped", true);
+        if (_sendProxy is not { } sp)
+        {
+            return;
+        }
+
+        sp.SetUniform("CCSPlayerPawn", "m_bIsScoped", true);
+        ForceResendAll("CCSPlayerPawn", "m_bIsScoped");
         Reply(issuer, "enc7 (bool b7): CCSPlayerPawn::m_bIsScoped = true — all players appear scoped to all clients");
     }
 
