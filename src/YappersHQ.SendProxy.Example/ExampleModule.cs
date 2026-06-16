@@ -515,7 +515,7 @@ public sealed class ExampleModule : IModSharpModule
 
         sp.SetUniform("CCSPlayerPawn", "m_angEyeAngles", new Vector3(0f, 180f, 0f));
         ForceResendAll("CCSPlayerPawn", "m_angEyeAngles");
-        Reply(issuer, "enc3 (qangle b3): m_angEyeAngles = (0,180,0) — flips where players look. Observe another player/bot (your own view is client-controlled).");
+        Reply(issuer, "enc3 (qangle b3): m_angEyeAngles = (0,180,0) — fakes where a player is looking (their camera). SPECTATE someone to see it: their spectate view points the spoofed way. sp_encoders_off to clear.");
     }
 
     // bucket 4 — float — m_flScale (model scale): every player renders tiny (0.3x) to all clients.
