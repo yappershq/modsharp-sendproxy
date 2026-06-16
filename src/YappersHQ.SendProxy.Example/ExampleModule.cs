@@ -574,15 +574,32 @@ public sealed class ExampleModule : IModSharpModule
             return;
         }
 
-        sp.Unhook("CCSPlayerController", "m_iPawnHealth");
-        sp.Unhook("CCSPlayerPawn", "m_iHealth");
-        sp.Unhook("CCSPlayerPawn", "m_iTeamNum");
-        sp.Unhook("CCSPlayerController", "m_iTeamNum");
-        sp.Unhook("CCSPlayerPawn", "m_angEyeAngles");
-        sp.Unhook("CCSPlayerPawn", "m_flScale");
-        sp.Unhook("CCSPlayerController", "m_iszPlayerName");
-        sp.Unhook("CCSPlayerPawn", "m_bIsScoped");
-        Reply(issuer, "sp_encoders_off: reverted all sp_encoder1..7 demos");
+        (string ser, string field)[] fields =
+        {
+            ("CCSPlayerController", "m_iPawnHealth"),
+            ("CCSPlayerPawn", "m_iHealth"),
+            ("CCSPlayerPawn", "m_iTeamNum"),
+            ("CCSPlayerController", "m_iTeamNum"),
+            ("CCSPlayerPawn", "m_angEyeAngles"),
+            ("CCSPlayerPawn", "m_flScale"),
+            ("CCSPlayerController", "m_iszPlayerName"),
+            ("CCSPlayerPawn", "m_bIsScoped"),
+        };
+
+        foreach (var (ser, field) in fields)
+        {
+            sp.Unhook(ser, field);
+        }
+
+        // Unhook only STOPS the spoof — clients still hold the last fake value, and a static field isn't
+        // re-sent until it changes. Force a resend AFTER unhooking so the real value goes back out and
+        // every client reverts immediately (otherwise they'd stay faked until the field naturally changed).
+        foreach (var (ser, field) in fields)
+        {
+            ForceResendAll(ser, field);
+        }
+
+        Reply(issuer, "sp_encoders_off: reverted all sp_encoder1..7 demos (real values re-sent)");
     }
 
     #endregion
@@ -627,14 +644,25 @@ public sealed class ExampleModule : IModSharpModule
 
     private void Reply(IGameClient? issuer, string message)
     {
-        if (issuer?.GetPlayerController()?.GetPlayerPawn() is { } pawn)
+        // Print at the CLIENT level, not via the pawn — pawn.Print routes through the pawn's controller
+        // and throws "Controller is null" when the command comes from console/RCON or the issuer's pawn
+        // isn't linked to a controller. issuer.Print goes straight to the client. Fall back to the server
+        // log for console invocations (issuer == null) or if the client print throws for any reason.
+        if (issuer is { IsValid: true })
         {
-            pawn.Print(HudPrintChannel.Chat, message);
+            try
+            {
+                issuer.Print(HudPrintChannel.Chat, message);
+
+                return;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "SendProxy example: client Print failed — logging instead");
+            }
         }
-        else
-        {
-            _logger.LogInformation("{Message}", message);
-        }
+
+        _logger.LogInformation("{Message}", message);
     }
 
     private static bool TryInt(StringCommand cmd, int argIndex, out int value)
