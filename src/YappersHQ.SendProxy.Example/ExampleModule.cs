@@ -18,20 +18,14 @@
  */
 
 using System;
-using System.Collections.Generic;
-using System.Globalization;
-using System.Linq;
-using System.Numerics;
 using Microsoft.Extensions.Configuration;
 using Microsoft.Extensions.Logging;
 using Sharp.Modules.AdminManager.Shared;
 using Sharp.Modules.TargetingManager.Shared;
 using Sharp.Shared;
-using Sharp.Shared.Enums;
 using Sharp.Shared.Managers;
 using Sharp.Shared.Objects;
-using Sharp.Shared.Types;
-using Sharp.Shared.Units;
+using YappersHQ.SendProxy.Example.Commands;
 using YappersHQ.SendProxy.Shared;
 
 namespace YappersHQ.SendProxy.Example;
@@ -46,34 +40,21 @@ namespace YappersHQ.SendProxy.Example;
 public sealed class ExampleModule : IModSharpModule
 {
     private const string AdminManagerAssemblyName = "Sharp.Modules.AdminManager";
-    private const string SendProxyPermission      = "sendproxy:example";
 
     private static readonly string ModuleIdentity =
         typeof(ExampleModule).Assembly.GetName().Name ?? "YappersHQ.SendProxy.Example";
 
-    private readonly ILogger<ExampleModule> _logger;
-    private readonly IEntityManager         _entityManager;
-    private readonly IClientManager         _clientManager;
-    private readonly ISharpModuleManager    _modules;
-    private readonly IModSharp              _modSharp;
+    private readonly ILogger<ExampleModule>  _logger;
+    private readonly ISharpModuleManager     _modules;
 
-    // Cache the interface WRAPPER, not the instance: GetOptionalSharpModuleInterface returns a handle that
-    // tracks the live interface, so reading .Instance per use always gives the current SendProxy even if it
-    // hot-reloads. Caching the raw .Instance would dangle on reload (per ModSharp authors / laper).
     private IModSharpModuleInterface<ISendProxyManager>? _sendProxyHandle;
     private ISendProxyManager?                           _sendProxy => _sendProxyHandle?.Instance;
 
-    private IModSharpModuleInterface<IAdminManager>?     _adminManager;
-    private IModSharpModuleInterface<ITargetingManager>? _targeting;
-    private bool                                         _commandsRegistered;
+    private IModSharpModuleInterface<IAdminManager>? _adminManager;
+    private bool                                     _commandsRegistered;
 
-    // sp_fakeaim session state: a per-client (issuer-only) HP/team/cycling-color spoof on resolved targets.
-    private nint              _aimIssuer;            // recipient client ptr that sees the fakes
-    private readonly List<int> _aimPawns       = new(); // target pawn entity indices (color re-dirtied each tick)
-    private readonly List<int> _aimControllers = new();
-    private volatile uint     _aimColor;             // current cycling render color (RGBA), read on send threads
-    private int               _aimHue;
-    private Guid              _aimTimer;
+    private ExampleContext?        _ctx;
+    private ISpCommandCategory[]   _categories = [];
 
     public ExampleModule(
         ISharedSystem   sharedSystem,
@@ -83,11 +64,14 @@ public sealed class ExampleModule : IModSharpModule
         IConfiguration? coreConfiguration,
         bool            hotReload)
     {
-        _logger        = sharedSystem.GetLoggerFactory().CreateLogger<ExampleModule>();
-        _entityManager = sharedSystem.GetEntityManager();
-        _clientManager = sharedSystem.GetClientManager();
-        _modules       = sharedSystem.GetSharpModuleManager();
-        _modSharp      = sharedSystem.GetModSharp();
+        _logger  = sharedSystem.GetLoggerFactory().CreateLogger<ExampleModule>();
+        _modules = sharedSystem.GetSharpModuleManager();
+
+        _ctx = new ExampleContext(
+            sharedSystem.GetEntityManager(),
+            sharedSystem.GetClientManager(),
+            sharedSystem.GetModSharp(),
+            _logger);
     }
 
     public string DisplayName   => "SendProxy Example";
@@ -112,7 +96,10 @@ public sealed class ExampleModule : IModSharpModule
     {
         _sendProxyHandle = _modules.GetOptionalSharpModuleInterface<ISendProxyManager>(ISendProxyManager.Identity);
 
-        _targeting = _modules.GetOptionalSharpModuleInterface<ITargetingManager>(ITargetingManager.Identity);
+        var targeting = _modules.GetOptionalSharpModuleInterface<ITargetingManager>(ITargetingManager.Identity);
+
+        _ctx!.Handle    = _sendProxyHandle;
+        _ctx.Targeting  = targeting;
 
         if (_sendProxy is null)
         {
@@ -121,15 +108,23 @@ public sealed class ExampleModule : IModSharpModule
             return;
         }
 
+        _categories =
+        [
+            new GenericCommands(_ctx),
+            new PresetCommands(_ctx),
+            new EncoderDemoCommands(_ctx),
+            new FakeAimCommands(_ctx),
+            new ProbeCommands(_ctx),
+        ];
+
         TryRegisterCommands();
     }
 
     public void Shutdown()
     {
-        if (_aimTimer != Guid.Empty)
+        foreach (var c in _categories)
         {
-            _modSharp.StopTimer(_aimTimer);
-            _aimTimer = Guid.Empty;
+            c.Unregister();
         }
 
         _sendProxy?.UnhookAll();
@@ -158,40 +153,15 @@ public sealed class ExampleModule : IModSharpModule
 
             // RegisterAdminCommand does not auto-register the permission; do it so the flag resolves under
             // wildcards. Operators grant "sendproxy:example" (or "*") via their real admin source.
-            registry.RegisterPermissions([SendProxyPermission]);
+            registry.RegisterPermissions([ExampleContext.Permission]);
 
-            // Generic test matrix: any field, any encoder type, any mode.
-            registry.RegisterAdminCommand("sp_set",    OnSet,    [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_setpc",  OnSetPc,  [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_setent", OnSetEnt, [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_unset",  OnUnset,  [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_clear",  OnClear,  [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_help",   OnHelp,   [SendProxyPermission]);
-
-            // Presets — common one-liners built on the same API.
-            registry.RegisterAdminCommand("sp_fakehp",   OnFakeHp,   [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_fakename", OnFakeName, [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_sendfake", OnSendFake, [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_fakeaim",     OnFakeAim,    [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_fakeaim_off", OnFakeAimOff, [SendProxyPermission]);
-
-            // One canned real-use demo per encoder bucket (sp_encoder1..7) + a single off switch.
-            registry.RegisterAdminCommand("sp_encoder1", OnEncoder1, [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_encoder2", OnEncoder2, [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_encoder3", OnEncoder3, [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_encoder4", OnEncoder4, [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_encoder5", OnEncoder5, [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_encoder6", OnEncoder6, [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_encoder7", OnEncoder7, [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_encoders_off", OnEncodersOff, [SendProxyPermission]);
-
-            // Read-only serializer probe (discover which fields exist and their encoder type).
-            registry.RegisterAdminCommand("sp_probe_scan",  OnProbeScan,  [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_probe_dump",  OnProbeDump,  [SendProxyPermission]);
-            registry.RegisterAdminCommand("sp_probe_field", OnProbeField, [SendProxyPermission]);
+            foreach (var c in _categories)
+            {
+                c.Register(registry);
+            }
 
             _commandsRegistered = true;
-            _logger.LogInformation("SendProxy example admin commands registered under \"{Perm}\"", SendProxyPermission);
+            _logger.LogInformation("SendProxy example admin commands registered under \"{Perm}\"", ExampleContext.Permission);
         }
         catch (InvalidOperationException)
         {
@@ -201,779 +171,6 @@ public sealed class ExampleModule : IModSharpModule
         {
             _logger.LogError(e, "Failed to register SendProxy example admin commands.");
         }
-    }
-
-    #endregion
-
-    #region Generic test-matrix commands
-
-    // sp_set <serializer> <field> <type> <value...> — uniform spoof (every client) of any field.
-    private void OnSet(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        if (command.ArgCount < 3)
-        {
-            Reply(issuer, "usage: sp_set <serializer> <field> <int|uint|float|bool|vec|string|bytes> <value...>");
-
-            return;
-        }
-
-        var ser   = command.GetArg(1);
-        var field = command.GetArg(2);
-        var type  = command.GetArg(3).ToLowerInvariant();
-
-        switch (type)
-        {
-            case "int" when TryInt(command, 4, out var i):    sp.SetUniform(ser, field, i); break;
-            case "uint" when TryInt(command, 4, out var u):   sp.SetUniform(ser, field, u); break;
-            case "float" when TryFloat(command, 4, out var f): sp.SetUniform(ser, field, f); break;
-            case "bool" when TryBool(command, 4, out var b):  sp.SetUniform(ser, field, b); break;
-            case "vec" when TryVec(command, 4, out var v):    sp.SetUniform(ser, field, v); break;
-            case "string":                                    sp.SetUniform(ser, field, RestOfArgs(command, 4)); break;
-            case "bytes" when TryBytes(command, 4, out var by): sp.SetUniform(ser, field, by); break;
-            default:
-                Reply(issuer, $"sp_set: bad type/value for '{type}'. Types: int uint float bool vec string bytes");
-
-                return;
-        }
-
-        Reply(issuer, $"uniform: {ser}::{field} ({type}) spoofed for all clients");
-    }
-
-    // sp_setpc <serializer> <field> <type> — per-client demo: each client sees a value derived from its
-    // recipient pointer, proving the per-client path.
-    private void OnSetPc(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        if (command.ArgCount < 3)
-        {
-            Reply(issuer, "usage: sp_setpc <serializer> <field> <int|uint|float|bool|vec|string|bytes>");
-
-            return;
-        }
-
-        var ser   = command.GetArg(1);
-        var field = command.GetArg(2);
-        var type  = command.GetArg(3).ToLowerInvariant();
-
-        switch (type)
-        {
-            case "int":
-            case "uint":
-                // 1..64 — small + obvious + varies per client (low value keeps the varint the same byte
-                // length as a typical small field so the substitute fits the slot).
-                sp.Hook(ser, field, (nint c, int _, ref int v) => { v = 1 + (int) (c & 0x3F); return true; });
-                break;
-            case "float":
-                sp.Hook(ser, field, (nint c, int _, ref float v) => { v = c & 0xFF; return true; });
-                break;
-            case "bool":
-                sp.Hook(ser, field, (nint c, int _, ref bool v) => { v = (c & 1) == 0; return true; });
-                break;
-            case "vec":
-                sp.Hook(ser, field, (nint c, int _, ref Vector3 v) => { v = new Vector3(c & 0xFF, 0, 0); return true; });
-                break;
-            case "string":
-                sp.Hook(ser, field, (nint c, int _, ref string v) => { v = $"client-{c & 0xFF}"; return true; });
-                break;
-            case "bytes":
-                sp.Hook(ser, field, (nint c, int _, ref byte[] v) => { v = new[] { (byte) (c & 0xFF) }; return true; });
-                break;
-            default:
-                Reply(issuer, $"sp_setpc: unknown type '{type}'. Types: int uint float bool vec string bytes");
-
-                return;
-        }
-
-        Reply(issuer, $"per-client: {ser}::{field} ({type}) — each client sees a value derived from its recipient ptr");
-    }
-
-    // sp_setent <entityIndex> <serializer> <field> <type> <value...> — uniform spoof scoped to one entity.
-    private void OnSetEnt(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        if (command.ArgCount < 4 || !int.TryParse(command.GetArg(1), out var idx))
-        {
-            Reply(issuer, "usage: sp_setent <entityIndex> <serializer> <field> <type> <value...>");
-
-            return;
-        }
-
-        if (_entityManager.FindEntityByIndex((EntityIndex) idx) is not { } entity)
-        {
-            Reply(issuer, $"no entity at index {idx}");
-
-            return;
-        }
-
-        var ser   = command.GetArg(2);
-        var field = command.GetArg(3);
-        var type  = command.GetArg(4).ToLowerInvariant();
-
-        switch (type)
-        {
-            case "int" when TryInt(command, 5, out var i):     sp.SetUniform(entity, ser, field, i); break;
-            case "uint" when TryInt(command, 5, out var u):    sp.SetUniform(entity, ser, field, u); break;
-            case "float" when TryFloat(command, 5, out var f): sp.SetUniform(entity, ser, field, f); break;
-            case "bool" when TryBool(command, 5, out var b):   sp.SetUniform(entity, ser, field, b); break;
-            case "vec" when TryVec(command, 5, out var v):     sp.SetUniform(entity, ser, field, v); break;
-            case "string":                                     sp.SetUniform(entity, ser, field, RestOfArgs(command, 5)); break;
-            case "bytes" when TryBytes(command, 5, out var by): sp.SetUniform(entity, ser, field, by); break;
-            default:
-                Reply(issuer, $"sp_setent: bad type/value for '{type}'");
-
-                return;
-        }
-
-        Reply(issuer, $"entity #{idx}: {ser}::{field} ({type}) spoofed (other entities unaffected)");
-    }
-
-    // sp_unset <serializer> <field> — remove the all-entities registration for a field.
-    private void OnUnset(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        if (command.ArgCount < 2)
-        {
-            Reply(issuer, "usage: sp_unset <serializer> <field>");
-
-            return;
-        }
-
-        sp.Unhook(command.GetArg(1), command.GetArg(2));
-        Reply(issuer, $"unhooked {command.GetArg(1)}::{command.GetArg(2)}");
-    }
-
-    // sp_clear — remove every registration and uninstall the substitution detours.
-    private void OnClear(IGameClient? issuer, StringCommand command)
-    {
-        _sendProxy?.UnhookAll();
-        Reply(issuer, "all registrations cleared, substitution detours uninstalled");
-    }
-
-    private void OnHelp(IGameClient? issuer, StringCommand command)
-    {
-        Reply(issuer, "SendProxy test matrix:");
-        Reply(issuer, "  sp_set    <ser> <field> <type> <value...>   uniform (all clients)");
-        Reply(issuer, "  sp_setpc  <ser> <field> <type>              per-client (value varies per recipient)");
-        Reply(issuer, "  sp_setent <idx> <ser> <field> <type> <val>  scoped to one entity");
-        Reply(issuer, "  sp_sendfake <value>                         one-shot fake HUD HP to you only (force-resend)");
-        Reply(issuer, "  sp_unset  <ser> <field>   |   sp_clear   |   sp_help");
-        Reply(issuer, "types -> encoder bucket: int=b1  uint=b2  vec=b3(qangle/vector/coord/quantized)  float=b4  string=b5  bytes=b6  bool=b7");
-        Reply(issuer, "examples:");
-        Reply(issuer, "  sp_set CCSPlayerPawn m_iHealth int 1337");
-        Reply(issuer, "  sp_set CCSPlayerController m_iszPlayerName string Hacker");
-        Reply(issuer, "  sp_setpc CCSPlayerPawn m_iHealth int        (each client a different HP)");
-        Reply(issuer, "  sp_setent 3 CCSPlayerPawn m_iHealth int 1   (only entity #3)");
-        Reply(issuer, "canned per-bucket demos: sp_encoder1..7 (1=int 2=uint 3=qangle 4=float 5=string 6=bytes 7=bool), sp_encoders_off to revert");
-        Reply(issuer, "  sp_fakeaim <target>   per-client+per-entity: fake HP/team/colour/glow on a target (@aim/nick/@t), only YOU see it; sp_fakeaim_off");
-        Reply(issuer, "  sp_fakehp <n> | sp_fakename <text>            quick uniform presets");
-        Reply(issuer, "discover fields/types with sp_probe_dump <entityIndex> / sp_probe_field <ser> <field>");
-    }
-
-    #endregion
-
-    #region Presets
-
-    // sp_fakehp <n> — shortcut: uniform fake HP on all players.
-    private void OnFakeHp(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        if (command.ArgCount < 1 || !int.TryParse(command.GetArg(1), out var value))
-        {
-            Reply(issuer, "usage: sp_fakehp <value>   (0/off via sp_unset CCSPlayerPawn m_iHealth)");
-
-            return;
-        }
-
-        sp.SetUniform("CCSPlayerPawn", "m_iHealth", value);
-        Reply(issuer, $"all clients now see {value} HP on every player (real HP unchanged)");
-    }
-
-    // sp_fakename <text> — shortcut: uniform fake player name (b5 string).
-    private void OnFakeName(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        if (command.ArgCount < 1)
-        {
-            Reply(issuer, "usage: sp_fakename <text>");
-
-            return;
-        }
-
-        var name = RestOfArgs(command, 1);
-        sp.SetUniform("CCSPlayerController", "m_iszPlayerName", name);
-        Reply(issuer, $"all clients now see \"{name}\" as every player's name");
-    }
-
-    // sp_sendfake <n> — one-shot: push fake HUD HP to YOU only, once. Unlike sp_setpc/sp_fakehp this does
-    // not persist — it force-dirties m_iPawnHealth so it re-transmits immediately and fakes that single
-    // send. Use it to push a value before deciding to Hook. Demonstrates the per-client SendFake path.
-    private void OnSendFake(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        if (issuer is null)
-        {
-            return;
-        }
-
-        if (command.ArgCount < 1 || !int.TryParse(command.GetArg(1), out var value))
-        {
-            Reply(issuer, "usage: sp_sendfake <value>   (one-shot fake HUD HP to you only)");
-
-            return;
-        }
-
-        if (issuer.GetPlayerController() is not { } controller)
-        {
-            Reply(issuer, "sp_sendfake: could not resolve your controller entity");
-
-            return;
-        }
-
-        // HP lives in two places — controller mirror (m_iPawnHealth) + pawn actual (m_iHealth) — so push
-        // both for a consistent HUD. SendFake force-dirties the field, so it shows on the next snapshot
-        // (no slap needed) and fires once.
-        sp.SendFake(issuer, controller, "CCSPlayerController", "m_iPawnHealth", value);
-        if (controller.GetPlayerPawn() is { } pawn)
-        {
-            sp.SendFake(issuer, pawn, "CCSPlayerPawn", "m_iHealth", value);
-        }
-
-        Reply(issuer, $"one-shot: you should see {value} HP on the next update (real HP unchanged, fires once, no slap needed)");
-    }
-
-    // sp_fakeaim <target> — resolve a target string via TargetingManager (@aim, a nick, @t, multiple…) and
-    // make each resolved player appear, ONLY to the issuer, with fake HP (1) + team (CT) + a continuously
-    // cycling render colour. Pure per-client + per-entity: every other client still sees the real values.
-    // A repeating timer advances the colour and re-dirties m_clrRender on the targets so it keeps changing.
-    private void OnFakeAim(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp || issuer is null)
-        {
-            return;
-        }
-
-        if (_targeting?.Instance is not { } targeting)
-        {
-            Reply(issuer, "sp_fakeaim: TargetingManager not available");
-
-            return;
-        }
-
-        var targetArg = command.ArgCount >= 1 ? command.GetArg(1) : PredefinedTargets.Aim;
-
-        // Clear any previous session so hooks/timer don't stack.
-        ClearFakeAim(sp);
-
-        var targets = targeting.GetByTarget(issuer, targetArg).ToList();
-        if (targets.Count == 0)
-        {
-            Reply(issuer, $"sp_fakeaim: no targets matched '{targetArg}'");
-
-            return;
-        }
-
-        _aimIssuer = issuer.GetAbsPtr();
-        var issuerPtr = _aimIssuer;
-        _aimHue   = 0;
-        _aimColor = 0xFF0000FFu; // opaque red to start (RGBA)
-
-        foreach (var target in targets)
-        {
-            if (target.GetPlayerController() is not { } ctrl)
-            {
-                continue;
-            }
-
-            _aimControllers.Add((int) ctrl.Index);
-            sp.Hook(ctrl, "CCSPlayerController", "m_iPawnHealth", (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 1; return true; });
-            sp.Hook(ctrl, "CCSPlayerController", "m_iTeamNum",    (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
-            ctrl.NetworkStateChanged("m_iPawnHealth");   // force an initial re-send so it shows at once
-            ctrl.NetworkStateChanged("m_iTeamNum");
-
-            if (ctrl.GetPlayerPawn() is { } pawn)
-            {
-                _aimPawns.Add((int) pawn.Index);
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iHealth",          (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 1; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iTeamNum",         (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_clrRender",        (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = unchecked((int) _aimColor); return true; });
-                // Glow: enable a coloured outline (m_iGlowType nonzero) tinted by the same cycling colour.
-                // Both are nested under m_Glow; best-effort (enable mechanics / color-encoder may vary).
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iGlowType",        (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_glowColorOverride", (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = unchecked((int) _aimColor); return true; });
-                pawn.NetworkStateChanged("m_iHealth");
-                pawn.NetworkStateChanged("m_iTeamNum");
-                pawn.NetworkStateChanged("m_clrRender");
-                pawn.NetworkStateChanged("m_iGlowType");
-                pawn.NetworkStateChanged("m_glowColorOverride");
-            }
-        }
-
-        // Drive the colour cycle: every 100ms advance the hue and re-dirty the colour fields on each target
-        // so the engine re-sends them (the per-client hook then writes the new colour). Repeatable timer.
-        _aimTimer = _modSharp.PushTimer(CycleFakeAim, 0.1, GameTimerFlags.Repeatable);
-
-        Reply(issuer, $"sp_fakeaim: faking HP/team/colour/glow on {targets.Count} target(s) — only YOU see it. sp_fakeaim_off to clear.");
-    }
-
-    private void OnFakeAimOff(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is { } sp)
-        {
-            ClearFakeAim(sp);
-        }
-
-        Reply(issuer, "sp_fakeaim_off: cleared (real values re-sent)");
-    }
-
-    // Timer tick: advance the cycling colour and re-dirty m_clrRender on every target so it re-transmits.
-    private void CycleFakeAim()
-    {
-        _aimHue   = (_aimHue + 15) % 360;
-        _aimColor = HueToRgba(_aimHue);
-
-        foreach (var pidx in _aimPawns)
-        {
-            if (_entityManager.FindEntityByIndex((EntityIndex) pidx) is { } pawn)
-            {
-                pawn.NetworkStateChanged("m_clrRender");
-                pawn.NetworkStateChanged("m_glowColorOverride");
-            }
-        }
-    }
-
-    // Tear down a fakeaim session: stop the timer, unhook every per-entity registration on the targets, then
-    // re-dirty so the real values go back out, and clear state.
-    private void ClearFakeAim(ISendProxyManager sp)
-    {
-        if (_aimTimer != Guid.Empty)
-        {
-            _modSharp.StopTimer(_aimTimer);
-            _aimTimer = Guid.Empty;
-        }
-
-        foreach (var cidx in _aimControllers)
-        {
-            if (_entityManager.FindEntityByIndex((EntityIndex) cidx) is not { } ctrl)
-            {
-                continue;
-            }
-
-            sp.Unhook(ctrl, "CCSPlayerController", "m_iPawnHealth");
-            sp.Unhook(ctrl, "CCSPlayerController", "m_iTeamNum");
-            ctrl.NetworkStateChanged("m_iPawnHealth");
-            ctrl.NetworkStateChanged("m_iTeamNum");
-        }
-
-        foreach (var pidx in _aimPawns)
-        {
-            if (_entityManager.FindEntityByIndex((EntityIndex) pidx) is not { } pawn)
-            {
-                continue;
-            }
-
-            sp.Unhook(pawn, "CCSPlayerPawn", "m_iHealth");
-            sp.Unhook(pawn, "CCSPlayerPawn", "m_iTeamNum");
-            sp.Unhook(pawn, "CCSPlayerPawn", "m_clrRender");
-            sp.Unhook(pawn, "CCSPlayerPawn", "m_iGlowType");
-            sp.Unhook(pawn, "CCSPlayerPawn", "m_glowColorOverride");
-            pawn.NetworkStateChanged("m_iHealth");
-            pawn.NetworkStateChanged("m_iTeamNum");
-            pawn.NetworkStateChanged("m_clrRender");
-            pawn.NetworkStateChanged("m_iGlowType");
-            pawn.NetworkStateChanged("m_glowColorOverride");
-        }
-
-        _aimControllers.Clear();
-        _aimPawns.Clear();
-        _aimIssuer = 0;
-    }
-
-    // Full-saturation hue (0..359) -> packed RGBA (R | G<<8 | B<<16 | A<<24), opaque.
-    private static uint HueToRgba(int hue)
-    {
-        var h = hue / 60;
-        var f = (hue % 60) / 60f;
-        var q = (byte) (255 * (1 - f));
-        var t = (byte) (255 * f);
-
-        var (r, g, b) = h switch
-        {
-            0 => ((byte) 255, t, (byte) 0),
-            1 => (q, (byte) 255, (byte) 0),
-            2 => ((byte) 0, (byte) 255, t),
-            3 => ((byte) 0, q, (byte) 255),
-            4 => (t, (byte) 0, (byte) 255),
-            _ => ((byte) 255, (byte) 0, q),
-        };
-
-        return (uint) (r | (g << 8) | (b << 16) | (0xFF << 24));
-    }
-
-    #endregion
-
-    #region Per-encoder real-use demos (sp_encoder1..7)
-
-    // Force a field to re-transmit right now (mark it dirty on every player) so a uniform spoof shows
-    // immediately — no need to wait for the value to change naturally (a slap, a move, etc.). This is the
-    // "do it from the plugin alone" trigger: NetworkStateChanged sets the engine's per-field dirty bit, so
-    // the field lands in the next snapshot and the uniform encoder hook fakes whatever is re-sent. Routes
-    // to the controller for CCSPlayerController fields and to the pawn otherwise.
-    private void ForceResendAll(string serializerName, string fieldName)
-    {
-        var onController = serializerName.Contains("Controller", StringComparison.Ordinal);
-        foreach (var client in _clientManager.GetGameClients(inGame: true))
-        {
-            // Bots have no screen and the engine never sends them snapshots, so there's nothing to
-            // re-transmit on their behalf — skip them.
-            if (client.IsFakeClient || client.IsHltv)
-            {
-                continue;
-            }
-
-            if (client.GetPlayerController() is not { } controller)
-            {
-                continue;
-            }
-
-            if (onController)
-            {
-                controller.NetworkStateChanged(fieldName);
-            }
-            else if (controller.GetPlayerPawn() is { } pawn)
-            {
-                pawn.NetworkStateChanged(fieldName);
-            }
-        }
-    }
-
-    // One canned demo per encoder bucket, each on a real networked field. sp_encoders_off reverts.
-    // bucket 1 — signed int — fake HP. The HUD reads CCSPlayerController::m_iPawnHealth (not the pawn's
-    // m_iHealth), so spoof both: m_iPawnHealth drives the on-screen number, m_iHealth the pawn value.
-    private void OnEncoder1(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        sp.SetUniform("CCSPlayerController", "m_iPawnHealth", 1337);
-        sp.SetUniform("CCSPlayerPawn", "m_iHealth", 1337);
-        ForceResendAll("CCSPlayerController", "m_iPawnHealth");
-        ForceResendAll("CCSPlayerPawn", "m_iHealth");
-        Reply(issuer, "enc1 (int b1): m_iPawnHealth (HUD) + m_iHealth = 1337 — shown immediately (no slap needed)");
-    }
-
-    // bucket 2 — unsigned int — m_iTeamNum (uint8): every player shows as CT to all clients. m_iTeamNum
-    // lives on CBaseEntity, so BOTH the pawn (radar/outline/world model) and the controller (scoreboard)
-    // carry it — spoof both for the full effect. Real use: disguise team membership.
-    private void OnEncoder2(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        sp.SetUniform("CCSPlayerPawn", "m_iTeamNum", 3);
-        sp.SetUniform("CCSPlayerController", "m_iTeamNum", 3);
-        ForceResendAll("CCSPlayerPawn", "m_iTeamNum");
-        ForceResendAll("CCSPlayerController", "m_iTeamNum");
-        Reply(issuer, "enc2 (uint b2): m_iTeamNum = 3 (CT) on pawn + controller — all players appear CT (radar/outline + scoreboard)");
-    }
-
-    // bucket 3 — qangle — m_angEyeAngles (encoder qangle_precise): flips where every player appears to be
-    // looking. An "others see you" field — your OWN view is client-controlled, so observe another player or
-    // a bot (or spectate) to see it. The b3 family (qangle/coord/quantized) is also proven on the wire by
-    // the quantized struct-dump diag. (m_vecViewOffset can't be uniform-spoofed: its three quantized
-    // sub-fields share the bare names m_vecX/Y/Z with m_vecOrigin, and uniform matches by name only.)
-    private void OnEncoder3(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        sp.SetUniform("CCSPlayerPawn", "m_angEyeAngles", new Vector3(0f, 180f, 0f));
-        ForceResendAll("CCSPlayerPawn", "m_angEyeAngles");
-        Reply(issuer, "enc3 (qangle b3): m_angEyeAngles = (0,180,0) — fakes where a player is looking (their camera). SPECTATE someone to see it: their spectate view points the spoofed way. sp_encoders_off to clear.");
-    }
-
-    // bucket 4 — float — m_flScale (model scale): every player renders tiny (0.3x) to all clients.
-    // Dramatic + actually rendered from the netvar; server keeps real scale = 1, so hitboxes/collision are
-    // unchanged (purely visual). A networked leaf, so the resend resolves. Observe another player or a bot.
-    private void OnEncoder4(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        sp.SetUniform("CCSPlayerPawn", "m_flScale", 0.3f);
-        ForceResendAll("CCSPlayerPawn", "m_flScale");
-        Reply(issuer, "enc4 (float b4): m_flScale = 0.3 — every player renders tiny to all clients (real size unchanged). Observe another player/bot. sp_encoders_off to clear.");
-    }
-
-    // bucket 5 — string — m_iszPlayerName: every player shows the same name.
-    private void OnEncoder5(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        sp.SetUniform("CCSPlayerController", "m_iszPlayerName", "SendProxyTest");
-        ForceResendAll("CCSPlayerController", "m_iszPlayerName");
-        Reply(issuer, "enc5 (string b5): CCSPlayerController::m_iszPlayerName = \"SendProxyTest\" for all clients");
-    }
-
-    // bucket 6 — byte-array — no common byte-array netvar exists on the player schema; point the tester
-    // at the generic path so they can exercise b6 on whatever field they find via the probe.
-    private void OnEncoder6(IGameClient? issuer, StringCommand command)
-    {
-        Reply(issuer, "enc6 (bytes b6): no common byte-array field on players. Find one via sp_probe_dump,");
-        Reply(issuer, "then: sp_set <serializer> <field> bytes <hexstring>   (e.g. bytes DEADBEEF)");
-    }
-
-    // bucket 7 — bool — m_bIsScoped: every player appears scoped.
-    private void OnEncoder7(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        sp.SetUniform("CCSPlayerPawn", "m_bIsScoped", true);
-        ForceResendAll("CCSPlayerPawn", "m_bIsScoped");
-        Reply(issuer, "enc7 (bool b7): CCSPlayerPawn::m_bIsScoped = true — all players appear scoped to all clients");
-    }
-
-    private void OnEncodersOff(IGameClient? issuer, StringCommand command)
-    {
-        if (_sendProxy is not { } sp)
-        {
-            return;
-        }
-
-        (string ser, string field)[] fields =
-        {
-            ("CCSPlayerController", "m_iPawnHealth"),
-            ("CCSPlayerPawn", "m_iHealth"),
-            ("CCSPlayerPawn", "m_iTeamNum"),
-            ("CCSPlayerController", "m_iTeamNum"),
-            ("CCSPlayerPawn", "m_angEyeAngles"),
-            ("CCSPlayerPawn", "m_flScale"),
-            ("CCSPlayerController", "m_iszPlayerName"),
-            ("CCSPlayerPawn", "m_bIsScoped"),
-        };
-
-        foreach (var (ser, field) in fields)
-        {
-            sp.Unhook(ser, field);
-        }
-
-        // Unhook only STOPS the spoof — clients still hold the last fake value, and a static field isn't
-        // re-sent until it changes. Force a resend AFTER unhooking so the real value goes back out and
-        // every client reverts immediately (otherwise they'd stay faked until the field naturally changed).
-        foreach (var (ser, field) in fields)
-        {
-            ForceResendAll(ser, field);
-        }
-
-        Reply(issuer, "sp_encoders_off: reverted all sp_encoder1..7 demos (real values re-sent)");
-    }
-
-    #endregion
-
-    #region Serializer probe (read-only)
-
-    private void OnProbeScan(IGameClient? issuer, StringCommand command)
-    {
-        Reply(issuer, "sp_probe_scan: scanning live entities (see server log)");
-        SerializerProbe.Scan(_entityManager, _logger);
-    }
-
-    private void OnProbeDump(IGameClient? issuer, StringCommand command)
-    {
-        if (command.ArgCount < 1 || !int.TryParse(command.GetArg(1), out var idx))
-        {
-            Reply(issuer, "usage: sp_probe_dump <entityIndex>");
-
-            return;
-        }
-
-        Reply(issuer, $"sp_probe_dump: dumping entity {idx} (see server log)");
-        SerializerProbe.Dump(_entityManager, _logger, idx);
-    }
-
-    private void OnProbeField(IGameClient? issuer, StringCommand command)
-    {
-        if (command.ArgCount < 2)
-        {
-            Reply(issuer, "usage: sp_probe_field <serializerClass> <fieldName>");
-
-            return;
-        }
-
-        Reply(issuer, $"sp_probe_field: dumping {command.GetArg(1)}::{command.GetArg(2)} (see server log)");
-        SerializerProbe.DumpField(_entityManager, _logger, command.GetArg(1), command.GetArg(2));
-    }
-
-    #endregion
-
-    #region Helpers
-
-    private void Reply(IGameClient? issuer, string message)
-    {
-        // Print at the CLIENT level, not via the pawn — pawn.Print routes through the pawn's controller
-        // and throws "Controller is null" when the command comes from console/RCON or the issuer's pawn
-        // isn't linked to a controller. issuer.Print goes straight to the client. Fall back to the server
-        // log for console invocations (issuer == null) or if the client print throws for any reason.
-        if (issuer is { IsValid: true })
-        {
-            try
-            {
-                issuer.Print(HudPrintChannel.Chat, message);
-
-                return;
-            }
-            catch (Exception ex)
-            {
-                _logger.LogWarning(ex, "SendProxy example: client Print failed — logging instead");
-            }
-        }
-
-        _logger.LogInformation("{Message}", message);
-    }
-
-    private static bool TryInt(StringCommand cmd, int argIndex, out int value)
-    {
-        value = 0;
-        if (cmd.ArgCount < argIndex
-            || !long.TryParse(cmd.GetArg(argIndex), NumberStyles.Integer, CultureInfo.InvariantCulture, out var l))
-        {
-            return false;
-        }
-
-        value = unchecked((int) l);
-
-        return true;
-    }
-
-    private static bool TryFloat(StringCommand cmd, int argIndex, out float value)
-    {
-        value = 0f;
-
-        return cmd.ArgCount >= argIndex
-            && float.TryParse(cmd.GetArg(argIndex), NumberStyles.Float, CultureInfo.InvariantCulture, out value);
-    }
-
-    private static bool TryBool(StringCommand cmd, int argIndex, out bool value)
-    {
-        value = false;
-        if (cmd.ArgCount < argIndex)
-        {
-            return false;
-        }
-
-        var s = cmd.GetArg(argIndex);
-        if (s is "1" or "true" or "yes")
-        {
-            value = true;
-
-            return true;
-        }
-
-        return s is "0" or "false" or "no";
-    }
-
-    private static bool TryVec(StringCommand cmd, int argIndex, out Vector3 value)
-    {
-        value = default;
-        if (cmd.ArgCount < argIndex + 2
-            || !float.TryParse(cmd.GetArg(argIndex), NumberStyles.Float, CultureInfo.InvariantCulture, out var x)
-            || !float.TryParse(cmd.GetArg(argIndex + 1), NumberStyles.Float, CultureInfo.InvariantCulture, out var y)
-            || !float.TryParse(cmd.GetArg(argIndex + 2), NumberStyles.Float, CultureInfo.InvariantCulture, out var z))
-        {
-            return false;
-        }
-
-        value = new Vector3(x, y, z);
-
-        return true;
-    }
-
-    // Parse a contiguous hex string (e.g. "DEADBEEF") into bytes.
-    private static bool TryBytes(StringCommand cmd, int argIndex, out byte[] value)
-    {
-        value = Array.Empty<byte>();
-        if (cmd.ArgCount < argIndex)
-        {
-            return false;
-        }
-
-        var hex = cmd.GetArg(argIndex);
-        if (hex.Length == 0 || (hex.Length & 1) != 0)
-        {
-            return false;
-        }
-
-        var bytes = new byte[hex.Length / 2];
-        for (var i = 0; i < bytes.Length; i++)
-        {
-            if (!byte.TryParse(hex.AsSpan(i * 2, 2), NumberStyles.HexNumber, CultureInfo.InvariantCulture, out bytes[i]))
-            {
-                return false;
-            }
-        }
-
-        value = bytes;
-
-        return true;
-    }
-
-    // Join arg[from..ArgCount] with spaces (for free-text string values).
-    private static string RestOfArgs(StringCommand cmd, int from)
-    {
-        if (cmd.ArgCount < from)
-        {
-            return string.Empty;
-        }
-
-        var parts = new string[cmd.ArgCount - from + 1];
-        for (var i = 0; i < parts.Length; i++)
-        {
-            parts[i] = cmd.GetArg(from + i);
-        }
-
-        return string.Join(' ', parts);
     }
 
     #endregion
