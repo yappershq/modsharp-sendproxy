@@ -512,6 +512,15 @@ internal static unsafe class FieldSubstitution
         uint p6,
         uint p7, nint p8, uint p9)
     {
+        // No per-client registrations → nothing to substitute below; skip the serializer capture entirely.
+        if (_registry.IsEmpty)
+        {
+            return ((delegate* unmanaged[Cdecl]<
+                nint, nint, nint, nint, nint, uint,
+                uint, nint, uint,
+                nint>) _wflShimTrampoline)(a, b, c, d, e, p6, p7, p8, p9);
+        }
+
         _currentSerializer = a;
         var result = ((delegate* unmanaged[Cdecl]<
             nint, nint, nint, nint, nint, uint,
@@ -525,6 +534,13 @@ internal static unsafe class FieldSubstitution
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static nint WdeEntityCaptureHook(nint a, nint b, nint c, nint d, nint e, nint f)
     {
+        // No per-client registrations → skip the entity-index/snapshot capture.
+        if (_registry.IsEmpty)
+        {
+            return ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nint, nint, nint>)
+                _wdeEntityCaptureTrampoline)(a, b, c, d, e, f);
+        }
+
         var entityIndex = -1;
         var snapshotPtr = (nint) 0;
 
@@ -555,12 +571,25 @@ internal static unsafe class FieldSubstitution
     private static void GetBitRangeHook(nint pathOut, nint table, uint registryIndex)
     {
         ((delegate* unmanaged[Cdecl]<nint, nint, uint, void>) _getBitRangeTrampoline)(pathOut, table, registryIndex);
-        _currentFieldPath = NativeUtil.IsUserPtr(pathOut) ? pathOut : 0;
+
+        // Only capture the field path when there's something to substitute (ValueCopyHook is gated the same).
+        if (!_registry.IsEmpty)
+        {
+            _currentFieldPath = NativeUtil.IsUserPtr(pathOut) ? pathOut : 0;
+        }
     }
 
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static byte ValueCopyHook(nint dst, nint src, uint bitcount)
     {
+        // Hot path: this fires for every field copy of every entity for every client. With no per-client
+        // registrations there is nothing to substitute, so short-circuit before any resolve work — the
+        // detour then costs only this one check plus the trampoline.
+        if (_registry.IsEmpty)
+        {
+            return CallOriginal(dst, src, bitcount);
+        }
+
         var mode = (SubstitutionMode) _mode;
         if (mode == SubstitutionMode.Off || !NativeUtil.IsUserPtr(_currentSerializer))
         {
