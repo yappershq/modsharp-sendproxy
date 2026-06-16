@@ -514,10 +514,9 @@ public sealed class ExampleModule : IModSharpModule
         Reply(issuer, "enc3 (qangle b3): CCSPlayerPawn::m_angEyeAngles = (0,180,0) — players look backwards to all clients");
     }
 
-    // FOV zoom — m_iDesiredFOV (CBasePlayerController, uint): every client's view zooms in. This is the
-    // visible FOV field (the one game code uses to zoom, e.g. binoculars). NOTE m_flViewmodelFOV (the gun
-    // FOV) is a quantized float that substitutes correctly on the wire but isn't visibly rendered (own-view
-    // + client viewmodel_fov cvar), so it's a poor demo despite the encoder working — see docs.
+    // bucket 4 — float — m_flFlashDuration: every client renders a flash-blind white-out. A genuinely
+    // float-encoded field whose effect is unmistakable (unlike m_flViewmodelFOV, a quantized float that
+    // substitutes correctly on the wire but isn't visibly rendered — own-view + client viewmodel_fov cvar).
     private void OnEncoder4(IGameClient? issuer, StringCommand command)
     {
         if (_sendProxy is not { } sp)
@@ -525,9 +524,12 @@ public sealed class ExampleModule : IModSharpModule
             return;
         }
 
-        sp.SetUniform("CCSPlayerController", "m_iDesiredFOV", 40);
-        ForceResendAll("CCSPlayerController", "m_iDesiredFOV");
-        Reply(issuer, "enc4: CCSPlayerController::m_iDesiredFOV = 40 — every client's view zooms in (visible FOV)");
+        // Flash render needs both: max alpha (intensity 0..255) AND duration (how long it holds/fades).
+        sp.SetUniform("CCSPlayerPawn", "m_flFlashMaxAlpha", 255f);
+        sp.SetUniform("CCSPlayerPawn", "m_flFlashDuration", 5f);
+        ForceResendAll("CCSPlayerPawn", "m_flFlashMaxAlpha");
+        ForceResendAll("CCSPlayerPawn", "m_flFlashDuration");
+        Reply(issuer, "enc4 (float b4): m_flFlashMaxAlpha=255 + m_flFlashDuration=5 — every client flashed white (visible float). sp_encoders_off to clear.");
     }
 
     // bucket 5 — string — m_iszPlayerName: every player shows the same name.
@@ -576,7 +578,7 @@ public sealed class ExampleModule : IModSharpModule
         sp.Unhook("CCSPlayerPawn", "m_iTeamNum");
         sp.Unhook("CCSPlayerController", "m_iTeamNum");
         sp.Unhook("CCSPlayerPawn", "m_angEyeAngles");
-        sp.Unhook("CCSPlayerController", "m_iDesiredFOV");
+        sp.Unhook("CCSPlayerPawn", "m_flFlashDuration");
         sp.Unhook("CCSPlayerController", "m_iszPlayerName");
         sp.Unhook("CCSPlayerPawn", "m_bIsScoped");
         Reply(issuer, "sp_encoders_off: reverted all sp_encoder1..7 demos");
