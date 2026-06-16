@@ -22,6 +22,10 @@ each snapshot is encoded. Three targeting modes:
 > This library substitutes per-client by rewriting the per-field bits in the send loop. Full
 > analysis: **[`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md)**.
 
+> **New here?** Read **[`docs/HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md)** first — a plain-English
+> walkthrough of why this is hard on Source 2, the two substitution paths, the encoder families, the
+> API, and the gotchas.
+
 ## Supported field types
 
 | Category | Types | Status |
