@@ -165,8 +165,16 @@ loads the serializer singleton (`DAT_1806858a0`) and calls its vtable slot 8 (`+
 cross-platform unchanged; only the global-load sig differs and both are now in the gamedata
 (`CNetworkSerialization::SerializerSingleton`, linux + windows, `+3 r`).
 
-Remaining: first-enable verification of the flattened-leaf index numbering (the one value derived by
-assumption — DFS serializer-walk order; everything else is RE-confirmed). The C# implementation is DONE
+Leaf-index numbering — **RE-CONFIRMED** (no longer an assumption for standard fields): EncodeField
+(libnetworksystem 0x4334e0) assigns each field its flat index via a per-leaf counter (`param_8`,
+`*param_8 = n+1`) that increments in **record-walk DFS order** over the serializer field array
+(`*(serializer+0x30)`, stride 0x2e, descending embedded child serializers) — which is exactly what
+`ForceResend.WalkLeaves` reproduces. So the index↔name map matches the snapshot/CalcDelta index space for
+standard fields. Residual edge to confirm on hardware: polymorphic / dynamic-array fields (EncodeField
+branches on fieldInfo flags +0xD0 &0x40 for those) may number differently — the common spoof targets
+(health/team/colour/glow) are standard and match.
+
+The C# implementation is DONE
 (gated, off by default): `ForceResend.cs` + `ISendProxyManager.SetForceResend` + the `sp_forceresend <0|1>`
 command. Enable, confirm a spoof applies live, then it can be wired to auto-enable on per-client
 registration (drop the manual toggle).
