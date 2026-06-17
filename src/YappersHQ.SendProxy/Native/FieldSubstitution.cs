@@ -24,14 +24,13 @@ using System.Numerics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
-using System.Threading;
 using Microsoft.Extensions.Logging;
-using Sharp.Shared.GameEntities;
 using Sharp.Shared.Hooks;
 using Sharp.Shared.Managers;
 using Sharp.Shared.Objects;
 using Sharp.Shared.Units;
 using YappersHQ.SendProxy.Shared;
+
 
 namespace YappersHQ.SendProxy.Native;
 
@@ -48,12 +47,6 @@ namespace YappersHQ.SendProxy.Native;
 // work (building the substitute buffer) completes BEFORE the native save/rewind/emit sequence, so that
 // sequence has no managed throw-site and needs no guard of its own.
 
-internal enum SubstitutionMode
-{
-    Off,
-    Fake,
-}
-
 // Network encoder family for a registered field. The Coord3/Normal3/CoordIntegral3/QuantizedFloat set
 // requires reading the live value struct from the entity snapshot (the encoder's quant logic must see
 // the real float). String re-points the value at a scratch char*; ByteArray hands the encoder a scratch
@@ -68,177 +61,8 @@ internal enum FieldType
     String, ByteArray,
 }
 
-// CallbackKind maps a SpoofValue.Kind (or uniform-value Kind) to the set of FieldTypes it can drive.
-// Kept internal so CallbackMatches can gate the dispatch without exposing it to consumers.
-internal enum CallbackKind
-{
-    None = 0,
-    Int,
-    Float,
-    Bool,
-    Vector,
-    String,
-    Bytes,
-}
-
 internal static unsafe class FieldSubstitution
 {
-    private static volatile int _mode = (int) SubstitutionMode.Off;
-
-    public static SubstitutionMode Mode
-    {
-        get => (SubstitutionMode) _mode;
-        set => Interlocked.Exchange(ref _mode, (int) value);
-    }
-
-    // A registration holds either a uniform SpoofValue (no Callback) or a per-client SendProxyCallback
-    // (with Value seeded as the initial value passed to the callback). Key entityIndex: -1 = all entities
-    // (global), >= 0 = a specific entity. ValueCopyHook probes the entity-specific entry first, then the
-    // global fallback — both lock-free dictionary reads.
-    private readonly struct SpoofEntry
-    {
-        public readonly SpoofValue         Value;
-        public readonly SendProxyCallback? Callback;
-
-        // Assembly name of the module that owns this callback (null for uniform spoofs, which hold no
-        // delegate). Used to purge a consumer's callbacks when its module unloads — invoking a delegate
-        // into an unloaded AssemblyLoadContext would crash the server.
-        public readonly string? Owner;
-
-        // One-shot (SendFake) support. When OneShot is set the registration fires for exactly the
-        // TargetClient on its next transmit and is then removed; sends to other clients pass through
-        // untouched. TargetClient is the CServerSideClient* (matched against RecipientCapture.CurrentClient).
-        public readonly bool OneShot;
-        public readonly nint TargetClient;
-
-        // Uniform spoof: store value directly, no callback.
-        public SpoofEntry(in SpoofValue value) : this()
-            => Value = value;
-
-        // One-shot (SendFake): a uniform-style value bound to a single target client.
-        public SpoofEntry(in SpoofValue value, nint targetClient) : this()
-        {
-            Value        = value;
-            OneShot      = true;
-            TargetClient = targetClient;
-        }
-
-        // Per-client callback; Value carries the optional seed (default zero for that kind).
-        public SpoofEntry(SendProxyCallback callback, in SpoofValue seed) : this()
-        {
-            Value    = seed;
-            Callback = callback;
-            Owner    = OwnerOf(callback);
-        }
-
-        // The defining assembly of the callback target = the consumer module that registered it.
-        private static string? OwnerOf(Delegate callback)
-            => callback.Method.Module.Assembly.GetName().Name;
-
-        public bool HasCallback => Callback is not null;
-
-        // Derive a CallbackKind from SpoofValue.Kind so CallbackMatches can gate by field family.
-        // A SpoofKind.Int seed is compatible with the full integer family (int/uint/bool/fixed).
-        private static CallbackKind KindOf(SpoofKind k)
-            => k switch
-            {
-                SpoofKind.Int    => CallbackKind.Int,
-                SpoofKind.Float  => CallbackKind.Float,
-                SpoofKind.Bool   => CallbackKind.Bool,
-                SpoofKind.Vector => CallbackKind.Vector,
-                SpoofKind.String => CallbackKind.String,
-                SpoofKind.Bytes  => CallbackKind.Bytes,
-                _                => CallbackKind.None,
-            };
-
-        // True when this registration's value kind can drive the given field family. A mismatch (e.g.
-        // a string value on an int field) would write wrong-type bits, so the caller passes through.
-        public bool CallbackMatches(FieldType type)
-            => KindOf(Value.Kind) switch
-            {
-                CallbackKind.Int    => type is FieldType.Int32 or FieldType.UInt32 or FieldType.Int64 or FieldType.Bool or FieldType.Fixed32 or FieldType.Fixed64,
-                CallbackKind.Float  => type is FieldType.Float32 or FieldType.Coord3 or FieldType.Normal3 or FieldType.CoordIntegral3 or FieldType.QuantizedFloat,
-                CallbackKind.Bool   => type is FieldType.Bool,
-                CallbackKind.Vector => type is FieldType.QAngle3 or FieldType.Vector3 or FieldType.Coord3 or FieldType.Normal3 or FieldType.CoordIntegral3 or FieldType.QuantizedFloat,
-                CallbackKind.String => type is FieldType.String,
-                CallbackKind.Bytes  => type is FieldType.ByteArray,
-                _                   => false,
-            };
-    }
-
-    private static readonly ConcurrentDictionary<(string ser, string field, int entityIndex), SpoofEntry> _registry = new();
-
-    // -- Registration (called from SendProxyManager on the main thread) ----------------------------
-
-    public static void SetSpoof(string ser, string field, in SpoofValue value)
-        => _registry[(ser, field, -1)] = new SpoofEntry(value);
-
-    public static void SetCallback(string ser, string field, SendProxyCallback cb, in SpoofValue seed = default)
-        => _registry[(ser, field, -1)] = new SpoofEntry(cb, seed);
-
-    public static void SetEntitySpoof(int ent, string ser, string field, in SpoofValue value)
-        => _registry[(ser, field, ent)] = new SpoofEntry(value);
-
-    public static void SetEntityCallback(int ent, string ser, string field, SendProxyCallback cb, in SpoofValue seed = default)
-        => _registry[(ser, field, ent)] = new SpoofEntry(cb, seed);
-
-    // One-shot (SendFake): fire once for targetClient on the next transmit, then auto-remove. Entity-scoped
-    // (ent >= 0) so it never lingers across entity-index reuse; the force-dirty is issued by the caller.
-    public static void SetOneShot(int ent, string ser, string field, nint client, in SpoofValue value)
-        => _registry[(ser, field, ent)] = new SpoofEntry(value, client);
-
-    public static void ClearGlobal(string ser, string field)            => _registry.TryRemove((ser, field, -1), out _);
-    public static void ClearEntity(int ent, string ser, string field)   => _registry.TryRemove((ser, field, ent), out _);
-    public static void ClearAll()                                       => _registry.Clear();
-
-    // Remove every callback registration owned by an unloading module. A delegate into an unloaded
-    // AssemblyLoadContext would crash the server when the send path invokes it, so this is called from
-    // OnLibraryDisconnect. Uniform spoofs (Owner == null) hold no delegate and are left untouched.
-    public static int PurgeOwner(string moduleName)
-    {
-        var removed = 0;
-        foreach (var kv in _registry)
-        {
-            if (kv.Value.Owner == moduleName && _registry.TryRemove(kv.Key, out _))
-            {
-                removed++;
-            }
-        }
-
-        return removed;
-    }
-
-    // Drop every registration scoped to a specific entity index (called from OnEntityDeleted — indices
-    // are reused after disconnect/round restart, so stale entity-scoped registrations must not persist).
-    public static void ClearEntityIndex(int entityIndex)
-    {
-        if (entityIndex < 0)
-        {
-            return;
-        }
-
-        foreach (var key in _registry.Keys)
-        {
-            if (key.entityIndex == entityIndex)
-            {
-                _registry.TryRemove(key, out _);
-            }
-        }
-    }
-
-    public static bool IsHooked(string ser, string field)
-    {
-        foreach (var key in _registry.Keys)
-        {
-            if (key.ser == ser && key.field == field)
-            {
-                return true;
-            }
-        }
-
-        return false;
-    }
-
     // CFieldPath* filled by GetBitRange; valid for the BitCopyPrimitive call that follows on this thread.
     // Linux only: on Windows GetBitRange is inlined so _currentFieldPath stays 0; the Windows path uses
     // _currentFieldIndex instead.
@@ -257,6 +81,11 @@ internal static unsafe class FieldSubstitution
     // Entity index from WriteDeltaEntity ctx+0x34; -1 if not captured.
     [ThreadStatic]
     private static int _currentEntityIndex;
+
+    /// <summary>The entity index captured for the WriteDeltaEntity call in scope on THIS thread (ctx+0x34),
+    ///     or -1. ForceResend reads this rather than trusting an unverified WriteFields arg as the entity
+    ///     index — both run on the same send-worker thread inside WriteDeltaEntity_Internal.</summary>
+    public static int CurrentEntityIndex => _currentEntityIndex;
 
     // To-snapshot CFrameSnapshotEntry* (ctx+0x90), data regions at +0x30 — used by the live-struct path.
     [ThreadStatic]
@@ -277,11 +106,9 @@ internal static unsafe class FieldSubstitution
 
     private static ILogger? _logger;
 
-    // Managers used to hand the per-client callback idiomatic wrappers (IGameClient / IBaseEntity) instead
-    // of raw pointers/indices. Set at Install. Both lookups are pointer/array reads — safe to call on the
-    // engine send worker thread for IDENTITY (the callback contract forbids mutating engine state).
+    // Client manager used to resolve CServerSideClient* → IGameClient via engine slot. Set at Install.
+    // The lookup is a pointer/array read — safe to call on the engine send worker thread.
     private static IClientManager? _clientManager;
-    private static IEntityManager? _entityManager;
 
     // CServerSideClient::m_Slot — engine.games.jsonc resolves this to 72 (0x48) on both linux and windows.
     // The recipient pointer captured at PerClientEncode (rsi) is a CServerSideClient*; its slot maps 1:1 to
@@ -349,7 +176,6 @@ internal static unsafe class FieldSubstitution
     {
         _logger        = logger;
         _clientManager = bridge.ClientManager;
-        _entityManager = bridge.EntityManager;
 
         if (!ValidateAddresses(logger))
         {
@@ -463,13 +289,10 @@ internal static unsafe class FieldSubstitution
 
     public static void Uninstall()
     {
-        Mode = SubstitutionMode.Off;
-
         DisposeHook(ref _valueCopyHook, ref _valueCopyTrampoline);
         DisposeMidHook(ref _getBitRangeMidHook);
         DisposeHook(ref _wflShimHook, ref _wflShimTrampoline);
         DisposeHook(ref _wdeEntityCaptureHook, ref _wdeEntityCaptureTrampoline);
-        ForceResend.Uninstall();
 
         _logger?.LogInformation("FieldSubstitution: all hooks uninstalled");
         _logger = null;
@@ -490,21 +313,6 @@ internal static unsafe class FieldSubstitution
         hook = null;
     }
 
-    /// <summary>
-    ///     (serializer, field) pairs registered for an entity (its own index or the global -1 entries) —
-    ///     used by <see cref="ForceResend"/> to know which fields to force into that entity's delta.
-    /// </summary>
-    public static IEnumerable<(string ser, string field)> RegistryFieldsForEntity(int entityIndex)
-    {
-        foreach (var key in _registry.Keys)
-        {
-            if (key.entityIndex == entityIndex || key.entityIndex == -1)
-            {
-                yield return (key.ser, key.field);
-            }
-        }
-    }
-
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static nint WflShim(
         nint a,
@@ -513,7 +321,7 @@ internal static unsafe class FieldSubstitution
         uint p7, nint p8, uint p9)
     {
         // No per-client registrations → nothing to substitute below; skip the serializer capture entirely.
-        if (_registry.IsEmpty)
+        if (PerClientDispatch.IsEmpty)
         {
             return ((delegate* unmanaged[Cdecl]<
                 nint, nint, nint, nint, nint, uint,
@@ -525,13 +333,6 @@ internal static unsafe class FieldSubstitution
         _currentFieldIndex  = -1;
 
         var serName = NativeUtil.ReadShortAscii(*(nint*) (a + 0x00), 48);
-
-        // Force-resend (off by default): cache this serializer's flattened field-index map the first time
-        // it's seen, so the WriteFields hook can resolve a hooked field name -> index. No-op when disabled.
-        if (ForceResend.Enabled)
-        {
-            ForceResend.NoteSerializer(serName, a);
-        }
 
         // Windows: build the index→name array the first time this serializer is seen so ValueCopyHook can
         // resolve a field index captured by WindowsFieldIndexHook into a field name.
@@ -554,7 +355,7 @@ internal static unsafe class FieldSubstitution
     private static nint WdeEntityCaptureHook(nint a, nint b, nint c, nint d, nint e, nint f)
     {
         // No per-client registrations → skip the entity-index/snapshot capture.
-        if (_registry.IsEmpty)
+        if (PerClientDispatch.IsEmpty)
         {
             return ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nint, nint, nint>)
                 _wdeEntityCaptureTrampoline)(a, b, c, d, e, f);
@@ -602,7 +403,7 @@ internal static unsafe class FieldSubstitution
     private static void GetBitRangePathHook(MidHookContext* ctx)
     {
         // Only capture when there's something to substitute (ValueCopyHook is gated the same way).
-        if (_registry.IsEmpty)
+        if (PerClientDispatch.IsEmpty)
         {
             return;
         }
@@ -617,7 +418,7 @@ internal static unsafe class FieldSubstitution
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static void WindowsFieldIndexHook(MidHookContext* ctx)
     {
-        if (_registry.IsEmpty)
+        if (PerClientDispatch.IsEmpty)
         {
             return;
         }
@@ -736,13 +537,12 @@ internal static unsafe class FieldSubstitution
         // Hot path: this fires for every field copy of every entity for every client. With no per-client
         // registrations there is nothing to substitute, so short-circuit before any resolve work — the
         // detour then costs only this one check plus the trampoline.
-        if (_registry.IsEmpty)
+        if (PerClientDispatch.IsEmpty)
         {
             return CallOriginal(dst, src, bitcount);
         }
 
-        var mode = (SubstitutionMode) _mode;
-        if (mode == SubstitutionMode.Off || !NativeUtil.IsUserPtr(_currentSerializer))
+        if (!NativeUtil.IsUserPtr(_currentSerializer))
         {
             return CallOriginal(dst, src, bitcount);
         }
@@ -796,74 +596,27 @@ internal static unsafe class FieldSubstitution
             var clientPtr   = RecipientCapture.CurrentClient;
             var entityIndex = _currentEntityIndex;
 
-            var hasReg = TryGetRegistration(serName, fieldName, entityIndex, out var reg, out var matchedEnt);
+            SpoofValue spoofVal;
+            FieldType  fieldType;
 
-            // One-shot (SendFake): only the target client gets the fake; everyone else passes through and
-            // the registration survives until its target is served. Matched on CServerSideClient*.
-            if (hasReg && reg.OneShot && clientPtr != reg.TargetClient)
+            // -- Per-viewer proxy consume (IProxyManager SetFor) --------------------------------------
+            // If a proxy recorded per-recipient values for this (entity, field) during the shared pack,
+            // apply THIS client's value: its SetFor override, or the recorded default (uniform value if also
+            // SetAll'd, else the real value — restoring non-recipients).
+            if (!NativeUtil.IsUserPtr(clientPtr)
+                || !PerClientDispatch.TryResolve(entityIndex, fieldName,
+                    *(int*) (clientPtr + CServerSideClientSlotOffset), out var pcValue, out _))
             {
                 return CallOriginal(dst, src, bitcount);
             }
 
-            if (!hasReg)
-            {
-                return CallOriginal(dst, src, bitcount);
-            }
-
-            var fieldType = Classify(leafRec);
+            fieldType = Classify(leafRec);
             if (fieldType == FieldType.Unsupported)
             {
                 return CallOriginal(dst, src, bitcount);
             }
 
-            // Seed a SpoofValue from the registration's stored value (uniform) or the zero default, then
-            // optionally invoke the per-client callback to let it mutate the value. The per-client callback
-            // is the one genuine managed throw-site on this path; a throw is logged and passed through.
-
-            // Build the initial SpoofValue seeded from the registration's stored value.
-            var spoofVal = reg.Value;
-
-            // For the uniform case (no callback), we apply directly. For the callback case, we first
-            // check kind compatibility (same rule as before), then invoke once.
-            bool substitute;
-
-            if (!reg.HasCallback)
-            {
-                substitute = true;
-            }
-            else if (!reg.CallbackMatches(fieldType))
-            {
-                // A callback with a kind incompatible with this field family would write garbage — pass through.
-                return CallOriginal(dst, src, bitcount);
-            }
-            else
-            {
-                // Hand the callback idiomatic wrappers. Resolve the recipient (slot → IGameClient) and the
-                // entity (index → IBaseEntity); if either can't be resolved (client gone, index not
-                // captured) there's nothing meaningful to give the callback, so pass the real value through.
-                var gameClient = ResolveClient(clientPtr);
-                var entity     = ResolveEntity(entityIndex);
-                if (gameClient is null || entity is null)
-                {
-                    return CallOriginal(dst, src, bitcount);
-                }
-
-                try
-                {
-                    substitute = reg.Callback!(gameClient, entity, ref spoofVal);
-                }
-                catch (Exception ex)
-                {
-                    _logger?.LogWarning(ex, "SendProxy: per-client callback threw for \"{Ser}::{Field}\" — passing through", serName, fieldName);
-
-                    return CallOriginal(dst, src, bitcount);
-                }
-            }
-
-            if (!substitute)
-            {
-                return CallOriginal(dst, src, bitcount);
-            }
+            spoofVal = pcValue;
 
             // Extract the typed sub-values from the (possibly mutated) SpoofValue using the SAME
             // bit-conversion logic that existed before: Float32 reads float bits, UInt32 reads uint cast,
@@ -1072,16 +825,7 @@ internal static unsafe class FieldSubstitution
             *(int*) (src + 0x10) += (int) bitcount;
             *(int*) (bw + 0x10) = 0;
 
-            var copyOk = CallOriginal(dst, (nint) bw, (uint) encodedBits);
-
-            // One-shot fired for its target client — remove it so it doesn't recur. Other clients on this
-            // snapshot already passed through (client-match gate above), so they never see the fake.
-            if (reg.OneShot)
-            {
-                _registry.TryRemove((serName, fieldName, matchedEnt), out _);
-            }
-
-            return copyOk;
+            return CallOriginal(dst, (nint) bw, (uint) encodedBits);
         }
         catch
         {
@@ -1089,20 +833,6 @@ internal static unsafe class FieldSubstitution
             // only for failures BEFORE the native emit sequence above, so a plain passthrough is correct.
             return CallOriginal(dst, src, bitcount);
         }
-    }
-
-    private static bool TryGetRegistration(string serName, string fieldName, int entityIndex, out SpoofEntry reg, out int matchedEnt)
-    {
-        if (entityIndex >= 0 && _registry.TryGetValue((serName, fieldName, entityIndex), out reg))
-        {
-            matchedEnt = entityIndex;
-
-            return true;
-        }
-
-        matchedEnt = -1;
-
-        return _registry.TryGetValue((serName, fieldName, -1), out reg);
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -1127,11 +857,6 @@ internal static unsafe class FieldSubstitution
 
         return cm.GetGameClient((PlayerSlot) (byte) slot);
     }
-
-    // Resolve the captured entity index to an IBaseEntity. Returns null if the manager is unset or the index
-    // wasn't captured (-1) — the caller then passes through.
-    private static IBaseEntity? ResolveEntity(int entityIndex)
-        => entityIndex < 0 || _entityManager is not { } em ? null : em.FindEntityByIndex((EntityIndex) entityIndex);
 
     // Walk the CFieldPath (filled by GetBitRange) through the flattened-serializer field array to the leaf
     // record + its field name. Every dereference is IsUserPtr-guarded; a guard failure returns empty (the

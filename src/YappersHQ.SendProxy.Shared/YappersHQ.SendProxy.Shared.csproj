@@ -1,2 +1,6 @@
 <Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <!-- The SendProxy module constructs ProxyContext and reads back the values a callback writes. -->
+    <InternalsVisibleTo Include="YappersHQ.SendProxy" />
+  </ItemGroup>
 </Project>
