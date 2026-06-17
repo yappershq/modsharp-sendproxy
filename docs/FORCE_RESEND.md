@@ -105,5 +105,31 @@ Field-name → serializer-field-index: build the map once from the full-update p
 shim already has the per-entity serializer in scope (`_currentSerializer`, records at +0x30); walk it,
 record `fieldName → index` keyed by serializer name, and look it up in the CalcDelta hook.
 
+### The output field-index list format (RE'd — so the append is safe)
+
+CalcDelta's 5th arg (the output list, `param_2+0x900` inside WriteDeltaEntity_Internal) is a
+**`CUtlVector<int>`** of field indices:
+
+```
++0x00  int   count          // number of field indices written
++0x04  int   sizeAndFlag     // capacity; (& 0x7fffffff) = size, high bit (0x80000000) = heap-allocated
++0x08  int[4] inline   OR    // when size <= 4: indices stored inline here
++0x08  int*  heapPtr         // when size  > 4: pointer to the index array (read as *(int**)(list+8))
+```
+
+(Confirmed by the consumption in WriteDeltaEntity_Internal: `*piVar16` is the count, `piVar16[1] &
+0x7fffffff` the size with the external-alloc bit, `piVar9 = (size>4) ? *(int**)(piVar16+2) : piVar16+2`.)
+
+To inject the hooked field: standard `CUtlVector<int>` push-back of the field's serializer-index —
+grow if needed (respect the inline-≤4 / heap->4 split + the 0x80000000 flag), write the index, bump count.
+Skip if the index is already present (CalcDelta may have included it from a real change).
+
 Ship gated behind a flag (off by default) and validate on a live client before enabling — appending to the
 engine's delta list is hot-path engine surgery that must be confirmed in-game, not assumed.
+
+### Spec completeness
+
+All four pieces are now RE'd: (1) hook = vtable slot 8 of `*(0x00ac4ae0)`; (2) issuer + entity from existing
+captures; (3) output list = CUtlVector&lt;int&gt; layout above; (4) field-name→index from the full-update
+serializer walk. Build is mechanical from here; only the live-client validation + the Windows global-load
+sig remain.
