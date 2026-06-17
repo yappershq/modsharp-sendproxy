@@ -24,13 +24,14 @@ namespace YappersHQ.SendProxy.Shared;
 
 /// <summary>
 ///     Per-client substitution callback. Runs on the engine send worker threads — must be thread-safe and
-///     non-blocking. <paramref name="value"/> is seeded with the registered uniform value (or the zero
-///     value for that kind); mutate it and return <c>true</c> to encode the mutated value for this client,
-///     return <c>false</c> to pass the real value through. <paramref name="client"/> is the raw
-///     <c>CServerSideClient*</c> recipient (0 if capture is inactive); <paramref name="entityIndex"/> is
-///     the entity being sent (-1 if not captured).
+///     non-blocking, and should only READ from <paramref name="client"/>/<paramref name="entity"/> (slot,
+///     index, steamid, schema fields), never mutate engine state from here. <paramref name="value"/> is
+///     seeded with the registered uniform value (or the zero value for that kind); mutate it and return
+///     <c>true</c> to encode the mutated value for this client, or return <c>false</c> to pass the real
+///     value through. <paramref name="client"/> is the recipient being encoded; <paramref name="entity"/>
+///     is the entity whose field is being sent.
 /// </summary>
-public delegate bool SendProxyCallback(nint client, int entityIndex, ref SpoofValue value);
+public delegate bool SendProxyCallback(IGameClient client, IBaseEntity entity, ref SpoofValue value);
 
 /// <summary>
 ///     SendProxy for ModSharp / CS2 — intercept the per-client serialization of networked entity fields

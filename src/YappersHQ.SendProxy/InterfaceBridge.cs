@@ -27,6 +27,7 @@ internal sealed class InterfaceBridge
 {
     public IGameData            GameData           { get; }
     public IEntityManager       EntityManager      { get; }
+    public IClientManager       ClientManager      { get; }
     public IHookManager         HookManager        { get; }
     public ISharpModuleManager  SharpModuleManager { get; }
 
@@ -34,6 +35,7 @@ internal sealed class InterfaceBridge
     {
         GameData           = sharedSystem.GetModSharp().GetGameData();
         EntityManager      = sharedSystem.GetEntityManager();
+        ClientManager      = sharedSystem.GetClientManager();
         HookManager        = sharedSystem.GetHookManager();
         SharpModuleManager = sharedSystem.GetSharpModuleManager();
     }

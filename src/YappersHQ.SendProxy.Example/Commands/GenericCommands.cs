@@ -19,6 +19,7 @@
 
 using System.Numerics;
 using Sharp.Modules.AdminManager.Shared;
+using Sharp.Shared.GameEntities;
 using Sharp.Shared.Objects;
 using Sharp.Shared.Types;
 using Sharp.Shared.Units;
@@ -130,22 +131,22 @@ internal sealed class GenericCommands : ISpCommandCategory
             case "uint":
                 // 1..64 — small + obvious + varies per client (low value keeps the varint the same byte
                 // length as a typical small field so the substitute fits the slot).
-                sp.Hook(ser, field, (nint c, int _, ref SpoofValue v) => { v.AsInt = 1 + (int) (c & 0x3F); return true; });
+                sp.Hook(ser, field, (IGameClient c, IBaseEntity _, ref SpoofValue v) => { v.AsInt = 1 + (c.Slot.AsPrimitive() & 0x3F); return true; });
                 break;
             case "float":
-                sp.Hook(ser, field, (nint c, int _, ref SpoofValue v) => { v.AsFloat = c & 0xFF; return true; });
+                sp.Hook(ser, field, (IGameClient c, IBaseEntity _, ref SpoofValue v) => { v.AsFloat = c.Slot.AsPrimitive(); return true; });
                 break;
             case "bool":
-                sp.Hook(ser, field, (nint c, int _, ref SpoofValue v) => { v.AsBool = (c & 1) == 0; return true; });
+                sp.Hook(ser, field, (IGameClient c, IBaseEntity _, ref SpoofValue v) => { v.AsBool = (c.Slot.AsPrimitive() & 1) == 0; return true; });
                 break;
             case "vec":
-                sp.Hook(ser, field, (nint c, int _, ref SpoofValue v) => { v.AsVector = new Vector3(c & 0xFF, 0, 0); return true; });
+                sp.Hook(ser, field, (IGameClient c, IBaseEntity _, ref SpoofValue v) => { v.AsVector = new Vector3(c.Slot.AsPrimitive(), 0, 0); return true; });
                 break;
             case "string":
-                sp.Hook(ser, field, (nint c, int _, ref SpoofValue v) => { v.AsString = $"client-{c & 0xFF}"; return true; });
+                sp.Hook(ser, field, (IGameClient c, IBaseEntity _, ref SpoofValue v) => { v.AsString = $"client-{c.Slot.AsPrimitive()}"; return true; });
                 break;
             case "bytes":
-                sp.Hook(ser, field, (nint c, int _, ref SpoofValue v) => { v.AsBytes = new[] { (byte) (c & 0xFF) }; return true; });
+                sp.Hook(ser, field, (IGameClient c, IBaseEntity _, ref SpoofValue v) => { v.AsBytes = new[] { c.Slot.AsPrimitive() }; return true; });
                 break;
             default:
                 _ctx.Reply(issuer, $"sp_setpc: unknown type '{type}'. Types: int uint float bool vec string bytes");

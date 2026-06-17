@@ -26,7 +26,11 @@ using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading;
 using Microsoft.Extensions.Logging;
+using Sharp.Shared.GameEntities;
 using Sharp.Shared.Hooks;
+using Sharp.Shared.Managers;
+using Sharp.Shared.Objects;
+using Sharp.Shared.Units;
 using YappersHQ.SendProxy.Shared;
 
 namespace YappersHQ.SendProxy.Native;
@@ -273,6 +277,17 @@ internal static unsafe class FieldSubstitution
 
     private static ILogger? _logger;
 
+    // Managers used to hand the per-client callback idiomatic wrappers (IGameClient / IBaseEntity) instead
+    // of raw pointers/indices. Set at Install. Both lookups are pointer/array reads — safe to call on the
+    // engine send worker thread for IDENTITY (the callback contract forbids mutating engine state).
+    private static IClientManager? _clientManager;
+    private static IEntityManager? _entityManager;
+
+    // CServerSideClient::m_Slot — engine.games.jsonc resolves this to 72 (0x48) on both linux and windows.
+    // The recipient pointer captured at PerClientEncode (rsi) is a CServerSideClient*; its slot maps 1:1 to
+    // an IGameClient via IClientManager.GetGameClient(PlayerSlot).
+    private const int CServerSideClientSlotOffset = 0x48;
+
     public static nint GetBitRangeAddr;
     // Windows: address of the WriteFieldList per-field site (gamedata "CFlattenedSerializer::WriteFieldList_FieldPathSite").
     // On Linux this is zero and is never used; on Windows it replaces GetBitRangeAddr as the midhook target.
@@ -332,7 +347,9 @@ internal static unsafe class FieldSubstitution
 
     public static bool Install(InterfaceBridge bridge, ILogger logger)
     {
-        _logger = logger;
+        _logger        = logger;
+        _clientManager = bridge.ClientManager;
+        _entityManager = bridge.EntityManager;
 
         if (!ValidateAddresses(logger))
         {
@@ -776,14 +793,14 @@ internal static unsafe class FieldSubstitution
                 }
             }
 
-            var client      = RecipientCapture.CurrentClient;
+            var clientPtr   = RecipientCapture.CurrentClient;
             var entityIndex = _currentEntityIndex;
 
             var hasReg = TryGetRegistration(serName, fieldName, entityIndex, out var reg, out var matchedEnt);
 
             // One-shot (SendFake): only the target client gets the fake; everyone else passes through and
             // the registration survives until its target is served. Matched on CServerSideClient*.
-            if (hasReg && reg.OneShot && client != reg.TargetClient)
+            if (hasReg && reg.OneShot && clientPtr != reg.TargetClient)
             {
                 return CallOriginal(dst, src, bitcount);
             }
@@ -821,9 +838,19 @@ internal static unsafe class FieldSubstitution
             }
             else
             {
+                // Hand the callback idiomatic wrappers. Resolve the recipient (slot → IGameClient) and the
+                // entity (index → IBaseEntity); if either can't be resolved (client gone, index not
+                // captured) there's nothing meaningful to give the callback, so pass the real value through.
+                var gameClient = ResolveClient(clientPtr);
+                var entity     = ResolveEntity(entityIndex);
+                if (gameClient is null || entity is null)
+                {
+                    return CallOriginal(dst, src, bitcount);
+                }
+
                 try
                 {
-                    substitute = reg.Callback!(client, entityIndex, ref spoofVal);
+                    substitute = reg.Callback!(gameClient, entity, ref spoofVal);
                 }
                 catch (Exception ex)
                 {
@@ -1081,6 +1108,30 @@ internal static unsafe class FieldSubstitution
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     private static byte CallOriginal(nint dst, nint src, uint bitcount)
         => ((delegate* unmanaged[Cdecl]<nint, nint, uint, byte>) _valueCopyTrampoline)(dst, src, bitcount);
+
+    // Resolve the CServerSideClient* recipient (captured at PerClientEncode) to an IGameClient via its
+    // engine slot (m_Slot @ +0x48). Returns null if the manager is unset, the pointer is bad, or the slot
+    // is out of range — the caller then passes the real value through.
+    private static IGameClient? ResolveClient(nint serverSideClient)
+    {
+        if (_clientManager is not { } cm || !NativeUtil.IsUserPtr(serverSideClient))
+        {
+            return null;
+        }
+
+        var slot = *(int*) (serverSideClient + CServerSideClientSlotOffset);
+        if (slot < 0 || slot > PlayerSlot.MaxPlayerSlot.AsPrimitive())
+        {
+            return null;
+        }
+
+        return cm.GetGameClient((PlayerSlot) (byte) slot);
+    }
+
+    // Resolve the captured entity index to an IBaseEntity. Returns null if the manager is unset or the index
+    // wasn't captured (-1) — the caller then passes through.
+    private static IBaseEntity? ResolveEntity(int entityIndex)
+        => entityIndex < 0 || _entityManager is not { } em ? null : em.FindEntityByIndex((EntityIndex) entityIndex);
 
     // Walk the CFieldPath (filled by GetBitRange) through the flattened-serializer field array to the leaf
     // record + its field name. Every dereference is IsUserPtr-guarded; a guard failure returns empty (the
