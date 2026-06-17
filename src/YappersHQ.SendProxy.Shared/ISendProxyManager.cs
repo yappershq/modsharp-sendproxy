@@ -194,4 +194,12 @@ public interface ISendProxyManager
 
     /// <summary>True if any (uniform or per-client) registration exists for this field across all entities.</summary>
     bool IsHooked(string serializerName, string fieldName);
+
+    /// <summary>
+    ///     Enable/disable live force-resend: pushes hooked fields into the per-client delta so a spoof applies
+    ///     immediately instead of only after a full update. Off by default; installs a vtable hook on the
+    ///     serializer's encode path when first enabled. Returns false if the hook could not be installed.
+    ///     (See docs/FORCE_RESEND.md — the field-index numbering is verified on first enable.)
+    /// </summary>
+    bool SetForceResend(bool enabled);
 }

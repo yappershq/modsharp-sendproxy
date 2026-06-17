@@ -431,4 +431,13 @@ internal sealed class SendProxyManager : ISendProxyManager
 
     public bool IsHooked(string serializerName, string fieldName)
         => UniformEncoderHook.HasAny || FieldSubstitution.IsHooked(serializerName, fieldName);
+
+    public bool SetForceResend(bool enabled)
+    {
+        var ok = ForceResend.SetEnabled(enabled);
+        _logger.LogInformation("SendProxy: force-resend {State}{Result}", enabled ? "enable" : "disable",
+            ok ? "" : " (FAILED to install)");
+
+        return ok;
+    }
 }

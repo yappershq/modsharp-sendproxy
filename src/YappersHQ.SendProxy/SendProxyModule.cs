@@ -38,6 +38,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private const string BitCopyKey            = "CFlattenedSerializer::BitCopyPrimitive";
     private const string EncoderRegistryKey    = "CFlattenedSerializer::EncoderRegistry";
     private const string EncodeInt32Key        = "CFlattenedSerializer::EncodeInt32";
+    private const string SerializerSingletonKey = "CNetworkSerialization::SerializerSingleton";
 
     private static readonly string[] EncoderBucketKeys =
     {
@@ -170,6 +171,11 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         }
 
         FieldSubstitution.SetEncoderResolution(_registryAddr, bucketAddrs, _encodeInt32Addr);
+
+        // Force-resend (off by default): hand it the serializer-singleton global so it CAN install its
+        // WriteFields vtable hook later if enabled. Resolving the address is harmless; nothing is hooked
+        // until ForceResend.SetEnabled(true).
+        ForceResend.Configure(_bridge, _logger, ResolveFromGameData(SerializerSingletonKey));
     }
 
     private nint ResolveFromGameData(string key)

@@ -38,7 +38,29 @@ internal sealed class GenericCommands : ISpCommandCategory
         registry.RegisterAdminCommand("sp_setent", OnSetEnt, [ExampleContext.Permission]);
         registry.RegisterAdminCommand("sp_unset",  OnUnset,  [ExampleContext.Permission]);
         registry.RegisterAdminCommand("sp_clear",  OnClear,  [ExampleContext.Permission]);
+        registry.RegisterAdminCommand("sp_forceresend", OnForceResend, [ExampleContext.Permission]);
         registry.RegisterAdminCommand("sp_help",   OnHelp,   [ExampleContext.Permission]);
+    }
+
+    // sp_forceresend <0|1> — toggle live force-resend (push hooked fields into the per-client delta so a
+    // spoof applies immediately instead of only after a full update). Off by default; installs a vtable
+    // hook on first enable. See docs/FORCE_RESEND.md.
+    private void OnForceResend(IGameClient? issuer, StringCommand command)
+    {
+        if (_ctx.SendProxy is not { } sp)
+        {
+            return;
+        }
+
+        if (command.ArgCount < 1 || !ExampleContext.TryBool(command, 1, out var on))
+        {
+            _ctx.Reply(issuer, "usage: sp_forceresend <0|1>");
+
+            return;
+        }
+
+        var ok = sp.SetForceResend(on);
+        _ctx.Reply(issuer, $"sp_forceresend: {(on ? "enabled" : "disabled")}{(ok ? "" : " — FAILED to install")}");
     }
 
     // sp_set <serializer> <field> <type> <value...> — uniform spoof (every client) of any field.

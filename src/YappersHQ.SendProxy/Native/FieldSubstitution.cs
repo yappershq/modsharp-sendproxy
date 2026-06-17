@@ -495,6 +495,7 @@ internal static unsafe class FieldSubstitution
         DisposeMidHook(ref _getBitRangeMidHook);
         DisposeHook(ref _wflShimHook, ref _wflShimTrampoline);
         DisposeHook(ref _wdeEntityCaptureHook, ref _wdeEntityCaptureTrampoline);
+        ForceResend.Uninstall();
 
         _logger?.LogInformation("FieldSubstitution: all hooks uninstalled");
         _logger = null;
@@ -515,6 +516,21 @@ internal static unsafe class FieldSubstitution
         hook = null;
     }
 
+    /// <summary>
+    ///     (serializer, field) pairs registered for an entity (its own index or the global -1 entries) —
+    ///     used by <see cref="ForceResend"/> to know which fields to force into that entity's delta.
+    /// </summary>
+    public static IEnumerable<(string ser, string field)> RegistryFieldsForEntity(int entityIndex)
+    {
+        foreach (var key in _registry.Keys)
+        {
+            if (key.entityIndex == entityIndex || key.entityIndex == -1)
+            {
+                yield return (key.ser, key.field);
+            }
+        }
+    }
+
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static nint WflShim(
         nint a,
@@ -532,6 +548,14 @@ internal static unsafe class FieldSubstitution
         }
 
         _currentSerializer = a;
+
+        // Force-resend (off by default): cache this serializer's flattened field-index map the first time
+        // it's seen, so the WriteFields hook can resolve a hooked field name -> index. No-op when disabled.
+        if (ForceResend.Enabled)
+        {
+            ForceResend.NoteSerializer(NativeUtil.ReadShortAscii(*(nint*) (a + 0x00), 48), a);
+        }
+
         var result = ((delegate* unmanaged[Cdecl]<
             nint, nint, nint, nint, nint, uint,
             uint, nint, uint,
