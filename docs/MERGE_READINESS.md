@@ -30,15 +30,16 @@ recommended pre-merge polish.
   convention is `*(double*)` (it reads a double and narrows), distinct from the Coord/Normal/quantized cases
   which use `(float*)[]`. Each `FieldType` writes the scratch in the exact width its encoder reads. No fix.
 
-## Recommended pre-merge polish (not applied — defensive / cosmetic)
+## Recommended pre-merge polish
 
-- **`IsValidEntity` guards on the entity-scoped `Hook`/`SetEntity`/`SendFake` overloads.** They read
-  `entity.Index` directly; a stale entity wrapper is a dangling native pointer. Add
-  `if (entity is not { IsValidEntity: true }) return;` at each entry (≈14 sites — best done via a small
-  `bool TryEntityIndex(IBaseEntity?, out int)` helper to avoid duplication). Not a live bug (the plugin's
-  own callers pass valid entities) but good public-API hygiene for a core merge.
-- **`FieldSubstitution.SetFieldPathRegister` / `FieldPathReg`** — Windows-tuning scaffolding with no caller;
-  mark `internal` explicitly + `TODO(windows)`, or expose via `ISendProxyManager` if Windows tuning is near.
+APPLIED (commit f313108):
+- **`IsValidEntity` guards** on every entity-scoped `Hook`/`SetEntity`/`Unhook` overload (guard before
+  reading `entity.Index` — a stale entity wrapper is a dangling native pointer); `BeginSendFake`'s null
+  check upgraded to the same.
+- **`SetOneShot(bool)` overload** added for parity with the typed spoof API.
+
+REMAINING (cosmetic, deferred):
+- **`FieldSubstitution.SetFieldPathRegister` / `FieldPathReg`** — Windows-tuning scaffolding; mark
+  `internal` + `TODO(windows)`, or expose via `ISendProxyManager` if Windows tuning becomes near-term.
 - **Registration-API visibility** — `SetSpoof`/`SetCallback`/`SetOneShot` are `public static` on an
-  `internal` class (effectively assembly-internal); make them `internal` to signal intent for the merge.
-- **`SetOneShot` bool overload** — add for parity with the rest of the typed spoof API.
+  `internal` class (already effectively assembly-internal, so this is purely stylistic — low value).
