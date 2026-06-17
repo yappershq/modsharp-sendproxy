@@ -18,7 +18,6 @@
  */
 
 using System;
-using System.Numerics;
 using Microsoft.Extensions.Logging;
 using Sharp.Shared.GameEntities;
 using Sharp.Shared.Objects;
@@ -77,7 +76,6 @@ internal sealed class SendProxyManager : ISendProxyManager
         return false;
     }
 
-
     // Drop every registration scoped to entityIndex (called from OnEntityDeleted — indices are reused).
     internal void RemoveEntityRegistrations(int entityIndex)
         => FieldSubstitution.ClearEntityIndex(entityIndex);
@@ -95,63 +93,18 @@ internal sealed class SendProxyManager : ISendProxyManager
 
     // -- Hook, all entities -----------------------------------------------------------------------
 
-    public void Hook(string serializerName, string fieldName, PerClientIntProxy callback)
+    public void Hook(string serializerName, string fieldName, SendProxyCallback callback)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
-        if (!EnsureDetours($"Hook(\"{serializerName}::{fieldName}\", int)")) return;
+        if (!EnsureDetours($"Hook(\"{serializerName}::{fieldName}\")")) return;
         FieldSubstitution.SetCallback(serializerName, fieldName, callback);
         FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: per-client int callback (all entities) registered for \"{Ser}::{Field}\"", serializerName, fieldName);
-    }
-
-    public void Hook(string serializerName, string fieldName, PerClientFloatProxy callback)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
-        if (!EnsureDetours($"Hook(\"{serializerName}::{fieldName}\", float)")) return;
-        FieldSubstitution.SetCallback(serializerName, fieldName, callback);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: per-client float callback (all entities) registered for \"{Ser}::{Field}\"", serializerName, fieldName);
-    }
-
-    public void Hook(string serializerName, string fieldName, PerClientBoolProxy callback)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
-        if (!EnsureDetours($"Hook(\"{serializerName}::{fieldName}\", bool)")) return;
-        FieldSubstitution.SetCallback(serializerName, fieldName, callback);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: per-client bool callback (all entities) registered for \"{Ser}::{Field}\"", serializerName, fieldName);
-    }
-
-    public void Hook(string serializerName, string fieldName, PerClientVectorProxy callback)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
-        if (!EnsureDetours($"Hook(\"{serializerName}::{fieldName}\", vector)")) return;
-        FieldSubstitution.SetCallback(serializerName, fieldName, callback);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: per-client vector callback (all entities) registered for \"{Ser}::{Field}\"", serializerName, fieldName);
-    }
-
-    public void Hook(string serializerName, string fieldName, PerClientStringProxy callback)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
-        if (!EnsureDetours($"Hook(\"{serializerName}::{fieldName}\", string)")) return;
-        FieldSubstitution.SetCallback(serializerName, fieldName, callback);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: per-client string callback (all entities) registered for \"{Ser}::{Field}\"", serializerName, fieldName);
-    }
-
-    public void Hook(string serializerName, string fieldName, PerClientBytesProxy callback)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
-        if (!EnsureDetours($"Hook(\"{serializerName}::{fieldName}\", bytes)")) return;
-        FieldSubstitution.SetCallback(serializerName, fieldName, callback);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: per-client bytes callback (all entities) registered for \"{Ser}::{Field}\"", serializerName, fieldName);
+        _logger.LogInformation("SendProxy: per-client callback (all entities) registered for \"{Ser}::{Field}\"", serializerName, fieldName);
     }
 
     // -- Hook, single entity ----------------------------------------------------------------------
 
-    public void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientIntProxy callback)
+    public void Hook(IBaseEntity entity, string serializerName, string fieldName, SendProxyCallback callback)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
         if (entity is not { IsValidEntity: true })
@@ -160,85 +113,10 @@ internal sealed class SendProxyManager : ISendProxyManager
         }
 
         var idx = (int) entity.Index;
-        if (!EnsureDetours($"Hook(ent={idx}, \"{serializerName}::{fieldName}\", int)")) return;
+        if (!EnsureDetours($"Hook(ent={idx}, \"{serializerName}::{fieldName}\")")) return;
         FieldSubstitution.SetEntityCallback(idx, serializerName, fieldName, callback);
         FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: per-client int callback registered for ent={Ent} \"{Ser}::{Field}\"", idx, serializerName, fieldName);
-    }
-
-    public void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientFloatProxy callback)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
-        if (entity is not { IsValidEntity: true })
-        {
-            return;
-        }
-
-        var idx = (int) entity.Index;
-        if (!EnsureDetours($"Hook(ent={idx}, \"{serializerName}::{fieldName}\", float)")) return;
-        FieldSubstitution.SetEntityCallback(idx, serializerName, fieldName, callback);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: per-client float callback registered for ent={Ent} \"{Ser}::{Field}\"", idx, serializerName, fieldName);
-    }
-
-    public void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientBoolProxy callback)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
-        if (entity is not { IsValidEntity: true })
-        {
-            return;
-        }
-
-        var idx = (int) entity.Index;
-        if (!EnsureDetours($"Hook(ent={idx}, \"{serializerName}::{fieldName}\", bool)")) return;
-        FieldSubstitution.SetEntityCallback(idx, serializerName, fieldName, callback);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: per-client bool callback registered for ent={Ent} \"{Ser}::{Field}\"", idx, serializerName, fieldName);
-    }
-
-    public void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientVectorProxy callback)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
-        if (entity is not { IsValidEntity: true })
-        {
-            return;
-        }
-
-        var idx = (int) entity.Index;
-        if (!EnsureDetours($"Hook(ent={idx}, \"{serializerName}::{fieldName}\", vector)")) return;
-        FieldSubstitution.SetEntityCallback(idx, serializerName, fieldName, callback);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: per-client vector callback registered for ent={Ent} \"{Ser}::{Field}\"", idx, serializerName, fieldName);
-    }
-
-    public void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientStringProxy callback)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
-        if (entity is not { IsValidEntity: true })
-        {
-            return;
-        }
-
-        var idx = (int) entity.Index;
-        if (!EnsureDetours($"Hook(ent={idx}, \"{serializerName}::{fieldName}\", string)")) return;
-        FieldSubstitution.SetEntityCallback(idx, serializerName, fieldName, callback);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: per-client string callback registered for ent={Ent} \"{Ser}::{Field}\"", idx, serializerName, fieldName);
-    }
-
-    public void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientBytesProxy callback)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
-        if (entity is not { IsValidEntity: true })
-        {
-            return;
-        }
-
-        var idx = (int) entity.Index;
-        if (!EnsureDetours($"Hook(ent={idx}, \"{serializerName}::{fieldName}\", bytes)")) return;
-        FieldSubstitution.SetEntityCallback(idx, serializerName, fieldName, callback);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: per-client bytes callback registered for ent={Ent} \"{Ser}::{Field}\"", idx, serializerName, fieldName);
+        _logger.LogInformation("SendProxy: per-client callback registered for ent={Ent} \"{Ser}::{Field}\"", idx, serializerName, fieldName);
     }
 
     // -- SetUniform, all entities -----------------------------------------------------------------
@@ -248,51 +126,42 @@ internal sealed class SendProxyManager : ISendProxyManager
     // field is matched unambiguously and every client sees the value. (The bit-copy path can't reliably
     // pair a value-copy to its field, so it's reserved for per-client callbacks.) Matched by field name.
 
-    public void SetUniform(string serializerName, string fieldName, int value)
+    public void SetUniform(string serializerName, string fieldName, in SpoofValue value)
     {
-        if (string.IsNullOrEmpty(fieldName) || !EnsureUniformHook($"SetUniform(\"{fieldName}\", int)")) return;
-        UniformEncoderHook.SetInt(fieldName, value);
-        _logger.LogInformation("SendProxy: uniform int spoof \"{Field}\" → {Value}", fieldName, value);
-    }
+        if (string.IsNullOrEmpty(fieldName) || !EnsureUniformHook($"SetUniform(\"{fieldName}\")")) return;
 
-    public void SetUniform(string serializerName, string fieldName, float value)
-    {
-        if (string.IsNullOrEmpty(fieldName) || !EnsureUniformHook($"SetUniform(\"{fieldName}\", float)")) return;
-        UniformEncoderHook.SetFloat(fieldName, value);
-        _logger.LogInformation("SendProxy: uniform float spoof \"{Field}\" → {Value}", fieldName, value);
-    }
-
-    public void SetUniform(string serializerName, string fieldName, bool value)
-    {
-        if (string.IsNullOrEmpty(fieldName) || !EnsureUniformHook($"SetUniform(\"{fieldName}\", bool)")) return;
-        UniformEncoderHook.SetBool(fieldName, value);
-        _logger.LogInformation("SendProxy: uniform bool spoof \"{Field}\" → {Value}", fieldName, value);
-    }
-
-    public void SetUniform(string serializerName, string fieldName, Vector3 value)
-    {
-        if (string.IsNullOrEmpty(fieldName) || !EnsureUniformHook($"SetUniform(\"{fieldName}\", vector)")) return;
-        UniformEncoderHook.SetVector(fieldName, value);
-        _logger.LogInformation("SendProxy: uniform vector spoof \"{Field}\" → {Value}", fieldName, value);
-    }
-
-    public void SetUniform(string serializerName, string fieldName, string value)
-    {
-        if (string.IsNullOrEmpty(fieldName) || !EnsureUniformHook($"SetUniform(\"{fieldName}\", string)")) return;
-        UniformEncoderHook.SetString(fieldName, value);
-        _logger.LogInformation("SendProxy: uniform string spoof \"{Field}\" → \"{Value}\"", fieldName, value);
-    }
-
-    public void SetUniform(string serializerName, string fieldName, byte[] value)
-    {
-        if (string.IsNullOrEmpty(fieldName) || !EnsureUniformHook($"SetUniform(\"{fieldName}\", bytes)")) return;
-        UniformEncoderHook.SetBytes(fieldName, value);
-        _logger.LogInformation("SendProxy: uniform bytes spoof \"{Field}\" ({Len} bytes)", fieldName, value.Length);
+        switch (value.Kind)
+        {
+            case SpoofKind.Int:
+                UniformEncoderHook.SetInt(fieldName, value.RawIntBits);
+                _logger.LogInformation("SendProxy: uniform int spoof \"{Field}\" → {Value}", fieldName, value.RawIntBits);
+                break;
+            case SpoofKind.Float:
+                UniformEncoderHook.SetFloat(fieldName, value.RawFloat);
+                _logger.LogInformation("SendProxy: uniform float spoof \"{Field}\" → {Value}", fieldName, value.RawFloat);
+                break;
+            case SpoofKind.Bool:
+                UniformEncoderHook.SetBool(fieldName, value.AsBool);
+                _logger.LogInformation("SendProxy: uniform bool spoof \"{Field}\" → {Value}", fieldName, value.AsBool);
+                break;
+            case SpoofKind.Vector:
+                UniformEncoderHook.SetVector(fieldName, value.RawVec);
+                _logger.LogInformation("SendProxy: uniform vector spoof \"{Field}\" → {Value}", fieldName, value.RawVec);
+                break;
+            case SpoofKind.String:
+                UniformEncoderHook.SetString(fieldName, value.AsString);
+                _logger.LogInformation("SendProxy: uniform string spoof \"{Field}\" → \"{Value}\"", fieldName, value.AsString);
+                break;
+            case SpoofKind.Bytes:
+                UniformEncoderHook.SetBytes(fieldName, value.AsBytes);
+                _logger.LogInformation("SendProxy: uniform bytes spoof \"{Field}\" ({Len} bytes)", fieldName, value.AsBytes.Length);
+                break;
+        }
     }
 
     // -- SetUniform, single entity ----------------------------------------------------------------
 
-    public void SetUniform(IBaseEntity entity, string serializerName, string fieldName, int value)
+    public void SetUniform(IBaseEntity entity, string serializerName, string fieldName, in SpoofValue value)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
         if (entity is not { IsValidEntity: true })
@@ -301,85 +170,10 @@ internal sealed class SendProxyManager : ISendProxyManager
         }
 
         var idx = (int) entity.Index;
-        if (!EnsureDetours($"SetUniform(ent={idx}, \"{serializerName}::{fieldName}\", int)")) return;
+        if (!EnsureDetours($"SetUniform(ent={idx}, \"{serializerName}::{fieldName}\")")) return;
         FieldSubstitution.SetEntitySpoof(idx, serializerName, fieldName, value);
         FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: uniform int spoof ent={Ent} \"{Ser}::{Field}\" → {Value}", idx, serializerName, fieldName, value);
-    }
-
-    public void SetUniform(IBaseEntity entity, string serializerName, string fieldName, float value)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
-        if (entity is not { IsValidEntity: true })
-        {
-            return;
-        }
-
-        var idx = (int) entity.Index;
-        if (!EnsureDetours($"SetUniform(ent={idx}, \"{serializerName}::{fieldName}\", float)")) return;
-        FieldSubstitution.SetEntitySpoof(idx, serializerName, fieldName, BitConverter.SingleToInt32Bits(value));
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: uniform float spoof ent={Ent} \"{Ser}::{Field}\" → {Value}", idx, serializerName, fieldName, value);
-    }
-
-    public void SetUniform(IBaseEntity entity, string serializerName, string fieldName, bool value)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
-        if (entity is not { IsValidEntity: true })
-        {
-            return;
-        }
-
-        var idx = (int) entity.Index;
-        if (!EnsureDetours($"SetUniform(ent={idx}, \"{serializerName}::{fieldName}\", bool)")) return;
-        FieldSubstitution.SetEntitySpoof(idx, serializerName, fieldName, value ? 1 : 0);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: uniform bool spoof ent={Ent} \"{Ser}::{Field}\" → {Value}", idx, serializerName, fieldName, value);
-    }
-
-    public void SetUniform(IBaseEntity entity, string serializerName, string fieldName, Vector3 value)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
-        if (entity is not { IsValidEntity: true })
-        {
-            return;
-        }
-
-        var idx = (int) entity.Index;
-        if (!EnsureDetours($"SetUniform(ent={idx}, \"{serializerName}::{fieldName}\", vector)")) return;
-        FieldSubstitution.SetEntitySpoof(idx, serializerName, fieldName, value);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: uniform vector spoof ent={Ent} \"{Ser}::{Field}\" → {Value}", idx, serializerName, fieldName, value);
-    }
-
-    public void SetUniform(IBaseEntity entity, string serializerName, string fieldName, string value)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
-        if (entity is not { IsValidEntity: true })
-        {
-            return;
-        }
-
-        var idx = (int) entity.Index;
-        if (!EnsureDetours($"SetUniform(ent={idx}, \"{serializerName}::{fieldName}\", string)")) return;
-        FieldSubstitution.SetEntitySpoof(idx, serializerName, fieldName, value);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: uniform string spoof ent={Ent} \"{Ser}::{Field}\" → \"{Value}\"", idx, serializerName, fieldName, value);
-    }
-
-    public void SetUniform(IBaseEntity entity, string serializerName, string fieldName, byte[] value)
-    {
-        if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
-        if (entity is not { IsValidEntity: true })
-        {
-            return;
-        }
-
-        var idx = (int) entity.Index;
-        if (!EnsureDetours($"SetUniform(ent={idx}, \"{serializerName}::{fieldName}\", bytes)")) return;
-        FieldSubstitution.SetEntitySpoof(idx, serializerName, fieldName, value);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        _logger.LogInformation("SendProxy: uniform bytes spoof ent={Ent} \"{Ser}::{Field}\" ({Len} bytes)", idx, serializerName, fieldName, value.Length);
+        _logger.LogInformation("SendProxy: uniform spoof ent={Ent} \"{Ser}::{Field}\" → {Kind}", idx, serializerName, fieldName, value.Kind);
     }
 
     // -- SendFake (one-shot push to a single client) ----------------------------------------------
@@ -409,58 +203,13 @@ internal sealed class SendProxyManager : ISendProxyManager
         return clientPtr != 0;
     }
 
-    public void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, int value)
+    public void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, in SpoofValue value)
     {
         if (!BeginSendFake(client, entity, serializerName, fieldName, out var idx, out var clientPtr)) return;
         FieldSubstitution.SetOneShot(idx, serializerName, fieldName, clientPtr, value);
         FieldSubstitution.Mode = SubstitutionMode.Fake;
         entity.NetworkStateChanged(fieldName);
-        _logger.LogInformation("SendProxy: one-shot int fake ent={Ent} client=0x{C:X} \"{Ser}::{Field}\" → {Value}", idx, clientPtr, serializerName, fieldName, value);
-    }
-
-    public void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, float value)
-    {
-        if (!BeginSendFake(client, entity, serializerName, fieldName, out var idx, out var clientPtr)) return;
-        FieldSubstitution.SetOneShot(idx, serializerName, fieldName, clientPtr, BitConverter.SingleToInt32Bits(value));
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        entity.NetworkStateChanged(fieldName);
-        _logger.LogInformation("SendProxy: one-shot float fake ent={Ent} client=0x{C:X} \"{Ser}::{Field}\" → {Value}", idx, clientPtr, serializerName, fieldName, value);
-    }
-
-    public void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, bool value)
-    {
-        if (!BeginSendFake(client, entity, serializerName, fieldName, out var idx, out var clientPtr)) return;
-        FieldSubstitution.SetOneShot(idx, serializerName, fieldName, clientPtr, value ? 1 : 0);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        entity.NetworkStateChanged(fieldName);
-        _logger.LogInformation("SendProxy: one-shot bool fake ent={Ent} client=0x{C:X} \"{Ser}::{Field}\" → {Value}", idx, clientPtr, serializerName, fieldName, value);
-    }
-
-    public void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, Vector3 value)
-    {
-        if (!BeginSendFake(client, entity, serializerName, fieldName, out var idx, out var clientPtr)) return;
-        FieldSubstitution.SetOneShot(idx, serializerName, fieldName, clientPtr, value);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        entity.NetworkStateChanged(fieldName);
-        _logger.LogInformation("SendProxy: one-shot vector fake ent={Ent} client=0x{C:X} \"{Ser}::{Field}\" → {Value}", idx, clientPtr, serializerName, fieldName, value);
-    }
-
-    public void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, string value)
-    {
-        if (!BeginSendFake(client, entity, serializerName, fieldName, out var idx, out var clientPtr)) return;
-        FieldSubstitution.SetOneShot(idx, serializerName, fieldName, clientPtr, value);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        entity.NetworkStateChanged(fieldName);
-        _logger.LogInformation("SendProxy: one-shot string fake ent={Ent} client=0x{C:X} \"{Ser}::{Field}\" → \"{Value}\"", idx, clientPtr, serializerName, fieldName, value);
-    }
-
-    public void SendFake(IGameClient client, IBaseEntity entity, string serializerName, string fieldName, byte[] value)
-    {
-        if (!BeginSendFake(client, entity, serializerName, fieldName, out var idx, out var clientPtr)) return;
-        FieldSubstitution.SetOneShot(idx, serializerName, fieldName, clientPtr, value);
-        FieldSubstitution.Mode = SubstitutionMode.Fake;
-        entity.NetworkStateChanged(fieldName);
-        _logger.LogInformation("SendProxy: one-shot bytes fake ent={Ent} client=0x{C:X} \"{Ser}::{Field}\" ({Len} bytes)", idx, clientPtr, serializerName, fieldName, value.Length);
+        _logger.LogInformation("SendProxy: one-shot fake ent={Ent} client=0x{C:X} \"{Ser}::{Field}\" → {Kind}", idx, clientPtr, serializerName, fieldName, value.Kind);
     }
 
     // -- Removal ----------------------------------------------------------------------------------

@@ -109,26 +109,26 @@ internal sealed class FakeAimCommands : ISpCommandCategory
             }
 
             _aimControllers.Add((int) ctrl.Index);
-            sp.Hook(ctrl, "CCSPlayerController", "m_iPawnHealth", (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 1; return true; });
-            sp.Hook(ctrl, "CCSPlayerController", "m_iTeamNum",    (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
+            sp.Hook(ctrl, "CCSPlayerController", "m_iPawnHealth", (nint c, int _, ref SpoofValue v) => { if (c != issuerPtr) return false; v.AsInt = 1; return true; });
+            sp.Hook(ctrl, "CCSPlayerController", "m_iTeamNum",    (nint c, int _, ref SpoofValue v) => { if (c != issuerPtr) return false; v.AsInt = 3; return true; });
             SafeDirty(ctrl, "m_iPawnHealth");   // force an initial re-send so it shows at once
             SafeDirty(ctrl, "m_iTeamNum");
 
             if (ctrl.GetPlayerPawn() is { } pawn)
             {
                 _aimPawns.Add((int) pawn.Index);
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iHealth",          (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 1; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iTeamNum",         (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_clrRender",        (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = unchecked((int) _aimColor); return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_iHealth",          (nint c, int _, ref SpoofValue v) => { if (c != issuerPtr) return false; v.AsInt = 1; return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_iTeamNum",         (nint c, int _, ref SpoofValue v) => { if (c != issuerPtr) return false; v.AsInt = 3; return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_clrRender",        (nint c, int _, ref SpoofValue v) => { if (c != issuerPtr) return false; v.AsInt = unchecked((int) _aimColor); return true; });
                 // Glow: a coloured outline. The fields live on the EMBEDDED CGlowProperty (m_Glow), not on
                 // the pawn class — so the per-client hook matches by leaf name but the force-dirty goes
                 // through the parent m_Glow + sub-offset (see ReDirtyPawn). Full enable set (mirrors the
                 // known glow recipe: type=3, team=-1 all-see, wide range): type/team/range/rangemin/colour.
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iGlowType",         (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 3; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iGlowTeam",         (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = -1; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_nGlowRange",        (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 99999; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_nGlowRangeMin",     (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = 0; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_glowColorOverride", (nint c, int _, ref int v) => { if (c != issuerPtr) return false; v = unchecked((int) _aimColor); return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_iGlowType",         (nint c, int _, ref SpoofValue v) => { if (c != issuerPtr) return false; v.AsInt = 3; return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_iGlowTeam",         (nint c, int _, ref SpoofValue v) => { if (c != issuerPtr) return false; v.AsInt = -1; return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_nGlowRange",        (nint c, int _, ref SpoofValue v) => { if (c != issuerPtr) return false; v.AsInt = 99999; return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_nGlowRangeMin",     (nint c, int _, ref SpoofValue v) => { if (c != issuerPtr) return false; v.AsInt = 0; return true; });
+                sp.Hook(pawn, "CCSPlayerPawn", "m_glowColorOverride", (nint c, int _, ref SpoofValue v) => { if (c != issuerPtr) return false; v.AsInt = unchecked((int) _aimColor); return true; });
                 ReDirtyPawn(pawn);
             }
         }

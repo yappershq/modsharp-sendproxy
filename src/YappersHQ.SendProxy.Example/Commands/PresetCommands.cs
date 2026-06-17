@@ -20,6 +20,7 @@
 using Sharp.Modules.AdminManager.Shared;
 using Sharp.Shared.Objects;
 using Sharp.Shared.Types;
+using YappersHQ.SendProxy.Shared;
 
 namespace YappersHQ.SendProxy.Example.Commands;
 
@@ -52,7 +53,7 @@ internal sealed class PresetCommands : ISpCommandCategory
             return;
         }
 
-        sp.SetUniform("CCSPlayerPawn", "m_iHealth", value);
+        sp.SetUniform("CCSPlayerPawn", "m_iHealth", SpoofValue.Int(value));
         _ctx.Reply(issuer, $"all clients now see {value} HP on every player (real HP unchanged)");
     }
 
@@ -72,7 +73,7 @@ internal sealed class PresetCommands : ISpCommandCategory
         }
 
         var name = ExampleContext.RestOfArgs(command, 1);
-        sp.SetUniform("CCSPlayerController", "m_iszPlayerName", name);
+        sp.SetUniform("CCSPlayerController", "m_iszPlayerName", SpoofValue.String(name));
         _ctx.Reply(issuer, $"all clients now see \"{name}\" as every player's name");
     }
 
@@ -108,10 +109,10 @@ internal sealed class PresetCommands : ISpCommandCategory
         // HP lives in two places — controller mirror (m_iPawnHealth) + pawn actual (m_iHealth) — so push
         // both for a consistent HUD. SendFake force-dirties the field, so it shows on the next snapshot
         // (no slap needed) and fires once.
-        sp.SendFake(issuer, controller, "CCSPlayerController", "m_iPawnHealth", value);
+        sp.SendFake(issuer, controller, "CCSPlayerController", "m_iPawnHealth", SpoofValue.Int(value));
         if (controller.GetPlayerPawn() is { } pawn)
         {
-            sp.SendFake(issuer, pawn, "CCSPlayerPawn", "m_iHealth", value);
+            sp.SendFake(issuer, pawn, "CCSPlayerPawn", "m_iHealth", SpoofValue.Int(value));
         }
 
         _ctx.Reply(issuer, $"one-shot: you should see {value} HP on the next update (real HP unchanged, fires once, no slap needed)");

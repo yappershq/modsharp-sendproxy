@@ -17,10 +17,12 @@
  * along with SendProxy. If not, see <https://www.gnu.org/licenses/>.
  */
 
+using System.Numerics;
 using Sharp.Modules.AdminManager.Shared;
 using Sharp.Shared.Objects;
 using Sharp.Shared.Types;
 using Sharp.Shared.Units;
+using YappersHQ.SendProxy.Shared;
 
 namespace YappersHQ.SendProxy.Example.Commands;
 
@@ -82,21 +84,23 @@ internal sealed class GenericCommands : ISpCommandCategory
         var field = command.GetArg(2);
         var type  = command.GetArg(3).ToLowerInvariant();
 
+        SpoofValue sv;
         switch (type)
         {
-            case "int" when ExampleContext.TryInt(command, 4, out var i):    sp.SetUniform(ser, field, i); break;
-            case "uint" when ExampleContext.TryInt(command, 4, out var u):   sp.SetUniform(ser, field, u); break;
-            case "float" when ExampleContext.TryFloat(command, 4, out var f): sp.SetUniform(ser, field, f); break;
-            case "bool" when ExampleContext.TryBool(command, 4, out var b):  sp.SetUniform(ser, field, b); break;
-            case "vec" when ExampleContext.TryVec(command, 4, out var v):    sp.SetUniform(ser, field, v); break;
-            case "string":                                    sp.SetUniform(ser, field, ExampleContext.RestOfArgs(command, 4)); break;
-            case "bytes" when ExampleContext.TryBytes(command, 4, out var by): sp.SetUniform(ser, field, by); break;
+            case "int" when ExampleContext.TryInt(command, 4, out var i):     sv = SpoofValue.Int(i); break;
+            case "uint" when ExampleContext.TryInt(command, 4, out var u):    sv = SpoofValue.Int(u); break;
+            case "float" when ExampleContext.TryFloat(command, 4, out var f): sv = SpoofValue.Float(f); break;
+            case "bool" when ExampleContext.TryBool(command, 4, out var b):   sv = SpoofValue.Bool(b); break;
+            case "vec" when ExampleContext.TryVec(command, 4, out var v):     sv = SpoofValue.Vector(v); break;
+            case "string":                                                     sv = SpoofValue.String(ExampleContext.RestOfArgs(command, 4)); break;
+            case "bytes" when ExampleContext.TryBytes(command, 4, out var by): sv = SpoofValue.Bytes(by); break;
             default:
                 _ctx.Reply(issuer, $"sp_set: bad type/value for '{type}'. Types: int uint float bool vec string bytes");
 
                 return;
         }
 
+        sp.SetUniform(ser, field, sv);
         _ctx.Reply(issuer, $"uniform: {ser}::{field} ({type}) spoofed for all clients");
     }
 
@@ -126,22 +130,22 @@ internal sealed class GenericCommands : ISpCommandCategory
             case "uint":
                 // 1..64 — small + obvious + varies per client (low value keeps the varint the same byte
                 // length as a typical small field so the substitute fits the slot).
-                sp.Hook(ser, field, (nint c, int _, ref int v) => { v = 1 + (int) (c & 0x3F); return true; });
+                sp.Hook(ser, field, (nint c, int _, ref SpoofValue v) => { v.AsInt = 1 + (int) (c & 0x3F); return true; });
                 break;
             case "float":
-                sp.Hook(ser, field, (nint c, int _, ref float v) => { v = c & 0xFF; return true; });
+                sp.Hook(ser, field, (nint c, int _, ref SpoofValue v) => { v.AsFloat = c & 0xFF; return true; });
                 break;
             case "bool":
-                sp.Hook(ser, field, (nint c, int _, ref bool v) => { v = (c & 1) == 0; return true; });
+                sp.Hook(ser, field, (nint c, int _, ref SpoofValue v) => { v.AsBool = (c & 1) == 0; return true; });
                 break;
             case "vec":
-                sp.Hook(ser, field, (nint c, int _, ref System.Numerics.Vector3 v) => { v = new System.Numerics.Vector3(c & 0xFF, 0, 0); return true; });
+                sp.Hook(ser, field, (nint c, int _, ref SpoofValue v) => { v.AsVector = new Vector3(c & 0xFF, 0, 0); return true; });
                 break;
             case "string":
-                sp.Hook(ser, field, (nint c, int _, ref string v) => { v = $"client-{c & 0xFF}"; return true; });
+                sp.Hook(ser, field, (nint c, int _, ref SpoofValue v) => { v.AsString = $"client-{c & 0xFF}"; return true; });
                 break;
             case "bytes":
-                sp.Hook(ser, field, (nint c, int _, ref byte[] v) => { v = new[] { (byte) (c & 0xFF) }; return true; });
+                sp.Hook(ser, field, (nint c, int _, ref SpoofValue v) => { v.AsBytes = new[] { (byte) (c & 0xFF) }; return true; });
                 break;
             default:
                 _ctx.Reply(issuer, $"sp_setpc: unknown type '{type}'. Types: int uint float bool vec string bytes");
@@ -178,21 +182,23 @@ internal sealed class GenericCommands : ISpCommandCategory
         var field = command.GetArg(3);
         var type  = command.GetArg(4).ToLowerInvariant();
 
+        SpoofValue sv;
         switch (type)
         {
-            case "int" when ExampleContext.TryInt(command, 5, out var i):     sp.SetUniform(entity, ser, field, i); break;
-            case "uint" when ExampleContext.TryInt(command, 5, out var u):    sp.SetUniform(entity, ser, field, u); break;
-            case "float" when ExampleContext.TryFloat(command, 5, out var f): sp.SetUniform(entity, ser, field, f); break;
-            case "bool" when ExampleContext.TryBool(command, 5, out var b):   sp.SetUniform(entity, ser, field, b); break;
-            case "vec" when ExampleContext.TryVec(command, 5, out var v):     sp.SetUniform(entity, ser, field, v); break;
-            case "string":                                     sp.SetUniform(entity, ser, field, ExampleContext.RestOfArgs(command, 5)); break;
-            case "bytes" when ExampleContext.TryBytes(command, 5, out var by): sp.SetUniform(entity, ser, field, by); break;
+            case "int" when ExampleContext.TryInt(command, 5, out var i):      sv = SpoofValue.Int(i); break;
+            case "uint" when ExampleContext.TryInt(command, 5, out var u):     sv = SpoofValue.Int(u); break;
+            case "float" when ExampleContext.TryFloat(command, 5, out var f):  sv = SpoofValue.Float(f); break;
+            case "bool" when ExampleContext.TryBool(command, 5, out var b):    sv = SpoofValue.Bool(b); break;
+            case "vec" when ExampleContext.TryVec(command, 5, out var v):      sv = SpoofValue.Vector(v); break;
+            case "string":                                                      sv = SpoofValue.String(ExampleContext.RestOfArgs(command, 5)); break;
+            case "bytes" when ExampleContext.TryBytes(command, 5, out var by): sv = SpoofValue.Bytes(by); break;
             default:
                 _ctx.Reply(issuer, $"sp_setent: bad type/value for '{type}'");
 
                 return;
         }
 
+        sp.SetUniform(entity, ser, field, sv);
         _ctx.Reply(issuer, $"entity #{idx}: {ser}::{field} ({type}) spoofed (other entities unaffected)");
     }
 

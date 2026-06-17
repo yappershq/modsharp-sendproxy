@@ -64,6 +64,8 @@ internal enum FieldType
     String, ByteArray,
 }
 
+// CallbackKind maps a SpoofValue.Kind (or uniform-value Kind) to the set of FieldTypes it can drive.
+// Kept internal so CallbackMatches can gate the dispatch without exposing it to consumers.
 internal enum CallbackKind
 {
     None = 0,
@@ -85,25 +87,14 @@ internal static unsafe class FieldSubstitution
         set => Interlocked.Exchange(ref _mode, (int) value);
     }
 
-    // A registration holds either a uniform value (one of the Has*/non-null fields) or a per-client typed
-    // callback. Key entityIndex: -1 = all entities (global), >= 0 = a specific entity. ValueCopyHook
-    // probes the entity-specific entry first, then the global fallback — both lock-free dictionary reads.
+    // A registration holds either a uniform SpoofValue (no Callback) or a per-client SendProxyCallback
+    // (with Value seeded as the initial value passed to the callback). Key entityIndex: -1 = all entities
+    // (global), >= 0 = a specific entity. ValueCopyHook probes the entity-specific entry first, then the
+    // global fallback — both lock-free dictionary reads.
     private readonly struct SpoofEntry
     {
-        public readonly bool    HasIntSpoof;
-        public readonly int     IntSpoof;       // int / uint / bool / fixed / float-bits
-        public readonly bool    HasVectorSpoof;
-        public readonly Vector3 VectorSpoof;
-        public readonly string? StringSpoof;
-        public readonly byte[]? BytesSpoof;
-
-        public readonly CallbackKind          CallbackType;
-        public readonly PerClientIntProxy?    IntCallback;
-        public readonly PerClientFloatProxy?  FloatCallback;
-        public readonly PerClientBoolProxy?   BoolCallback;
-        public readonly PerClientVectorProxy? VectorCallback;
-        public readonly PerClientStringProxy? StringCallback;
-        public readonly PerClientBytesProxy?  BytesCallback;
+        public readonly SpoofValue         Value;
+        public readonly SendProxyCallback? Callback;
 
         // Assembly name of the module that owns this callback (null for uniform spoofs, which hold no
         // delegate). Used to purge a consumer's callbacks when its module unloads — invoking a delegate
@@ -116,101 +107,50 @@ internal static unsafe class FieldSubstitution
         public readonly bool OneShot;
         public readonly nint TargetClient;
 
-        public SpoofEntry(int value) : this()
+        // Uniform spoof: store value directly, no callback.
+        public SpoofEntry(in SpoofValue value) : this()
+            => Value = value;
+
+        // One-shot (SendFake): a uniform-style value bound to a single target client.
+        public SpoofEntry(in SpoofValue value, nint targetClient) : this()
         {
-            HasIntSpoof = true;
-            IntSpoof    = value;
-        }
-
-        public SpoofEntry(Vector3 value) : this()
-        {
-            HasVectorSpoof = true;
-            VectorSpoof    = value;
-        }
-
-        public SpoofEntry(string value) : this()
-            => StringSpoof = value;
-
-        public SpoofEntry(byte[] value) : this()
-            => BytesSpoof = value;
-
-        // One-shot constructors (SendFake): a uniform-style value bound to a single target client.
-        public SpoofEntry(int value, nint targetClient) : this(value)
-        {
+            Value        = value;
             OneShot      = true;
             TargetClient = targetClient;
         }
 
-        public SpoofEntry(Vector3 value, nint targetClient) : this(value)
+        // Per-client callback; Value carries the optional seed (default zero for that kind).
+        public SpoofEntry(SendProxyCallback callback, in SpoofValue seed) : this()
         {
-            OneShot      = true;
-            TargetClient = targetClient;
-        }
-
-        public SpoofEntry(string value, nint targetClient) : this(value)
-        {
-            OneShot      = true;
-            TargetClient = targetClient;
-        }
-
-        public SpoofEntry(byte[] value, nint targetClient) : this(value)
-        {
-            OneShot      = true;
-            TargetClient = targetClient;
-        }
-
-        public SpoofEntry(PerClientIntProxy callback) : this()
-        {
-            CallbackType = CallbackKind.Int;
-            IntCallback  = callback;
-            Owner        = OwnerOf(callback);
-        }
-
-        public SpoofEntry(PerClientFloatProxy callback) : this()
-        {
-            CallbackType  = CallbackKind.Float;
-            FloatCallback = callback;
-            Owner         = OwnerOf(callback);
-        }
-
-        public SpoofEntry(PerClientBoolProxy callback) : this()
-        {
-            CallbackType = CallbackKind.Bool;
-            BoolCallback = callback;
-            Owner        = OwnerOf(callback);
-        }
-
-        public SpoofEntry(PerClientVectorProxy callback) : this()
-        {
-            CallbackType   = CallbackKind.Vector;
-            VectorCallback = callback;
-            Owner          = OwnerOf(callback);
-        }
-
-        public SpoofEntry(PerClientStringProxy callback) : this()
-        {
-            CallbackType   = CallbackKind.String;
-            StringCallback = callback;
-            Owner          = OwnerOf(callback);
-        }
-
-        public SpoofEntry(PerClientBytesProxy callback) : this()
-        {
-            CallbackType  = CallbackKind.Bytes;
-            BytesCallback = callback;
-            Owner         = OwnerOf(callback);
+            Value    = seed;
+            Callback = callback;
+            Owner    = OwnerOf(callback);
         }
 
         // The defining assembly of the callback target = the consumer module that registered it.
         private static string? OwnerOf(Delegate callback)
             => callback.Method.Module.Assembly.GetName().Name;
 
-        public bool HasCallback => CallbackType != CallbackKind.None;
+        public bool HasCallback => Callback is not null;
 
-        // True when this registration's callback kind can drive the given field family. A mismatch (e.g.
-        // a string callback on an int field) would write wrong-type bits, so the caller passes through.
+        // Derive a CallbackKind from SpoofValue.Kind so CallbackMatches can gate by field family.
+        // A SpoofKind.Int seed is compatible with the full integer family (int/uint/bool/fixed).
+        private static CallbackKind KindOf(SpoofKind k)
+            => k switch
+            {
+                SpoofKind.Int    => CallbackKind.Int,
+                SpoofKind.Float  => CallbackKind.Float,
+                SpoofKind.Bool   => CallbackKind.Bool,
+                SpoofKind.Vector => CallbackKind.Vector,
+                SpoofKind.String => CallbackKind.String,
+                SpoofKind.Bytes  => CallbackKind.Bytes,
+                _                => CallbackKind.None,
+            };
+
+        // True when this registration's value kind can drive the given field family. A mismatch (e.g.
+        // a string value on an int field) would write wrong-type bits, so the caller passes through.
         public bool CallbackMatches(FieldType type)
-            => CallbackType switch
+            => KindOf(Value.Kind) switch
             {
                 CallbackKind.Int    => type is FieldType.Int32 or FieldType.UInt32 or FieldType.Int64 or FieldType.Bool or FieldType.Fixed32 or FieldType.Fixed64,
                 CallbackKind.Float  => type is FieldType.Float32 or FieldType.Coord3 or FieldType.Normal3 or FieldType.CoordIntegral3 or FieldType.QuantizedFloat,
@@ -226,37 +166,22 @@ internal static unsafe class FieldSubstitution
 
     // -- Registration (called from SendProxyManager on the main thread) ----------------------------
 
-    public static void SetSpoof(string ser, string field, int value)         => _registry[(ser, field, -1)] = new SpoofEntry(value);
-    public static void SetSpoof(string ser, string field, Vector3 value)     => _registry[(ser, field, -1)] = new SpoofEntry(value);
-    public static void SetSpoof(string ser, string field, string value)      => _registry[(ser, field, -1)] = new SpoofEntry(value);
-    public static void SetSpoof(string ser, string field, byte[] value)      => _registry[(ser, field, -1)] = new SpoofEntry(value);
+    public static void SetSpoof(string ser, string field, in SpoofValue value)
+        => _registry[(ser, field, -1)] = new SpoofEntry(value);
 
-    public static void SetCallback(string ser, string field, PerClientIntProxy cb)    => _registry[(ser, field, -1)] = new SpoofEntry(cb);
-    public static void SetCallback(string ser, string field, PerClientFloatProxy cb)  => _registry[(ser, field, -1)] = new SpoofEntry(cb);
-    public static void SetCallback(string ser, string field, PerClientBoolProxy cb)   => _registry[(ser, field, -1)] = new SpoofEntry(cb);
-    public static void SetCallback(string ser, string field, PerClientVectorProxy cb) => _registry[(ser, field, -1)] = new SpoofEntry(cb);
-    public static void SetCallback(string ser, string field, PerClientStringProxy cb) => _registry[(ser, field, -1)] = new SpoofEntry(cb);
-    public static void SetCallback(string ser, string field, PerClientBytesProxy cb)  => _registry[(ser, field, -1)] = new SpoofEntry(cb);
+    public static void SetCallback(string ser, string field, SendProxyCallback cb, in SpoofValue seed = default)
+        => _registry[(ser, field, -1)] = new SpoofEntry(cb, seed);
 
-    public static void SetEntitySpoof(int ent, string ser, string field, int value)     => _registry[(ser, field, ent)] = new SpoofEntry(value);
-    public static void SetEntitySpoof(int ent, string ser, string field, Vector3 value) => _registry[(ser, field, ent)] = new SpoofEntry(value);
-    public static void SetEntitySpoof(int ent, string ser, string field, string value)  => _registry[(ser, field, ent)] = new SpoofEntry(value);
-    public static void SetEntitySpoof(int ent, string ser, string field, byte[] value)  => _registry[(ser, field, ent)] = new SpoofEntry(value);
+    public static void SetEntitySpoof(int ent, string ser, string field, in SpoofValue value)
+        => _registry[(ser, field, ent)] = new SpoofEntry(value);
 
-    public static void SetEntityCallback(int ent, string ser, string field, PerClientIntProxy cb)    => _registry[(ser, field, ent)] = new SpoofEntry(cb);
-    public static void SetEntityCallback(int ent, string ser, string field, PerClientFloatProxy cb)  => _registry[(ser, field, ent)] = new SpoofEntry(cb);
-    public static void SetEntityCallback(int ent, string ser, string field, PerClientBoolProxy cb)   => _registry[(ser, field, ent)] = new SpoofEntry(cb);
-    public static void SetEntityCallback(int ent, string ser, string field, PerClientVectorProxy cb) => _registry[(ser, field, ent)] = new SpoofEntry(cb);
-    public static void SetEntityCallback(int ent, string ser, string field, PerClientStringProxy cb) => _registry[(ser, field, ent)] = new SpoofEntry(cb);
-    public static void SetEntityCallback(int ent, string ser, string field, PerClientBytesProxy cb)  => _registry[(ser, field, ent)] = new SpoofEntry(cb);
+    public static void SetEntityCallback(int ent, string ser, string field, SendProxyCallback cb, in SpoofValue seed = default)
+        => _registry[(ser, field, ent)] = new SpoofEntry(cb, seed);
 
     // One-shot (SendFake): fire once for targetClient on the next transmit, then auto-remove. Entity-scoped
     // (ent >= 0) so it never lingers across entity-index reuse; the force-dirty is issued by the caller.
-    public static void SetOneShot(int ent, string ser, string field, nint client, int value)     => _registry[(ser, field, ent)] = new SpoofEntry(value, client);
-    public static void SetOneShot(int ent, string ser, string field, nint client, Vector3 value) => _registry[(ser, field, ent)] = new SpoofEntry(value, client);
-    public static void SetOneShot(int ent, string ser, string field, nint client, string value)  => _registry[(ser, field, ent)] = new SpoofEntry(value, client);
-    public static void SetOneShot(int ent, string ser, string field, nint client, byte[] value)  => _registry[(ser, field, ent)] = new SpoofEntry(value, client);
-    public static void SetOneShot(int ent, string ser, string field, nint client, bool value)    => SetOneShot(ent, ser, field, client, value ? 1 : 0);
+    public static void SetOneShot(int ent, string ser, string field, nint client, in SpoofValue value)
+        => _registry[(ser, field, ent)] = new SpoofEntry(value, client);
 
     public static void ClearGlobal(string ser, string field)            => _registry.TryRemove((ser, field, -1), out _);
     public static void ClearEntity(int ent, string ser, string field)   => _registry.TryRemove((ser, field, ent), out _);
@@ -722,13 +647,16 @@ internal static unsafe class FieldSubstitution
                 return CallOriginal(dst, src, bitcount);
             }
 
-            // Resolve the substitute value (uniform seed, then optional per-client callback). The callback
+            // Seed a SpoofValue from the registration's stored value (uniform) or the zero default, then
+            // optionally invoke the per-client callback to let it mutate the value. The per-client callback
             // is the one genuine managed throw-site on this path; a throw is logged and passed through.
-            var     intBits        = reg.HasIntSpoof ? reg.IntSpoof : 0;
-            var     vec            = reg.HasVectorSpoof ? reg.VectorSpoof : default;
-            string? str            = reg.StringSpoof;
-            var     bytes          = reg.BytesSpoof;
-            bool    substitute;
+
+            // Build the initial SpoofValue seeded from the registration's stored value.
+            var spoofVal = reg.Value;
+
+            // For the uniform case (no callback), we apply directly. For the callback case, we first
+            // check kind compatibility (same rule as before), then invoke once.
+            bool substitute;
 
             if (!reg.HasCallback)
             {
@@ -736,14 +664,14 @@ internal static unsafe class FieldSubstitution
             }
             else if (!reg.CallbackMatches(fieldType))
             {
-                // A callback registered for the wrong family would write garbage — pass through.
+                // A callback with a kind incompatible with this field family would write garbage — pass through.
                 return CallOriginal(dst, src, bitcount);
             }
             else
             {
                 try
                 {
-                    substitute = InvokeCallback(reg, client, entityIndex, ref intBits, ref vec, ref str, ref bytes);
+                    substitute = reg.Callback!(client, entityIndex, ref spoofVal);
                 }
                 catch (Exception ex)
                 {
@@ -756,6 +684,21 @@ internal static unsafe class FieldSubstitution
             if (!substitute)
             {
                 return CallOriginal(dst, src, bitcount);
+            }
+
+            // Extract the typed sub-values from the (possibly mutated) SpoofValue using the SAME
+            // bit-conversion logic that existed before: Float32 reads float bits, UInt32 reads uint cast,
+            // Bool checks != 0, vectors read XYZ, string/bytes read the ref fields. The raw-int-bits path
+            // (Int32/Int64/Fixed32/Fixed64) reads _intBits directly via RawIntBits.
+            var intBits = spoofVal.RawIntBits;
+            var vec     = spoofVal.RawVec;
+            var str     = spoofVal.RawStr;
+            var bytes   = spoofVal.RawBytes;
+            // Float32 is stored in RawFloat; re-interpret to int bits for the encode path (identical to
+            // the original InvokeCallback Float case: BitConverter.SingleToInt32Bits(f) → intBits).
+            if (spoofVal.Kind == SpoofKind.Float)
+            {
+                intBits = BitConverter.SingleToInt32Bits(spoofVal.RawFloat);
             }
 
             // Resolve the field's own engine encoder (dispatch slot 0 at fieldInfo+0x38) and its params.
@@ -841,7 +784,7 @@ internal static unsafe class FieldSubstitution
                         scratch[i] = *(byte*) (liveValuePtr + i);
                     }
 
-                    if (reg.CallbackType == CallbackKind.Vector || reg.HasVectorSpoof)
+                    if (spoofVal.Kind == SpoofKind.Vector)
                     {
                         ((float*) scratch)[0] = vec.X;
                         ((float*) scratch)[1] = vec.Y;
@@ -981,51 +924,6 @@ internal static unsafe class FieldSubstitution
         matchedEnt = -1;
 
         return _registry.TryGetValue((serName, fieldName, -1), out reg);
-    }
-
-    private static bool InvokeCallback(
-        in SpoofEntry reg, nint client, int entityIndex,
-        ref int intBits, ref Vector3 vec, ref string? str, ref byte[]? bytes)
-    {
-        switch (reg.CallbackType)
-        {
-            case CallbackKind.Int:
-                return reg.IntCallback!(client, entityIndex, ref intBits);
-
-            case CallbackKind.Float:
-                var f = BitConverter.Int32BitsToSingle(intBits);
-                var rf = reg.FloatCallback!(client, entityIndex, ref f);
-                intBits = BitConverter.SingleToInt32Bits(f);
-
-                return rf;
-
-            case CallbackKind.Bool:
-                var b = intBits != 0;
-                var rb = reg.BoolCallback!(client, entityIndex, ref b);
-                intBits = b ? 1 : 0;
-
-                return rb;
-
-            case CallbackKind.Vector:
-                return reg.VectorCallback!(client, entityIndex, ref vec);
-
-            case CallbackKind.String:
-                var s = str ?? string.Empty;
-                var rs = reg.StringCallback!(client, entityIndex, ref s);
-                str = s;
-
-                return rs;
-
-            case CallbackKind.Bytes:
-                var by = bytes ?? Array.Empty<byte>();
-                var rby = reg.BytesCallback!(client, entityIndex, ref by);
-                bytes = by;
-
-                return rby;
-
-            default:
-                return false;
-        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]

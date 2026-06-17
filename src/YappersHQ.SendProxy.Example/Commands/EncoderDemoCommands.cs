@@ -21,6 +21,7 @@ using System.Numerics;
 using Sharp.Modules.AdminManager.Shared;
 using Sharp.Shared.Objects;
 using Sharp.Shared.Types;
+using YappersHQ.SendProxy.Shared;
 
 namespace YappersHQ.SendProxy.Example.Commands;
 
@@ -53,8 +54,8 @@ internal sealed class EncoderDemoCommands : ISpCommandCategory
             return;
         }
 
-        sp.SetUniform("CCSPlayerController", "m_iPawnHealth", 1337);
-        sp.SetUniform("CCSPlayerPawn", "m_iHealth", 1337);
+        sp.SetUniform("CCSPlayerController", "m_iPawnHealth", SpoofValue.Int(1337));
+        sp.SetUniform("CCSPlayerPawn", "m_iHealth", SpoofValue.Int(1337));
         _ctx.ForceResendAll("CCSPlayerController", "m_iPawnHealth");
         _ctx.ForceResendAll("CCSPlayerPawn", "m_iHealth");
         _ctx.Reply(issuer, "enc1 (int b1): m_iPawnHealth (HUD) + m_iHealth = 1337 — shown immediately (no slap needed)");
@@ -70,8 +71,8 @@ internal sealed class EncoderDemoCommands : ISpCommandCategory
             return;
         }
 
-        sp.SetUniform("CCSPlayerPawn", "m_iTeamNum", 3);
-        sp.SetUniform("CCSPlayerController", "m_iTeamNum", 3);
+        sp.SetUniform("CCSPlayerPawn", "m_iTeamNum", SpoofValue.Int(3));
+        sp.SetUniform("CCSPlayerController", "m_iTeamNum", SpoofValue.Int(3));
         _ctx.ForceResendAll("CCSPlayerPawn", "m_iTeamNum");
         _ctx.ForceResendAll("CCSPlayerController", "m_iTeamNum");
         _ctx.Reply(issuer, "enc2 (uint b2): m_iTeamNum = 3 (CT) on pawn + controller — all players appear CT (radar/outline + scoreboard)");
@@ -89,7 +90,7 @@ internal sealed class EncoderDemoCommands : ISpCommandCategory
             return;
         }
 
-        sp.SetUniform("CCSPlayerPawn", "m_angEyeAngles", new Vector3(0f, 180f, 0f));
+        sp.SetUniform("CCSPlayerPawn", "m_angEyeAngles", SpoofValue.Vector(new Vector3(0f, 180f, 0f)));
         _ctx.ForceResendAll("CCSPlayerPawn", "m_angEyeAngles");
         _ctx.Reply(issuer, "enc3 (qangle b3): m_angEyeAngles = (0,180,0) — fakes where a player is looking (their camera). SPECTATE someone to see it: their spectate view points the spoofed way. sp_encoders_off to clear.");
     }
@@ -104,7 +105,7 @@ internal sealed class EncoderDemoCommands : ISpCommandCategory
             return;
         }
 
-        sp.SetUniform("CCSPlayerPawn", "m_flScale", 0.3f);
+        sp.SetUniform("CCSPlayerPawn", "m_flScale", SpoofValue.Float(0.3f));
         _ctx.ForceResendAll("CCSPlayerPawn", "m_flScale");
         _ctx.Reply(issuer, "enc4 (float b4): m_flScale = 0.3 — every player renders tiny to all clients (real size unchanged). Observe another player/bot. sp_encoders_off to clear.");
     }
@@ -117,7 +118,7 @@ internal sealed class EncoderDemoCommands : ISpCommandCategory
             return;
         }
 
-        sp.SetUniform("CCSPlayerController", "m_iszPlayerName", "SendProxyTest");
+        sp.SetUniform("CCSPlayerController", "m_iszPlayerName", SpoofValue.String("SendProxyTest"));
         _ctx.ForceResendAll("CCSPlayerController", "m_iszPlayerName");
         _ctx.Reply(issuer, "enc5 (string b5): CCSPlayerController::m_iszPlayerName = \"SendProxyTest\" for all clients");
     }
@@ -138,7 +139,7 @@ internal sealed class EncoderDemoCommands : ISpCommandCategory
             return;
         }
 
-        sp.SetUniform("CCSPlayerPawn", "m_bIsScoped", true);
+        sp.SetUniform("CCSPlayerPawn", "m_bIsScoped", SpoofValue.Bool(true));
         _ctx.ForceResendAll("CCSPlayerPawn", "m_bIsScoped");
         _ctx.Reply(issuer, "enc7 (bool b7): CCSPlayerPawn::m_bIsScoped = true — all players appear scoped to all clients");
     }
