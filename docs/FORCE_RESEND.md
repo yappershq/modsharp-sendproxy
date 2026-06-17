@@ -127,9 +127,35 @@ Skip if the index is already present (CalcDelta may have included it from a real
 Ship gated behind a flag (off by default) and validate on a live client before enabling — appending to the
 engine's delta list is hot-path engine surgery that must be confirmed in-game, not assumed.
 
+### CORRECTION (deeper RE) — hook the consumer `+0x70`, not CalcDelta `+0x40`
+
+WriteDeltaEntity_Internal builds the field-index list via **two** paths, both writing the same
+`CUtlVector<int>` (`param_2+0x900`):
+- **change-tick filter** (manual build, lines ~78-180): walks the TO-snapshot's per-field change list
+  (`*(to+0x10)` → entries `{int fieldIndex @+0, int changeTick @+4}`, stride 8) and adds fields whose
+  `changeTick > baselineTick` (`*(*(param_2+0xa0)+4)`). The appended element = `*record` = the field index.
+- **value-compare** (the `+0x40` CalcDelta call, line ~192) for the other branch.
+
+Both then feed the list to the **encode/WriteFields fn = vtable slot 14 (`+0x70`)**:
+```
+(*(code**)(*DAT_00ac4ae0 + 0x70))(DAT_00ac4ae0, FROM-data=*(param_2+0x90)+0x18, count, piVar16 /*arg3*/, …)
+```
+`+0x70` consumes `piVar16` (the field-index list) and encodes each listed field — that's where
+BitCopyPrimitive (our value hook) ultimately fires per field.
+
+**So the correct, path-agnostic hook is `+0x70` (WriteFields), arg3 = the field-index `CUtlVector<int>`:**
+hook it, and for the issuer (RecipientCapture) + a hooked entity (`_currentEntityIndex`), **sorted-insert the
+hooked field's index** into arg3 before calling the original (Trampoline). Hooking `+0x40` (CalcDelta) alone
+would miss the change-tick path; hooking `+0x70` covers both because both converge there.
+
+Hook via `IVirtualHook.Prepare(vtable, 14, fn)` (offset = slot INDEX, confirmed; `0x70/8 = 14`), where
+`vtable = *(*(0x00ac4ae0))`. The field index space = the serializer's flattened-leaf index (the same int the
+TO-snapshot change-list stores), so field-name→index = count leaves during the serializer record walk
+(handles embedded fields like m_Glow.* by their flattened-leaf position).
+
 ### Spec completeness
 
-All four pieces are now RE'd: (1) hook = vtable slot 8 of `*(0x00ac4ae0)`; (2) issuer + entity from existing
-captures; (3) output list = CUtlVector&lt;int&gt; layout above; (4) field-name→index from the full-update
-serializer walk. Build is mechanical from here; only the live-client validation + the Windows global-load
-sig remain.
+All RE'd with high confidence: hook = vtable **slot 14 (`+0x70`)** of `*(0x00ac4ae0)` (path-agnostic
+consumer); inject = sorted-insert into arg3's `CUtlVector<int>`; issuer+entity from existing captures;
+field-name→flattened-leaf-index from the serializer walk. Build is mechanical. Remaining: confirm the
+`+0x70` arg layout on Windows (same slot index) + the Windows global-load sig.

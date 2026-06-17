@@ -83,6 +83,17 @@
       //   match). NOTE: do NOT confuse with WriteDeltaEntities (plural loop driver @0x1800d2e90), its caller.
       "windows": "4C 89 44 24 ? 48 89 54 24 ? 48 89 4C 24 ? 55 57 41 55 48 8D 6C 24 ? 48 81 EC 60 01 00 00"
     },
+    // Serializer singleton GLOBAL (engine2). The CalcDelta virtual (vtable slot 8 / +0x40) lives on the
+    // object whose pointer this global holds — loaded inside WriteDeltaEntity_Internal as
+    // `mov rdi,[rip+<this global>]; mov rax,[rdi]; call [rax+0x40]`. Used ONLY by the gated, off-by-default
+    // force-resend (Option D): read *global -> object -> vtable, IVirtualHook slot 8, then append a hooked
+    // field's index to the delta output list so a per-client spoof applies live. See docs/FORCE_RESEND.md.
+    // The "+3 r" factory skips the 3-byte `48 8B 3D` opcode and RIP-resolves the rel32 to the global's address.
+    "CNetworkSerialization::SerializerSingleton": {
+      "library": "engine",
+      "linux": { "signature": "48 8B 3D ? ? ? ? 48 8B 30 48 8B 4A 20 48 8B 50 20 48 8B 07", "factory": "+3 r" }
+      // TODO windows: derive the equivalent global-load sig in engine2.dll WriteDeltaEntity_Internal (0x1800d1240).
+    },
     "CFlattenedSerializer::WriteFieldList": {
       "library": "networksystem",
       "linux": "55 48 8D 05 ? ? ? ? 45 31 DB 66 0F EF C0 48 89 E5 41 57 41 56 4C 8D",
