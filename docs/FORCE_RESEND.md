@@ -182,3 +182,19 @@ resolution captured at the per-field site — which is exactly the reverse of th
 force-resend already builds (`ForceResend.WalkLeaves`). (The Linux midhook also can't install on Windows
 regardless, since GetBitRange is inlined — no standalone address.) This is the index-based Windows design
 item; the name↔index machinery for it now exists.
+
+**Windows capture site + register (RE-grounded, fills the midhook TODO):** the field-path midhook hooks the
+WriteFieldList per-field point — the instruction immediately before each field's `BitCopyPrimitive` call.
+There `R12 = the current field index` (`MOVSXD RCX,R12D; MOV EDX,[*(R15+8)+RCX*4+4]` just above; R12 is
+non-volatile so it survives the intervening call), and hooking there is **1:1 with the per-field BitCopy by
+construction** (same code path), removing the "how many BitCopys per field" uncertainty. So:
+- gamedata site sig: `CFlattenedSerializer::WriteFieldList_FieldPathSite` (windows) =
+  `44 8B C6 48 8D 55 ? 48 8D 8D ? ? ? ? E8`.
+- Windows FieldPathReg → **R12** (read as an int field index, not a pointer).
+- resolve index→name via the serializer leaf map (reverse of `ForceResend.WalkLeaves`).
+
+Two hardware-verify points remain (same class as Linux's leaf-index assumption, NOT new assumptions — the
+site + register are RE-confirmed): (1) that R12's index space equals the leaf-walk DFS numbering; (2) that
+this covers the WriteFieldList path — the delta path (BuildMergedSerializedEntity) needs the analogous
+per-field site for full coverage. The remaining work is wiring the Windows install + index→name lookup
+(mechanical) and confirming those two points on a Windows client.

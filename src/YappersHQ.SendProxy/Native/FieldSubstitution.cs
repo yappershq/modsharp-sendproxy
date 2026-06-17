@@ -626,11 +626,17 @@ internal static unsafe class FieldSubstitution
         _currentFieldPath = NativeUtil.IsUserPtr(pathOut) ? pathOut : 0;
     }
 
-    // Which MidHookContext register holds the CFieldPath* at the hooked site. Linux (GetBitRange entry) = rdi
-    // (arg0). Windows does NOT use a CFieldPath pointer (it's index-based — see GetBitRangePathHook note), and
-    // the midhook can't install on Windows anyway (GetBitRange is inlined → no standalone addr to hook), so
-    // this stays Rdi; SetFieldPathRegister remains for completeness / future per-build tuning.
-    private static FieldPathReg _fieldPathReg = FieldPathReg.Rdi;
+    // Which MidHookContext register the field-path midhook reads at the hooked site.
+    //   Linux  : GetBitRange entry → rdi (arg0) = CFieldPath* (a pointer; ResolveFieldName walks it).
+    //   Windows: GetBitRange is inlined, so the midhook hooks the WriteFieldList per-field site instead
+    //            (gamedata "CFlattenedSerializer::WriteFieldList_FieldPathSite"); there R12 = the field
+    //            INDEX (not a pointer — Windows is index-based), so the Windows capture reads r12 as an int
+    //            index and resolves it via the serializer leaf map (index→name). The full Windows install +
+    //            index→name wiring is the documented next step (needs the leaf index↔name numbering verified
+    //            on hardware + the delta-path BuildMergedSerializedEntity site for full coverage — see
+    //            docs/FORCE_RESEND.md). Default below is the Linux pointer-reg; SetFieldPathRegister overrides.
+    private static FieldPathReg _fieldPathReg =
+        OperatingSystem.IsWindows() ? FieldPathReg.R12 : FieldPathReg.Rdi;
 
     internal enum FieldPathReg { Rdi, Rsi, Rdx, Rcx, R8, R9, R15, R14, R13, R12 }
 
