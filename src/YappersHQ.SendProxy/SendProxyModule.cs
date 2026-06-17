@@ -30,7 +30,6 @@ namespace YappersHQ.SendProxy;
 
 public sealed class SendProxyModule : IModSharpModule, IEntityListener
 {
-    private const string SendClientMessagesKey = "CNetworkGameServer::SendClientMessages";
     private const string WriteDeltaInternalKey = "CNetworkGameServerBase::WriteDeltaEntity_Internal";
     private const string PerClientEncodeKey    = "CNetworkGameServer::PerClientEncode";
     private const string WriteFieldListKey     = "CFlattenedSerializer::WriteFieldList";
@@ -130,7 +129,6 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         RecipientCapture.Uninstall();
         FieldSubstitution.Uninstall();
         _bridge.EntityManager.RemoveEntityListener(this);
-        _manager.Clear();
     }
 
     #endregion
@@ -155,7 +153,6 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
     private void ResolveNativeTargets()
     {
-        ResolveFromGameData(SendClientMessagesKey);
         _wdeAddr             = ResolveFromGameData(WriteDeltaInternalKey);
         _perClientEncodeAddr = ResolveFromGameData(PerClientEncodeKey);
         _writeFieldListAddr  = ResolveFromGameData(WriteFieldListKey);

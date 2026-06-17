@@ -77,7 +77,6 @@ internal sealed class SendProxyManager : ISendProxyManager
         return false;
     }
 
-    internal void Clear() { /* registry lives in FieldSubstitution; nothing to clear here */ }
 
     // Drop every registration scoped to entityIndex (called from OnEntityDeleted — indices are reused).
     internal void RemoveEntityRegistrations(int entityIndex)

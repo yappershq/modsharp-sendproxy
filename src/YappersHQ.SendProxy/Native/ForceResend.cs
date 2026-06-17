@@ -198,6 +198,11 @@ internal static unsafe class ForceResend
 
     public static void Uninstall()
     {
+        if (_injected != 0 || _skippedFull != 0)
+        {
+            _logger?.LogInformation("ForceResend: injected={Injected} skippedFull={Skipped}", _injected, _skippedFull);
+        }
+
         _hook?.Uninstall();
         _hook = null;
         _trampoline = 0;

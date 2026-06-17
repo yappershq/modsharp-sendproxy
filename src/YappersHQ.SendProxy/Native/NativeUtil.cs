@@ -17,18 +17,28 @@
  * along with SendProxy. If not, see <https://www.gnu.org/licenses/>.
  */
 
+using System;
 using System.Text;
 
 namespace YappersHQ.SendProxy.Native;
 
 internal static unsafe class NativeUtil
 {
+    // Safety boundary for every raw dereference, by platform canonical user-space shape:
+    //   Linux x64   : user pointers are 0x00007Fxx_xxxxxxxx → bits [63:40] == 0x7F (byte-identical to before).
+    //   Windows x64 : user pointers are below 0x0000_8000_0000_0000 → bits [63:48] == 0 (and non-tiny).
+    // The Windows branch makes the gate correct if the module runs on a Windows server (the old Linux-only
+    // shape would mis-classify Windows pointers — silently breaking every guard there).
+    private static readonly bool IsWindows = OperatingSystem.IsWindows();
+
     /// <summary>
-    ///     Linux x64 user-space gate: valid heap/rodata pointers have bits [63:40] == 0x7F. Cheap check
-    ///     to avoid dereferencing scalar field values and segfaulting.
+    ///     User-space pointer gate (platform-aware). Cheap check to avoid dereferencing a scalar field value
+    ///     and segfaulting on a non-pointer.
     /// </summary>
     public static bool IsUserPtr(nint p)
-        => p > 0 && ((ulong) p >> 40) == 0x7F;
+        => IsWindows
+            ? p > 0x10000 && ((ulong) p >> 48) == 0
+            : p > 0 && ((ulong) p >> 40) == 0x7F;
 
     /// <summary>
     ///     Read up to <paramref name="maxLen"/> printable ASCII bytes from <paramref name="p"/>. Returns

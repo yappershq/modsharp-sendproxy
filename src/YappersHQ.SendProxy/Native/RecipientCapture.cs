@@ -42,7 +42,6 @@ internal static unsafe class RecipientCapture
     private static IDetourHook? _hook;
     private static nint         _trampoline;
     private static ILogger?     _logger;
-    private static int          _count;
 
     public static bool Install(InterfaceBridge bridge, ILogger logger, nint perClientEncodeAddr)
     {
@@ -61,7 +60,6 @@ internal static unsafe class RecipientCapture
         }
 
         _logger = logger;
-        _count  = 0;
 
         var hook   = bridge.HookManager.CreateDetourHook();
         var hookFn = (nint) (delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nint, nint, nint>) &Hook;
@@ -96,31 +94,14 @@ internal static unsafe class RecipientCapture
     private static nint Hook(nint a, nint b, nint c, nint d, nint e, nint f)
     {
         _currentClient = b;
-        nint result;
 
         try
         {
-            var n = Interlocked.Increment(ref _count);
-            if (n <= 30 && _logger is { } log)
-            {
-                try
-                {
-                    log.LogInformation("RECIP#{N} tid={Tid} server=0x{A:X} client=0x{B:X}",
-                        n, Environment.CurrentManagedThreadId, a, b);
-                }
-                catch
-                {
-                    // Diagnostics only — never let logging faults escape the hook.
-                }
-            }
-
-            result = ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nint, nint, nint>) _trampoline)(a, b, c, d, e, f);
+            return ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, nint, nint, nint>) _trampoline)(a, b, c, d, e, f);
         }
         finally
         {
             _currentClient = 0;
         }
-
-        return result;
     }
 }
