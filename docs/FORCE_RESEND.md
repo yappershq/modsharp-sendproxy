@@ -74,3 +74,36 @@ scope via the WriteFieldList shim), keyed by serializer name, then look it up in
 
 Cycling values (e.g. sp_fakeaim's rainbow colour) work automatically under D since the field is re-injected
 every tick it's hooked.
+
+## Option D — implementation anchors (RE'd, ready to build + validate live)
+
+The CalcDelta call inside `WriteDeltaEntity_Internal` (Linux libengine2 `0x7d15c0`) is a **virtual call on a
+serializer singleton**, not a free function:
+
+```
+007d19c8  MOV RDI, [0x00ac4ae0]   ; RDI = serializer singleton (global holds the object ptr)
+007d19da  MOV RAX, [RDI]          ; RAX = its vtable
+007d19f5  CALL [RAX + 0x40]       ; CalcDelta = vtable slot 8  (0x40 / 8)
+```
+
+So the hook target = **vtable slot 8 of `*(global @ 0x00ac4ae0)`**. Hook it with ModSharp `IVirtualHook`
+(hook a vtable slot of the live object), resolved at boot as: sig the global-load instruction →
+`+3 r` factory (skip the 3-byte `48 8B 3D` opcode, RIP-resolve the rel32) → gives the global slot address
+`0x00ac4ae0` → read `*slot` = the object → `IVirtualHook` on its vtable index 8.
+
+Linux sig for the global load (distinctive run; rel32 wildcarded):
+`48 8B 3D ? ? ? ? 48 8B 30 48 8B 4A 20 48 8B 50 20 48 8B 07`  (`+3 r` factory).
+Windows: derive the equivalent global-load sig in engine2.dll's WriteDeltaEntity_Internal (`0x1800d1240`)
+and the same vtable-slot-8 hook applies (slot index is layout-stable cross-platform).
+
+Hook body: call original CalcDelta (it fills the output field-index list), then if
+`RecipientCapture.CurrentClient` is an issuer with a registration for this entity index (the entity index
+is in the call args), and the hooked field's serializer-index isn't already present, **append it** to the
+list (bump the count). The value-substitution hook then fakes it during the subsequent field write.
+
+Field-name → serializer-field-index: build the map once from the full-update path — the WriteFieldList
+shim already has the per-entity serializer in scope (`_currentSerializer`, records at +0x30); walk it,
+record `fieldName → index` keyed by serializer name, and look it up in the CalcDelta hook.
+
+Ship gated behind a flag (off by default) and validate on a live client before enabling — appending to the
+engine's delta list is hot-path engine surgery that must be confirmed in-game, not assumed.
