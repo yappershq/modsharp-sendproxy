@@ -165,5 +165,20 @@ loads the serializer singleton (`DAT_1806858a0`) and calls its vtable slot 8 (`+
 cross-platform unchanged; only the global-load sig differs and both are now in the gamedata
 (`CNetworkSerialization::SerializerSingleton`, linux + windows, `+3 r`).
 
-Remaining: the C# implementation (mechanical) + first-enable verification of the flattened-leaf index
-numbering (the one value derived by assumption — DFS serializer-walk order; everything else is RE-confirmed).
+Remaining: first-enable verification of the flattened-leaf index numbering (the one value derived by
+assumption — DFS serializer-walk order; everything else is RE-confirmed). The C# implementation is DONE
+(gated, off by default): `ForceResend.cs` + `ISendProxyManager.SetForceResend` + the `sp_forceresend <0|1>`
+command. Enable, confirm a spoof applies live, then it can be wired to auto-enable on per-client
+registration (drop the manual toggle).
+
+## Aside — Windows per-client field resolution is INDEX-based (not a CFieldPath)
+
+RE of the Windows WriteFieldList (engine2.dll) settled the open "Windows midhook field-path" question: the
+per-field path is resolved by **binary-searching the field key over the serializer's sorted field array**
+(`mov edx,[r12+rsi*4]; cmp edx,r14d` bisection) — the field identity on Windows is an **index**, there is
+no CFieldPath struct held in a register. So the Linux midhook model (capture a `CFieldPath*` via
+`FieldPathReg`) does NOT port to Windows; a Windows per-client substitution needs an **index→name**
+resolution captured at the per-field site — which is exactly the reverse of the flattened-leaf map this
+force-resend already builds (`ForceResend.WalkLeaves`). (The Linux midhook also can't install on Windows
+regardless, since GetBitRange is inlined — no standalone address.) This is the index-based Windows design
+item; the name↔index machinery for it now exists.

@@ -605,9 +605,14 @@ internal static unsafe class FieldSubstitution
     // original code (no trampoline call — that's the midhook contract). Captures the live CFieldPath* into
     // _currentFieldPath so ValueCopyHook (BitCopyPrimitive) can resolve which field is being copied.
     //   Linux  : hooked at GetBitRange entry → CFieldPath* is arg0 → ctx->rdi (SysV first integer arg).
-    //   Windows: hooked at the inlined-GetBitRange site inside WriteFieldList → the CFieldPath* is held in
-    //            a loop register there; selected via FieldPathReg (see SetFieldPathRegister). TODO windows:
-    //            confirm the exact register on hardware (RE points at the WriteFieldList pre-BitCopy site).
+    //   Windows: this CFieldPath-pointer model DOES NOT PORT. RE of WriteFieldList (engine2.dll) shows
+    //            Windows resolves the field by BINARY-SEARCHING the field key over the serializer's sorted
+    //            field array (`mov edx,[r12+rsi*4]; cmp edx,r14d` bisection) — the per-field identity is an
+    //            INDEX, there is no CFieldPath struct passed/held in a register. So a Windows per-client
+    //            substitution needs an INDEX→name resolution (the reverse of ForceResend's flattened-leaf
+    //            cache) captured at the per-field site, not a FieldPathReg pointer. FieldPathReg below stays
+    //            Linux-only; the Windows path is a separate index-based design (see docs/FORCE_RESEND.md
+    //            + the leaf-index walk in ForceResend.WalkLeaves which already produces the name↔index map).
     [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
     private static void GetBitRangePathHook(MidHookContext* ctx)
     {
@@ -621,10 +626,11 @@ internal static unsafe class FieldSubstitution
         _currentFieldPath = NativeUtil.IsUserPtr(pathOut) ? pathOut : 0;
     }
 
-    // Which MidHookContext register holds the CFieldPath* at the hooked site. Linux (GetBitRange entry) =
-    // rdi (arg0). Windows (WriteFieldList inlined site) = TBD on hardware — overridable via SetFieldPathRegister.
-    private static FieldPathReg _fieldPathReg =
-        OperatingSystem.IsWindows() ? FieldPathReg.R15 : FieldPathReg.Rdi;
+    // Which MidHookContext register holds the CFieldPath* at the hooked site. Linux (GetBitRange entry) = rdi
+    // (arg0). Windows does NOT use a CFieldPath pointer (it's index-based — see GetBitRangePathHook note), and
+    // the midhook can't install on Windows anyway (GetBitRange is inlined → no standalone addr to hook), so
+    // this stays Rdi; SetFieldPathRegister remains for completeness / future per-build tuning.
+    private static FieldPathReg _fieldPathReg = FieldPathReg.Rdi;
 
     internal enum FieldPathReg { Rdi, Rsi, Rdx, Rcx, R8, R9, R15, R14, R13, R12 }
 
