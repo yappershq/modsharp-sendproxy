@@ -236,8 +236,15 @@ internal static unsafe class FieldSubstitution
     }
 
     // CFieldPath* filled by GetBitRange; valid for the BitCopyPrimitive call that follows on this thread.
+    // Linux only: on Windows GetBitRange is inlined so _currentFieldPath stays 0; the Windows path uses
+    // _currentFieldIndex instead.
     [ThreadStatic]
     private static nint _currentFieldPath;
+
+    // Windows only: the flattened-leaf field index captured by WindowsFieldIndexHook at the WriteFieldList
+    // per-field site. -1 means "not captured" (reset after each WflShim call and on Linux always).
+    [ThreadStatic]
+    private static int _currentFieldIndex;
 
     // CFlattenedSerializer* captured by the WriteFieldList shim (rdi).
     [ThreadStatic]
@@ -267,6 +274,9 @@ internal static unsafe class FieldSubstitution
     private static ILogger? _logger;
 
     public static nint GetBitRangeAddr;
+    // Windows: address of the WriteFieldList per-field site (gamedata "CFlattenedSerializer::WriteFieldList_FieldPathSite").
+    // On Linux this is zero and is never used; on Windows it replaces GetBitRangeAddr as the midhook target.
+    public static nint WindowsFieldPathSiteAddr;
     public static nint ValueCopyAddr;
     public static nint WriteFieldListAddr;
     public static nint WdeAddr;
@@ -282,6 +292,11 @@ internal static unsafe class FieldSubstitution
     // fn pointer -> FieldType, built once at Install from the gamedata-resolved bucket handler bases.
     private static Dictionary<nint, FieldType>? _encoderTypes;
     private static readonly object _encoderTypesLock = new();
+
+    // Windows index→name cache: serializerName -> string[] indexed by flattened-leaf DFS order.
+    // Built lazily from WflShim the first time each serializer is seen (Windows only; never populated
+    // on Linux — _currentFieldIndex stays -1 and the Windows branch in ValueCopyHook is unreachable).
+    private static readonly ConcurrentDictionary<string, string[]> _windowsIndexName = new();
 
     /// <summary>
     ///     Provide the gamedata-resolved encoder identities used for classification: the registry table
@@ -355,20 +370,36 @@ internal static unsafe class FieldSubstitution
 
         if (_getBitRangeMidHook is null)
         {
-            var gbrHook   = bridge.HookManager.CreateMidFuncHook();
-            var gbrHookFn = (nint) (delegate* unmanaged[Cdecl]<MidHookContext*, void>) &GetBitRangePathHook;
-            gbrHook.Prepare(GetBitRangeAddr, gbrHookFn);
+            var gbrHook = bridge.HookManager.CreateMidFuncHook();
+
+            if (OperatingSystem.IsWindows())
+            {
+                var gbrHookFn = (nint) (delegate* unmanaged[Cdecl]<MidHookContext*, void>) &WindowsFieldIndexHook;
+                gbrHook.Prepare(WindowsFieldPathSiteAddr, gbrHookFn);
+            }
+            else
+            {
+                var gbrHookFn = (nint) (delegate* unmanaged[Cdecl]<MidHookContext*, void>) &GetBitRangePathHook;
+                gbrHook.Prepare(GetBitRangeAddr, gbrHookFn);
+            }
 
             if (!gbrHook.Install())
             {
-                logger.LogWarning("FieldSubstitution: GetBitRange mid-hook Install() failed");
+                logger.LogWarning("FieldSubstitution: field-path mid-hook Install() failed");
                 DisposeHook(ref _wflShimHook, ref _wflShimTrampoline);
 
                 return false;
             }
 
             _getBitRangeMidHook = gbrHook;
-            logger.LogInformation("FieldSubstitution: GetBitRange mid-hook installed @ 0x{Addr:X}", GetBitRangeAddr);
+            if (OperatingSystem.IsWindows())
+            {
+                logger.LogInformation("FieldSubstitution: WriteFieldList field-index mid-hook installed @ 0x{Addr:X}", WindowsFieldPathSiteAddr);
+            }
+            else
+            {
+                logger.LogInformation("FieldSubstitution: GetBitRange mid-hook installed @ 0x{Addr:X}", GetBitRangeAddr);
+            }
         }
 
         if (_valueCopyHook is null)
@@ -473,13 +504,23 @@ internal static unsafe class FieldSubstitution
                 nint>) _wflShimTrampoline)(a, b, c, d, e, p6, p7, p8, p9);
         }
 
-        _currentSerializer = a;
+        _currentSerializer  = a;
+        _currentFieldIndex  = -1;
+
+        var serName = NativeUtil.ReadShortAscii(*(nint*) (a + 0x00), 48);
 
         // Force-resend (off by default): cache this serializer's flattened field-index map the first time
         // it's seen, so the WriteFields hook can resolve a hooked field name -> index. No-op when disabled.
         if (ForceResend.Enabled)
         {
-            ForceResend.NoteSerializer(NativeUtil.ReadShortAscii(*(nint*) (a + 0x00), 48), a);
+            ForceResend.NoteSerializer(serName, a);
+        }
+
+        // Windows: build the index→name array the first time this serializer is seen so ValueCopyHook can
+        // resolve a field index captured by WindowsFieldIndexHook into a field name.
+        if (OperatingSystem.IsWindows())
+        {
+            NoteSerializerWindows(serName, a);
         }
 
         var result = ((delegate* unmanaged[Cdecl]<
@@ -487,6 +528,7 @@ internal static unsafe class FieldSubstitution
             uint, nint, uint,
             nint>) _wflShimTrampoline)(a, b, c, d, e, p6, p7, p8, p9);
         _currentSerializer = 0;
+        _currentFieldIndex = -1;
 
         return result;
     }
@@ -552,6 +594,86 @@ internal static unsafe class FieldSubstitution
         _currentFieldPath = NativeUtil.IsUserPtr(pathOut) ? pathOut : 0;
     }
 
+    // Windows: mid-function hook at WriteFieldList's per-field site. R12 = current field INDEX (1:1 with
+    // the BitCopy for that field). ValueCopyHook resolves this index to a name via _windowsIndexName.
+    // On Linux this callback is never installed; GetBitRangePathHook is used instead.
+    [UnmanagedCallersOnly(CallConvs = new[] { typeof(CallConvCdecl) })]
+    private static void WindowsFieldIndexHook(MidHookContext* ctx)
+    {
+        if (_registry.IsEmpty)
+        {
+            return;
+        }
+
+        _currentFieldIndex = (int) ctx->r12;
+    }
+
+    // Build and cache the index→name array for a serializer the first time it is seen (Windows only).
+    // Mirrors ForceResend.WalkLeaves but produces a string[] indexed by sequential DFS leaf order.
+    // Every deref is IsUserPtr-guarded; wrapped in try/catch so a bad walk never escapes.
+    private static void NoteSerializerWindows(string serName, nint serializer)
+    {
+        if (serName.Length == 0 || _windowsIndexName.ContainsKey(serName) || !NativeUtil.IsUserPtr(serializer))
+        {
+            return;
+        }
+
+        var list = new List<string>();
+        try
+        {
+            WalkLeavesIndexed(serializer, list, 0);
+        }
+        catch
+        {
+            return; // never let a bad walk poison the cache
+        }
+
+        _windowsIndexName.TryAdd(serName, list.ToArray());
+    }
+
+    // DFS walk producing an ordered leaf-name list (index = sequential position). Mirrors the structure of
+    // ForceResend.WalkLeaves: base @serializer+0x30, stride 0x2E; child serializer @rec+0x08; leaf
+    // fieldInfo @rec+0x00; name @*(fieldInfo+0x08). Guard: depth≤4, count≤4096.
+    private static void WalkLeavesIndexed(nint serializer, List<string> names, int depth)
+    {
+        if (depth > 4 || !NativeUtil.IsUserPtr(serializer))
+        {
+            return;
+        }
+
+        var count = *(int*) (serializer + 0x28);
+        if (count <= 0 || count > 4096)
+        {
+            return;
+        }
+
+        var arr = *(nint*) (serializer + 0x30);
+        if (!NativeUtil.IsUserPtr(arr))
+        {
+            return;
+        }
+
+        for (var i = 0; i < count; i++)
+        {
+            var rec   = arr + (nint) i * 0x2E;
+            var child = *(nint*) (rec + 0x08);
+            if (NativeUtil.IsUserPtr(child))
+            {
+                WalkLeavesIndexed(child, names, depth + 1);
+                continue;
+            }
+
+            var fieldInfo = *(nint*) (rec + 0x00);
+            if (!NativeUtil.IsUserPtr(fieldInfo))
+            {
+                names.Add(string.Empty); // placeholder to keep index alignment
+                continue;
+            }
+
+            names.Add(NativeUtil.ReadShortAscii(*(nint*) (fieldInfo + 0x08), 48));
+        }
+    }
+
     // Which MidHookContext register the field-path midhook reads at the hooked site.
     //   Linux  : GetBitRange entry → rdi (arg0) = CFieldPath* (a pointer; ResolveFieldName walks it).
     //   Windows: GetBitRange is inlined, so the midhook hooks the WriteFieldList per-field site instead
@@ -609,19 +731,49 @@ internal static unsafe class FieldSubstitution
         }
 
         var pathPtr = _currentFieldPath;
-        if (!NativeUtil.IsUserPtr(pathPtr))
+
+        // On Linux pathPtr is set by GetBitRangePathHook; on Windows GetBitRange is inlined so pathPtr
+        // stays 0 — use the index captured by WindowsFieldIndexHook and the pre-built index→name map.
+        if (!NativeUtil.IsUserPtr(pathPtr) && !(OperatingSystem.IsWindows() && _currentFieldIndex >= 0))
         {
             return CallOriginal(dst, src, bitcount);
         }
 
         try
         {
-            var serPtr    = _currentSerializer;
-            var serName   = NativeUtil.ReadShortAscii(*(nint*) (serPtr + 0x00), 48);
-            var fieldName = ResolveFieldName(serPtr, pathPtr, out var leafRec);
-            if (fieldName.Length == 0)
+            var serPtr  = _currentSerializer;
+            var serName = NativeUtil.ReadShortAscii(*(nint*) (serPtr + 0x00), 48);
+
+            string fieldName;
+            nint   leafRec;
+
+            if (OperatingSystem.IsWindows() && !NativeUtil.IsUserPtr(pathPtr))
             {
-                return CallOriginal(dst, src, bitcount);
+                // Windows index-based path: resolve field name from the pre-built index→name array.
+                leafRec = 0;
+                if (serName.Length == 0
+                    || !_windowsIndexName.TryGetValue(serName, out var indexNames)
+                    || _currentFieldIndex >= indexNames.Length
+                    || (fieldName = indexNames[_currentFieldIndex]).Length == 0)
+                {
+                    return CallOriginal(dst, src, bitcount);
+                }
+
+                // Resolve leafRec for Classify/TryGetLiveValuePtr by walking to the leaf at this index.
+                leafRec = ResolveLeafRecByIndex(serPtr, _currentFieldIndex);
+                if (leafRec == 0)
+                {
+                    return CallOriginal(dst, src, bitcount);
+                }
+            }
+            else
+            {
+                // Linux CFieldPath* path.
+                fieldName = ResolveFieldName(serPtr, pathPtr, out leafRec);
+                if (fieldName.Length == 0)
+                {
+                    return CallOriginal(dst, src, bitcount);
+                }
             }
 
             var client      = RecipientCapture.CurrentClient;
@@ -1023,6 +1175,61 @@ internal static unsafe class FieldSubstitution
         return NativeUtil.ReadShortAscii(*(nint*) (pInfo + 0x08), 48);
     }
 
+    // Windows: resolve the leafRec (record pointer) for a given flattened-leaf DFS index so Classify and
+    // TryGetLiveValuePtr can inspect the field's encoder and snapshot region. Mirrors WalkLeavesIndexed but
+    // stops once it reaches the target index. IsUserPtr-guarded; returns 0 on any guard failure.
+    private static nint ResolveLeafRecByIndex(nint serializer, int targetIndex)
+    {
+        var current = 0;
+
+        return WalkToLeafRec(serializer, ref current, targetIndex, 0);
+    }
+
+    private static nint WalkToLeafRec(nint serializer, ref int current, int target, int depth)
+    {
+        if (depth > 4 || !NativeUtil.IsUserPtr(serializer))
+        {
+            return 0;
+        }
+
+        var count = *(int*) (serializer + 0x28);
+        if (count <= 0 || count > 4096)
+        {
+            return 0;
+        }
+
+        var arr = *(nint*) (serializer + 0x30);
+        if (!NativeUtil.IsUserPtr(arr))
+        {
+            return 0;
+        }
+
+        for (var i = 0; i < count; i++)
+        {
+            var rec   = arr + (nint) i * 0x2E;
+            var child = *(nint*) (rec + 0x08);
+            if (NativeUtil.IsUserPtr(child))
+            {
+                var found = WalkToLeafRec(child, ref current, target, depth + 1);
+                if (found != 0)
+                {
+                    return found;
+                }
+
+                continue;
+            }
+
+            if (current == target)
+            {
+                return rec;
+            }
+
+            current++;
+        }
+
+        return 0;
+    }
+
     // Largest plausible field-array index — backstop when the array length reads implausibly. A serializer
     // never has anywhere near this many fields, and arr + 4096*0x2E (~0x2C000) stays within the array's
     // mapped region, so a bounded-but-wrong index reads garbage (→ no match → passthrough) instead of
@@ -1245,10 +1452,24 @@ internal static unsafe class FieldSubstitution
     private static bool ValidateAddresses(ILogger logger)
     {
         var ok = true;
-        if (GetBitRangeAddr == 0)
+
+        // On Linux the field-path is captured via GetBitRange; on Windows GetBitRange is inlined and
+        // the per-field site address is used instead. Require the correct one for the current platform.
+        if (OperatingSystem.IsWindows())
         {
-            logger.LogWarning("FieldSubstitution: GetBitRange address not resolved");
-            ok = false;
+            if (WindowsFieldPathSiteAddr == 0)
+            {
+                logger.LogWarning("FieldSubstitution: WriteFieldList_FieldPathSite address not resolved (Windows)");
+                ok = false;
+            }
+        }
+        else
+        {
+            if (GetBitRangeAddr == 0)
+            {
+                logger.LogWarning("FieldSubstitution: GetBitRange address not resolved");
+                ok = false;
+            }
         }
 
         if (ValueCopyAddr == 0)

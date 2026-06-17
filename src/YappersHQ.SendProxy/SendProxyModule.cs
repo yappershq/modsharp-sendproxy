@@ -30,14 +30,15 @@ namespace YappersHQ.SendProxy;
 
 public sealed class SendProxyModule : IModSharpModule, IEntityListener
 {
-    private const string WriteDeltaInternalKey = "CNetworkGameServerBase::WriteDeltaEntity_Internal";
-    private const string PerClientEncodeKey    = "CNetworkGameServer::PerClientEncode";
-    private const string WriteFieldListKey     = "CFlattenedSerializer::WriteFieldList";
-    private const string GetBitRangeKey        = "CFlattenedSerializer::GetBitRange";
-    private const string BitCopyKey            = "CFlattenedSerializer::BitCopyPrimitive";
-    private const string EncoderRegistryKey    = "CFlattenedSerializer::EncoderRegistry";
-    private const string EncodeInt32Key        = "CFlattenedSerializer::EncodeInt32";
-    private const string SerializerSingletonKey = "CNetworkSerialization::SerializerSingleton";
+    private const string WriteDeltaInternalKey          = "CNetworkGameServerBase::WriteDeltaEntity_Internal";
+    private const string PerClientEncodeKey             = "CNetworkGameServer::PerClientEncode";
+    private const string WriteFieldListKey              = "CFlattenedSerializer::WriteFieldList";
+    private const string GetBitRangeKey                 = "CFlattenedSerializer::GetBitRange";
+    private const string WriteFieldListFieldPathSiteKey = "CFlattenedSerializer::WriteFieldList_FieldPathSite";
+    private const string BitCopyKey                     = "CFlattenedSerializer::BitCopyPrimitive";
+    private const string EncoderRegistryKey             = "CFlattenedSerializer::EncoderRegistry";
+    private const string EncodeInt32Key                 = "CFlattenedSerializer::EncodeInt32";
+    private const string SerializerSingletonKey         = "CNetworkSerialization::SerializerSingleton";
 
     private static readonly string[] EncoderBucketKeys =
     {
@@ -58,6 +59,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private nint _perClientEncodeAddr;
     private nint _writeFieldListAddr;
     private nint _getBitRangeAddr;
+    private nint _writeFieldListFieldPathSiteAddr;
     private nint _bitCopyAddr;
     private nint _registryAddr;
     private nint _encodeInt32Addr;
@@ -153,13 +155,18 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
     private void ResolveNativeTargets()
     {
-        _wdeAddr             = ResolveFromGameData(WriteDeltaInternalKey);
-        _perClientEncodeAddr = ResolveFromGameData(PerClientEncodeKey);
-        _writeFieldListAddr  = ResolveFromGameData(WriteFieldListKey);
-        _getBitRangeAddr     = ResolveFromGameData(GetBitRangeKey);
-        _bitCopyAddr         = ResolveFromGameData(BitCopyKey);
-        _registryAddr        = ResolveFromGameData(EncoderRegistryKey);
-        _encodeInt32Addr     = ResolveFromGameData(EncodeInt32Key);
+        _wdeAddr                         = ResolveFromGameData(WriteDeltaInternalKey);
+        _perClientEncodeAddr             = ResolveFromGameData(PerClientEncodeKey);
+        _writeFieldListAddr              = ResolveFromGameData(WriteFieldListKey);
+        _getBitRangeAddr                 = ResolveFromGameData(GetBitRangeKey);
+        // Windows-only field-path capture site (GetBitRange is inlined on Windows). The gamedata entry has
+        // no linux sig, so only resolve it on Windows — avoids a spurious "not resolved" warning on Linux.
+        _writeFieldListFieldPathSiteAddr = OperatingSystem.IsWindows()
+            ? ResolveFromGameData(WriteFieldListFieldPathSiteKey)
+            : 0;
+        _bitCopyAddr                     = ResolveFromGameData(BitCopyKey);
+        _registryAddr                    = ResolveFromGameData(EncoderRegistryKey);
+        _encodeInt32Addr                 = ResolveFromGameData(EncodeInt32Key);
 
         var bucketAddrs = new nint[EncoderBucketKeys.Length];
         for (var i = 0; i < EncoderBucketKeys.Length; i++)
@@ -199,21 +206,39 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
     private bool EnsureSubDetours()
     {
-        if (_getBitRangeAddr == 0 || _bitCopyAddr == 0 || _writeFieldListAddr == 0)
+        // The field-path capture address differs by platform: Linux uses GetBitRange, Windows uses the
+        // inlined per-field site. Check the correct one is resolved rather than always requiring both.
+        var fieldPathOk = OperatingSystem.IsWindows()
+            ? _writeFieldListFieldPathSiteAddr != 0
+            : _getBitRangeAddr != 0;
+
+        if (!fieldPathOk || _bitCopyAddr == 0 || _writeFieldListAddr == 0)
         {
-            _logger.LogWarning(
-                "SendProxy: one or more substitution addresses not resolved "
-                + "(GetBitRange=0x{Gbr:X} BitCopy=0x{Bc:X} WriteFieldList=0x{Wfl:X}) — "
-                + "check gamedata sigs match this build",
-                _getBitRangeAddr, _bitCopyAddr, _writeFieldListAddr);
+            if (OperatingSystem.IsWindows())
+            {
+                _logger.LogWarning(
+                    "SendProxy: one or more substitution addresses not resolved "
+                    + "(WriteFieldList_FieldPathSite=0x{Site:X} BitCopy=0x{Bc:X} WriteFieldList=0x{Wfl:X}) — "
+                    + "check gamedata sigs match this build",
+                    _writeFieldListFieldPathSiteAddr, _bitCopyAddr, _writeFieldListAddr);
+            }
+            else
+            {
+                _logger.LogWarning(
+                    "SendProxy: one or more substitution addresses not resolved "
+                    + "(GetBitRange=0x{Gbr:X} BitCopy=0x{Bc:X} WriteFieldList=0x{Wfl:X}) — "
+                    + "check gamedata sigs match this build",
+                    _getBitRangeAddr, _bitCopyAddr, _writeFieldListAddr);
+            }
 
             return false;
         }
 
-        FieldSubstitution.GetBitRangeAddr    = _getBitRangeAddr;
-        FieldSubstitution.ValueCopyAddr      = _bitCopyAddr;
-        FieldSubstitution.WriteFieldListAddr = _writeFieldListAddr;
-        FieldSubstitution.WdeAddr            = _wdeAddr;
+        FieldSubstitution.GetBitRangeAddr            = _getBitRangeAddr;
+        FieldSubstitution.WindowsFieldPathSiteAddr   = _writeFieldListFieldPathSiteAddr;
+        FieldSubstitution.ValueCopyAddr              = _bitCopyAddr;
+        FieldSubstitution.WriteFieldListAddr         = _writeFieldListAddr;
+        FieldSubstitution.WdeAddr                    = _wdeAddr;
 
         if (_perClientEncodeAddr != 0)
         {
