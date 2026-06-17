@@ -154,6 +154,11 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientIntProxy callback)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
+        if (entity is not { IsValidEntity: true })
+        {
+            return;
+        }
+
         var idx = (int) entity.Index;
         if (!EnsureDetours($"Hook(ent={idx}, \"{serializerName}::{fieldName}\", int)")) return;
         FieldSubstitution.SetEntityCallback(idx, serializerName, fieldName, callback);
@@ -164,6 +169,11 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientFloatProxy callback)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
+        if (entity is not { IsValidEntity: true })
+        {
+            return;
+        }
+
         var idx = (int) entity.Index;
         if (!EnsureDetours($"Hook(ent={idx}, \"{serializerName}::{fieldName}\", float)")) return;
         FieldSubstitution.SetEntityCallback(idx, serializerName, fieldName, callback);
@@ -174,6 +184,11 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientBoolProxy callback)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
+        if (entity is not { IsValidEntity: true })
+        {
+            return;
+        }
+
         var idx = (int) entity.Index;
         if (!EnsureDetours($"Hook(ent={idx}, \"{serializerName}::{fieldName}\", bool)")) return;
         FieldSubstitution.SetEntityCallback(idx, serializerName, fieldName, callback);
@@ -184,6 +199,11 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientVectorProxy callback)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
+        if (entity is not { IsValidEntity: true })
+        {
+            return;
+        }
+
         var idx = (int) entity.Index;
         if (!EnsureDetours($"Hook(ent={idx}, \"{serializerName}::{fieldName}\", vector)")) return;
         FieldSubstitution.SetEntityCallback(idx, serializerName, fieldName, callback);
@@ -194,6 +214,11 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientStringProxy callback)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
+        if (entity is not { IsValidEntity: true })
+        {
+            return;
+        }
+
         var idx = (int) entity.Index;
         if (!EnsureDetours($"Hook(ent={idx}, \"{serializerName}::{fieldName}\", string)")) return;
         FieldSubstitution.SetEntityCallback(idx, serializerName, fieldName, callback);
@@ -204,6 +229,11 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void Hook(IBaseEntity entity, string serializerName, string fieldName, PerClientBytesProxy callback)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName) || callback is null) return;
+        if (entity is not { IsValidEntity: true })
+        {
+            return;
+        }
+
         var idx = (int) entity.Index;
         if (!EnsureDetours($"Hook(ent={idx}, \"{serializerName}::{fieldName}\", bytes)")) return;
         FieldSubstitution.SetEntityCallback(idx, serializerName, fieldName, callback);
@@ -265,6 +295,11 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void SetUniform(IBaseEntity entity, string serializerName, string fieldName, int value)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
+        if (entity is not { IsValidEntity: true })
+        {
+            return;
+        }
+
         var idx = (int) entity.Index;
         if (!EnsureDetours($"SetUniform(ent={idx}, \"{serializerName}::{fieldName}\", int)")) return;
         FieldSubstitution.SetEntitySpoof(idx, serializerName, fieldName, value);
@@ -275,6 +310,11 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void SetUniform(IBaseEntity entity, string serializerName, string fieldName, float value)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
+        if (entity is not { IsValidEntity: true })
+        {
+            return;
+        }
+
         var idx = (int) entity.Index;
         if (!EnsureDetours($"SetUniform(ent={idx}, \"{serializerName}::{fieldName}\", float)")) return;
         FieldSubstitution.SetEntitySpoof(idx, serializerName, fieldName, BitConverter.SingleToInt32Bits(value));
@@ -285,6 +325,11 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void SetUniform(IBaseEntity entity, string serializerName, string fieldName, bool value)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
+        if (entity is not { IsValidEntity: true })
+        {
+            return;
+        }
+
         var idx = (int) entity.Index;
         if (!EnsureDetours($"SetUniform(ent={idx}, \"{serializerName}::{fieldName}\", bool)")) return;
         FieldSubstitution.SetEntitySpoof(idx, serializerName, fieldName, value ? 1 : 0);
@@ -295,6 +340,11 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void SetUniform(IBaseEntity entity, string serializerName, string fieldName, Vector3 value)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
+        if (entity is not { IsValidEntity: true })
+        {
+            return;
+        }
+
         var idx = (int) entity.Index;
         if (!EnsureDetours($"SetUniform(ent={idx}, \"{serializerName}::{fieldName}\", vector)")) return;
         FieldSubstitution.SetEntitySpoof(idx, serializerName, fieldName, value);
@@ -305,6 +355,11 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void SetUniform(IBaseEntity entity, string serializerName, string fieldName, string value)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
+        if (entity is not { IsValidEntity: true })
+        {
+            return;
+        }
+
         var idx = (int) entity.Index;
         if (!EnsureDetours($"SetUniform(ent={idx}, \"{serializerName}::{fieldName}\", string)")) return;
         FieldSubstitution.SetEntitySpoof(idx, serializerName, fieldName, value);
@@ -315,6 +370,11 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void SetUniform(IBaseEntity entity, string serializerName, string fieldName, byte[] value)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
+        if (entity is not { IsValidEntity: true })
+        {
+            return;
+        }
+
         var idx = (int) entity.Index;
         if (!EnsureDetours($"SetUniform(ent={idx}, \"{serializerName}::{fieldName}\", bytes)")) return;
         FieldSubstitution.SetEntitySpoof(idx, serializerName, fieldName, value);
@@ -332,7 +392,8 @@ internal sealed class SendProxyManager : ISendProxyManager
     {
         idx       = -1;
         clientPtr = 0;
-        if (client is null || entity is null || string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName))
+        if (client is null || entity is not { IsValidEntity: true }
+            || string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName))
         {
             return false;
         }
@@ -415,6 +476,11 @@ internal sealed class SendProxyManager : ISendProxyManager
     public void Unhook(IBaseEntity entity, string serializerName, string fieldName)
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
+        if (entity is not { IsValidEntity: true })
+        {
+            return;
+        }
+
         var idx = (int) entity.Index;
         FieldSubstitution.ClearEntity(idx, serializerName, fieldName);
         _logger.LogInformation("SendProxy: entity registration removed for ent={Ent} \"{Ser}::{Field}\"", idx, serializerName, fieldName);

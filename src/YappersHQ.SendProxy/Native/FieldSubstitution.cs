@@ -256,6 +256,7 @@ internal static unsafe class FieldSubstitution
     public static void SetOneShot(int ent, string ser, string field, nint client, Vector3 value) => _registry[(ser, field, ent)] = new SpoofEntry(value, client);
     public static void SetOneShot(int ent, string ser, string field, nint client, string value)  => _registry[(ser, field, ent)] = new SpoofEntry(value, client);
     public static void SetOneShot(int ent, string ser, string field, nint client, byte[] value)  => _registry[(ser, field, ent)] = new SpoofEntry(value, client);
+    public static void SetOneShot(int ent, string ser, string field, nint client, bool value)    => SetOneShot(ent, ser, field, client, value ? 1 : 0);
 
     public static void ClearGlobal(string ser, string field)            => _registry.TryRemove((ser, field, -1), out _);
     public static void ClearEntity(int ent, string ser, string field)   => _registry.TryRemove((ser, field, ent), out _);
