@@ -157,5 +157,13 @@ TO-snapshot change-list stores), so field-name→index = count leaves during the
 
 All RE'd with high confidence: hook = vtable **slot 14 (`+0x70`)** of `*(0x00ac4ae0)` (path-agnostic
 consumer); inject = sorted-insert into arg3's `CUtlVector<int>`; issuer+entity from existing captures;
-field-name→flattened-leaf-index from the serializer walk. Build is mechanical. Remaining: confirm the
-`+0x70` arg layout on Windows (same slot index) + the Windows global-load sig.
+field-name→flattened-leaf-index from the serializer walk. Build is mechanical.
+
+**Windows parity CONFIRMED** (engine2.dll WriteDeltaEntity_Internal `0x1800d1240`): identical structure —
+loads the serializer singleton (`DAT_1806858a0`) and calls its vtable slot 8 (`+0x40` CalcDelta) + slot 14
+(`+0x70` WriteFields), same two-path build. So the hook (slot 14 of `*(*global)`) + sorted-insert is
+cross-platform unchanged; only the global-load sig differs and both are now in the gamedata
+(`CNetworkSerialization::SerializerSingleton`, linux + windows, `+3 r`).
+
+Remaining: the C# implementation (mechanical) + first-enable verification of the flattened-leaf index
+numbering (the one value derived by assumption — DFS serializer-walk order; everything else is RE-confirmed).

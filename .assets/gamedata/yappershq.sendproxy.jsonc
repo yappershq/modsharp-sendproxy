@@ -89,10 +89,14 @@
     // force-resend (Option D): read *global -> object -> vtable, IVirtualHook slot 8, then append a hooked
     // field's index to the delta output list so a per-client spoof applies live. See docs/FORCE_RESEND.md.
     // The "+3 r" factory skips the 3-byte `48 8B 3D` opcode and RIP-resolves the rel32 to the global's address.
+    // CONFIRMED identical on both platforms: WriteDeltaEntity_Internal loads this singleton then calls its
+    // vtable slot 8 (+0x40 = CalcDelta) and slot 14 (+0x70 = WriteFields/encode). Force-resend (Option D)
+    // hooks slot 14 of *(*global) and sorted-inserts a hooked field's index into the field-index list arg.
     "CNetworkSerialization::SerializerSingleton": {
       "library": "engine",
-      "linux": { "signature": "48 8B 3D ? ? ? ? 48 8B 30 48 8B 4A 20 48 8B 50 20 48 8B 07", "factory": "+3 r" }
-      // TODO windows: derive the equivalent global-load sig in engine2.dll WriteDeltaEntity_Internal (0x1800d1240).
+      "linux":   { "signature": "48 8B 3D ? ? ? ? 48 8B 30 48 8B 4A 20 48 8B 50 20 48 8B 07", "factory": "+3 r" },
+      // windows: MOV RCX,[rip->0x1806858a0] in WriteDeltaEntity_Internal (0x1800d1240); same +3 r factory.
+      "windows": { "signature": "48 8B 0D ? ? ? ? 4C 8B 8F 98 00 00 00 48 89 44 24 ? 33 C0 49 8B 10 4C 8B 11", "factory": "+3 r" }
     },
     "CFlattenedSerializer::WriteFieldList": {
       "library": "networksystem",
