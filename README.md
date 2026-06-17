@@ -1,18 +1,22 @@
 # SendProxy for ModSharp (CS2)
 
-SourceMod-`SendProxyManager`-style **per-field network value substitution** for
-**ModSharp / Counter-Strike 2 (Source 2)**. Intercept what clients *receive* for a networked
-entity field and substitute the value — **without changing the real server-side state**.
+**Per-field network value substitution** for **ModSharp / Counter-Strike 2 (Source 2)**. Intercept
+what clients *receive* for a networked entity field and substitute the value — **without changing the
+real server-side state**. (SourceMod's `SendProxyManager` was a conceptual reference only; the API is
+ModSharp-native — see the unified `SpoofValue` API below.)
 
 A consumer plugin asks the `ISendProxyManager` interface to spoof a field; the library installs the
 necessary native detours into CS2's serializer/send path and rewrites the per-client bit-stream as
 each snapshot is encoded. Three targeting modes:
 
 - **Uniform** — every client sees the same fake value for the field (`SetUniform`).
-- **Per-client** — a callback returns a (potentially different) value *per recipient* (`Hook` with a
-  typed `PerClient*Proxy` delegate).
+- **Per-client** — one `SendProxyCallback` returns a (potentially different) value *per recipient*
+  (`Hook`), reading/writing a tagged `SpoofValue`.
 - **Per-entity** — scope a spoof or callback to a single `IBaseEntity` (`SetUniform(entity, ...)` /
   `Hook(entity, ...)`).
+
+Values flow through one `SpoofValue` type (factories `SpoofValue.Int/Float/Bool/Vector/String/Bytes`;
+typed `v.AsInt`/`v.AsFloat`/… accessors in callbacks) — a single API surface for every field type.
 
 > **Why this is hard on CS2:** Source 1's SendProxy swapped each `SendProp`'s `m_pProxyFn`, a
 > per-field function the engine called *while serializing each client's snapshot* — so per-client
@@ -86,21 +90,24 @@ All registration is through two overload families:
 - `UnhookAll()` — remove every registration and uninstall the substitution detours.
 - `IsHooked(serializerName, fieldName)` — returns true if any registration exists for that field.
 
-Each `Hook` and `SetUniform` overload is typed: `PerClientIntProxy` / `PerClientFloatProxy` /
-`PerClientBoolProxy` / `PerClientVectorProxy` / `PerClientStringProxy` / `PerClientBytesProxy`
-for the callback family; `int` / `float` / `bool` / `Vector3` / `string` / `byte[]` for the uniform family.
+There's a single callback delegate — `SendProxyCallback(nint client, int entityIndex, ref SpoofValue value)`
+— and a single value type, `SpoofValue`, used by both `Hook` (callback) and `SetUniform`/`SendFake`
+(fixed value). Build a value with `SpoofValue.Int(…)` / `.Float(…)` / `.Bool(…)` / `.Vector(…)` /
+`.String(…)` / `.Bytes(…)`; inside a callback, read/write `value.AsInt` / `.AsFloat` / `.AsBool` /
+`.AsVector` / `.AsString` / `.AsBytes`.
 
-Per-entity registrations win over all-entities registrations for that entity when both exist.
-Detours install lazily on first registration.
+`SendFake(client, entity, serializerName, fieldName, in SpoofValue)` pushes a one-shot fake to a single
+client. Per-entity registrations win over all-entities registrations for that entity when both exist.
+Detours install lazily on first registration. `SetForceResend(bool)` toggles live application (see below).
 
 ### Uniform spoof (all clients, all entities)
 
 ```csharp
 // Everyone sees 1337 HP on every player pawn; real m_iHealth still drives damage/death.
-_sendProxy.SetUniform("CCSPlayerPawn", "m_iHealth", 1337);
+_sendProxy.SetUniform("CCSPlayerPawn", "m_iHealth", SpoofValue.Int(1337));
 
 // Force a string field to a fixed value for all clients.
-_sendProxy.SetUniform("CCSGameRulesProxy", "m_szMatchStatTxt", "custom text");
+_sendProxy.SetUniform("CCSGameRulesProxy", "m_szMatchStatTxt", SpoofValue.String("custom text"));
 ```
 
 ### Per-client callback
@@ -111,17 +118,17 @@ wrote via `ref`, `false` to leave the original.
 ```csharp
 // Per-client int — each recipient sees a value derived from their client pointer.
 _sendProxy.Hook("CCSPlayerPawn", "m_iHealth",
-    (nint client, int entityIndex, ref int value) =>
+    (nint client, int entityIndex, ref SpoofValue value) =>
     {
-        value = SomeLookup(client);
+        value.AsInt = SomeLookup(client);
         return true;
     });
 
 // Per-client string field.
 _sendProxy.Hook("SomeSerializer", "m_szSomeField",
-    (nint client, int entityIndex, ref string value) =>
+    (nint client, int entityIndex, ref SpoofValue value) =>
     {
-        value = GetStringForClient(client);
+        value.AsString = GetStringForClient(client);
         return true;
     });
 ```
@@ -135,19 +142,19 @@ _sendProxy.Hook("SomeSerializer", "m_szSomeField",
   do not dereference from managed code.
 - **`entityIndex`** is the entity currently being sent (`-1` if not captured).
 - **Return `false`** to leave the original value for that client; **`true`** to substitute the value
-  you wrote by `ref`. The `ref` parameter is seeded with the registered uniform value, or the type
-  zero/empty if none is registered.
+  you wrote into the `ref SpoofValue` (via `value.AsInt`/`.AsFloat`/…). The `SpoofValue` is seeded
+  with the registered uniform value, or the type zero/empty if none is registered.
 - A throwing callback is caught and treated as passthrough for that field/client.
 
 ### Per-entity targeting
 
 ```csharp
 // All clients see 1 HP for one specific entity; other pawns unaffected.
-_sendProxy.SetUniform(someEntity, "CCSPlayerPawn", "m_iHealth", 1);
+_sendProxy.SetUniform(someEntity, "CCSPlayerPawn", "m_iHealth", SpoofValue.Int(1));
 
 // Per-client callback scoped to one entity.
 _sendProxy.Hook(someEntity, "CCSPlayerPawn", "m_iHealth",
-    (nint client, int entityIndex, ref int value) => { value = 1; return true; });
+    (nint client, int entityIndex, ref SpoofValue value) => { value.AsInt = 1; return true; });
 ```
 
 `someEntity` is an `IBaseEntity` reference resolved at registration time. Do not store `IBaseEntity`
@@ -250,8 +257,21 @@ SourceMod's SendProxyManager purges hooks on plugin unload / entity removal):
   (reached through a sub-serializer descent) may not resolve yet — see the RE doc.
 - **All signatures are build-specific.** They're located at runtime by pattern (`FindPattern`), so a
   relink that only shifts addresses is fine; a code change to a hooked engine function is not.
-  Re-derive on engine updates with the tooling in `tools/` and the offsets/sig notes in
-  **[`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md)**.
+  Re-derive on engine updates with **[`docs/FINDING_SIGNATURES.md`](docs/FINDING_SIGNATURES.md)** and the
+  offsets/sig notes in **[`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md)**.
+- **Cross-platform:** Linux is the validated platform. Windows signatures are in the gamedata (each
+  verified by side-by-side decompile vs its Linux twin) but the Windows substitution path awaits live
+  validation on a Windows server — see `docs/FORCE_RESEND.md` / `docs/FINDING_SIGNATURES.md`.
+- **Live application:** a freshly-registered spoof on an unchanged field applies on the next full update
+  by default; `SetForceResend(true)` makes it apply live (gated off — see `docs/FORCE_RESEND.md`).
+
+## Documentation
+
+- **[`docs/HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md)** — plain-English overview (start here).
+- **[`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md)** — the full RE / C++-port spec.
+- **[`docs/FINDING_SIGNATURES.md`](docs/FINDING_SIGNATURES.md)** — human Ghidra/IDA guide to (re-)deriving every signature, with the Windows-specific gotchas.
+- **[`docs/FORCE_RESEND.md`](docs/FORCE_RESEND.md)** — live application of a per-client spoof (why the delta is value-compared, and the gated `SetForceResend` design).
+- **[`docs/MERGE_READINESS.md`](docs/MERGE_READINESS.md)** — review notes for bundling into ModSharp core.
 
 ## License & attribution
 
