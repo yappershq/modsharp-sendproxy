@@ -36,8 +36,3 @@ APPLIED (commit f313108):
   check upgraded to the same.
 - **`SetOneShot(bool)` overload** added for parity with the typed spoof API.
 
-REMAINING (cosmetic, deferred):
-- **`FieldSubstitution.SetFieldPathRegister` / `FieldPathReg`** — Windows-tuning scaffolding; mark
-  `internal` + `TODO(windows)`, or expose via `IProxyManager` if Windows tuning becomes near-term.
-- **Registration-API visibility** — `SetSpoof`/`SetCallback`/`SetOneShot` are `public static` on an
-  `internal` class (already effectively assembly-internal, so this is purely stylistic — low value).

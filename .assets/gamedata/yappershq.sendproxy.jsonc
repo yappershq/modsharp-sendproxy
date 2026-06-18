@@ -100,15 +100,12 @@
       //   capture the Linux build does by hooking GetBitRange must instead be done inside WriteFieldList
       //   (which contains the inlined bit-range logic) — GetBitRange is not independently hookable.
     },
-    // Windows-only field-path capture SITE (fills the Windows midhook TODO). Since GetBitRange is inlined on
-    // Windows, the field-path midhook hooks this point inside WriteFieldList instead: the instruction right
-    // before each field's BitCopyPrimitive call. At this site R12 = the current field INDEX (just above:
-    // `MOVSXD RCX,R12D; MOV EDX,[*(R15+8)+RCX*4+4]`; R12 is non-volatile so it survives the intervening call).
-    // Hooking here is 1:1 with the per-field BitCopy BY CONSTRUCTION (same per-field code path). The midhook
-    // reads R12 (a field INDEX, not a CFieldPath pointer — Windows is index-based) → resolve index->name via
-    // the serializer leaf map. VERIFY ON HARDWARE (same class as Linux's leaf-index assumption): (1) R12's
-    // index space == the leaf-walk DFS numbering; (2) this covers the WriteFieldList path — the delta path
-    // (BuildMergedSerializedEntity) needs the analogous site for full coverage. See docs/FORCE_RESEND.md.
+    // Windows-only field-path capture site. GetBitRange is inlined on Windows, so the field-path midhook
+    // hooks this point inside WriteFieldList — the instruction right before each field's BitCopyPrimitive
+    // call, where R12 = the current field INDEX (`MOVSXD RCX,R12D; MOV EDX,[*(R15+8)+RCX*4+4]`; R12 is
+    // non-volatile so it survives the call). Hooking here is 1:1 with the per-field BitCopy. The midhook
+    // reads R12 (a field index, not a CFieldPath pointer — Windows is index-based) and resolves index→name
+    // via the serializer leaf map.
     "CFlattenedSerializer::WriteFieldList_FieldPathSite": {
       "library": "networksystem",
       "windows": "44 8B C6 48 8D 55 ? 48 8D 8D ? ? ? ? E8"
