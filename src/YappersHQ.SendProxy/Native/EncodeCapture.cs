@@ -164,7 +164,7 @@ internal static unsafe class EncodeCapture
         // can skip everything for entities no proxy touches. Cheap: once per entity, not per field.
         if (!ProxyRegistry.IsEmpty && NativeUtil.IsUserPtr(ser))
         {
-            _serializerName     = NativeUtil.ReadShortAscii(*(nint*) ser, 48);
+            _serializerName     = NativeUtil.ResolveName(*(nint*) ser);
             _serializerHasProxy = _serializerName.Length > 0 && ProxyRegistry.HasSerializer(_serializerName);
         }
         else

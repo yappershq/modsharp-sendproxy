@@ -101,9 +101,47 @@ Everything else is disqualified: `Encode`/`WriteFieldList` (≈100KB frames), `E
 PackEntities_Normal (per-frame, too coarse). The `PackWork_t` lambda is the only same-level alternative to
 `0x38a130` but is engine2-side + synthesized; `0x38a130` is the cleaner, already-pinned target.
 
-## Next (implementation, after this RE is accepted)
-- Add a gamedata entry for `0x38a130` (linux prologue sig `55 48 89 E5 41 57 41 56 41 55 41 54 … 48 83 EC 88`
-  + windows twin) — verify unique.
-- Replace `EncodeCapture`'s target (Encode → `0x38a130`); read entity=r8d, serializer=*(arg2+8); add the
-  re-entrancy guard.
-- Build, then ONE careful live re-test on ttt (expect no crash this time, with the RE backing it).
+## Implementation status
+
+**IMPLEMENTED.** The gamedata entry `CFlattenedSerializer::EncodeEntity` is present (linux prologue sig
+`55 48 89 E5 41 57 41 56 41 55 41 54 … 48 83 EC 88`, windows `0x1800a5160`). `EncodeCapture` hooks
+`0x38a130`; reads entity index from r8d and serializer from *(arg2+8); re-entrancy guard installed.
+Live-validated on ttt: no crash, proxy fires once per (entity, field) as expected.
+
+## Phase ordering: PackEntities vs per-client send (why in-place SetFor reuse is safe)
+
+`PerClientDispatch.Record` (writes per-recipient SetFor overrides) runs during the shared pack;
+`PerClientDispatch.TryResolve` (reads them) runs during the per-client delta write. The question for
+reusing the override array in place (vs allocating fresh each pack) is whether those two can ever run
+**concurrently** — e.g. tick N+1's pack overwriting an array while tick N's send still iterates it. They
+cannot. Verified by RE of `libengine2.so`, `CNetworkGameServer::SendClientMessages` (`FUN_007a7280`,
+vprof scope `"SV:  SendClientMessages"`):
+
+1. **Pack is a blocking parallel-for.** The work is dispatched via `g_pThreadPool` vtable `+0xA0`
+   (label `"CNetworkGameServer::PackEntities"`, callback `LAB_00a58460`); its results are consumed
+   **inline immediately after the dispatch returns** (decomp `:969`→`:973`). A non-blocking dispatch
+   would race that consumption — so the call JOINS all pack workers before proceeding. `Record` (which
+   runs on pack workers) is therefore complete before the snapshot is used.
+2. **Per-client send is synchronous.** The send is a plain `do { … } while (++i < clientCount)` loop over
+   `param_1[0x4b]` (`:312`-`:451`) issuing per-client virtual calls (`+0x150` send scope, `+0x1b8`
+   send) — **no `+0xA0` thread-pool dispatch in the loop**. The delta encode (`WriteDeltaEntity_Internal`
+   → `BitCopyPrimitive`, where `TryResolve` fires) runs synchronously on the host thread inside this loop.
+   Socket transmission of the already-encoded buffer may be async, but it no longer touches the table.
+3. **One call per tick.** `SendClientMessages` is invoked once per tick from the single-threaded server
+   frame and returns only after both phases above complete. Tick N+1's pack (next `Record`) cannot begin
+   until tick N's send (last `TryResolve`) has returned.
+
+⇒ `Record` and `TryResolve` are sequential, never concurrent. Reusing the stored override array in place
+across ticks is safe, making the SetFor path allocation-free in steady state.
+
+**Windows (engine2.dll) — same invariant.** MSVC splits the Linux monolith into separate
+`ComputeClientPacks`/`PackEntities` and `SendClientMessages` functions, but the structure matches:
+1. Pack is dispatched through the thread-pool vtable (`+0x98` on Win64, label
+   `"CNetworkGameServer::PackEntities"`, `0x1800e87bf`) and its results are consumed inline immediately
+   after the call returns ⇒ blocking join.
+2. The per-client send is a synchronous loop (`0x18009e610`…`0x18009eb56`): per-client virtual calls
+   (`+0x148` send scope, `+0x1a8` send), loop counter `r12d` compared against the client count at
+   `*(this+0x250)` — **no thread-pool dispatch in the loop**.
+
+So the pack-joins-then-synchronous-send ordering holds on both platforms; the in-place reuse is safe
+cross-platform (no Linux-only gate needed).

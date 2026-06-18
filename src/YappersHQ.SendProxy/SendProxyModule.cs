@@ -28,7 +28,7 @@ using YappersHQ.SendProxy.Shared;
 
 namespace YappersHQ.SendProxy;
 
-public sealed class SendProxyModule : IModSharpModule, IEntityListener
+public sealed class SendProxyModule : IModSharpModule, IEntityListener, IGameListener
 {
     private const string WriteDeltaInternalKey          = "CNetworkGameServerBase::WriteDeltaEntity_Internal";
     private const string PerClientEncodeKey             = "CNetworkGameServer::PerClientEncode";
@@ -121,6 +121,13 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         EnsureProxyHooks();
 
         _bridge.EntityManager.InstallEntityListener(this);
+
+        // Clear the interned-name cache on every level activation: the encode/send hooks cache field and
+        // serializer names by their (stable-within-a-level) char* pointer. If a map change rebuilds the
+        // serializer metadata and reuses an address for a different name, a stale entry would resolve the
+        // wrong field. Dropping the cache per level makes that impossible — names simply re-intern on next
+        // use. Cheap (a few hundred entries) and removes any dependence on cross-level pointer stability.
+        _bridge.ModSharp.InstallGameListener(this);
     }
 
     // A consumer module unloaded — purge any per-client callbacks it owns before the send path can
@@ -138,7 +145,9 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         PerClientDispatch.Clear();
         RecipientCapture.Uninstall();
         FieldSubstitution.Uninstall();
+        NativeUtil.ClearNameCache();
         _bridge.EntityManager.RemoveEntityListener(this);
+        _bridge.ModSharp.RemoveGameListener(this);
     }
 
     #endregion
@@ -162,6 +171,18 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _proxyManager.RemoveEntityRegistrations((int) entity.Index);
         PerClientDispatch.ClearEntity((int) entity.Index);
     }
+
+    #endregion
+
+    #region IGameListener
+
+    int IGameListener.ListenerVersion  => IGameListener.ApiVersion;
+    int IGameListener.ListenerPriority => 0;
+
+    // Drop the interned-name cache when a new level activates — see InstallGameListener note in PostInit.
+    // Runs on the main thread during level setup (no snapshot packing in flight), so the clear is safe.
+    void IGameListener.OnServerActivate()
+        => NativeUtil.ClearNameCache();
 
     #endregion
 

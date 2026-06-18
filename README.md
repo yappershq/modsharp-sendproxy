@@ -261,16 +261,18 @@ SourceMod's SendProxyManager purges hooks on plugin unload / entity removal):
   3. `sp_proxyfor` → the per-viewer value shows only to the issuer; everyone else sees the real value.
   4. An entity-scoped proxy hits the right entity (sanity-checks the `[rsp+0x28]` entity-index read).
   See `docs/FINDING_SIGNATURES.md` for re-deriving the sigs if a game update breaks them.
-- **Live application:** a freshly-registered proxy on an unchanged field applies on the next full
-  update by default; force the field dirty with `entity.NetworkStateChanged("fieldName")` to show it
-  immediately (see `docs/FORCE_RESEND.md`).
+- **Live application:** a freshly-registered proxy on an unchanged field applies on the next natural
+  re-encode (value change or full update). For entity-scoped registrations, call
+  `entity.NetworkStateChanged("fieldName")` immediately after registering to dirty the field and apply
+  on the next tick. See `docs/FORCE_RESEND.md` for background on why the delta is value-compared and
+  why this is the correct approach.
 
 ## Documentation
 
 - **[`docs/HOW_IT_WORKS.md`](docs/HOW_IT_WORKS.md)** — plain-English overview (start here).
 - **[`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md)** — the full RE / C++-port spec.
 - **[`docs/FINDING_SIGNATURES.md`](docs/FINDING_SIGNATURES.md)** — human Ghidra/IDA guide to (re-)deriving every signature, with the Windows-specific gotchas.
-- **[`docs/FORCE_RESEND.md`](docs/FORCE_RESEND.md)** — live application of a per-client spoof (why the delta is value-compared, and the gated `SetForceResend` design).
+- **[`docs/FORCE_RESEND.md`](docs/FORCE_RESEND.md)** — live application background: why the delta is value-compared, and why `NetworkStateChanged` is the correct live-apply mechanism (the earlier force-resend approach was evaluated and not used).
 - **[`docs/MERGE_READINESS.md`](docs/MERGE_READINESS.md)** — review notes for bundling into ModSharp core.
 - **[`docs/ENCODE_CALLGRAPH_RE.md`](docs/ENCODE_CALLGRAPH_RE.md)** — crash/hook-type analysis for the per-entity encode wrapper hook.
 

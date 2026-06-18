@@ -559,7 +559,7 @@ internal static unsafe class FieldSubstitution
         try
         {
             var serPtr  = _currentSerializer;
-            var serName = NativeUtil.ReadShortAscii(*(nint*) (serPtr + 0x00), 48);
+            var serName = NativeUtil.ResolveName(*(nint*) (serPtr + 0x00));
 
             string fieldName;
             nint   leafRec;
@@ -948,7 +948,7 @@ internal static unsafe class FieldSubstitution
 
         leafRec = rec;
 
-        return NativeUtil.ReadShortAscii(*(nint*) (pInfo + 0x08), 48);
+        return NativeUtil.ResolveName(*(nint*) (pInfo + 0x08));
     }
 
     // Windows: resolve the leafRec (record pointer) for a given flattened-leaf DFS index so Classify and

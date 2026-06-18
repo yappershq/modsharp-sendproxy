@@ -25,6 +25,7 @@ namespace YappersHQ.SendProxy;
 
 internal sealed class InterfaceBridge
 {
+    public IModSharp           ModSharp           { get; }
     public IGameData            GameData           { get; }
     public IEntityManager       EntityManager      { get; }
     public IClientManager       ClientManager      { get; }
@@ -33,7 +34,8 @@ internal sealed class InterfaceBridge
 
     public InterfaceBridge(ISharedSystem sharedSystem)
     {
-        GameData           = sharedSystem.GetModSharp().GetGameData();
+        ModSharp           = sharedSystem.GetModSharp();
+        GameData           = ModSharp.GetGameData();
         EntityManager      = sharedSystem.GetEntityManager();
         ClientManager      = sharedSystem.GetClientManager();
         HookManager        = sharedSystem.GetHookManager();

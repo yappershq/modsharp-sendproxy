@@ -55,7 +55,8 @@ IDA-style pattern, or by hand: select the prologue, look at the hex, replace ope
 
 | Gamedata key | Library | Primary locator |
 |---|---|---|
-| `CFlattenedSerializer::EncodeField` | networksystem | string `"CFlattenedSerializer::EncodeField encoder wrote %d bits"` |
+| `CFlattenedSerializer::EncodeEntity` | networksystem | prologue sig @ linux `0x38a130`, windows `0x1800a5160`; the per-entity wrapper — single caller of `Encode`, small frame (0x88), non-recursive; the entity-capture hook target |
+| `CFlattenedSerializer::Encode` | networksystem | string `"CFlattenedSerializer::Encode failure for entity %d"` — **DO NOT HOOK** (100 KB frame, indirect recursion → stack overflow); kept in gamedata as a documented reference only |
 | `CFlattenedSerializer::WriteFieldList` | networksystem | string `"CFlattenedSerializer::WriteFieldList fieldDataBuf"` |
 | `CFlattenedSerializer::GetBitRange` | networksystem | string `"GetBitRange( %d -> %d ) end is before or same as start"` |
 | `CFlattenedSerializer::EncoderRegistry` (+ buckets) | networksystem | string `"CNetworkSerializer: Unable to find network encoder named %s!"` → registry table-load `lea` |
@@ -63,7 +64,6 @@ IDA-style pattern, or by hand: select the prologue, look at the hex, replace ope
 | `CFlattenedSerializer::BitCopyPrimitive` | networksystem | standalone leaf; reach via a BitCopy caller (WriteFieldList) → its bit-copy callee |
 | `CNetworkGameServerBase::WriteDeltaEntity_Internal` | engine2 | string `"…WriteDeltaEntity_Internal merging changes added in %d additional fields!"` |
 | `CNetworkGameServer::PerClientEncode` | engine2 | string `"WriteOOPVSDeltaEntities"` / `"Delta: [%d] deletions"` (it’s the fn holding them; calls WriteDeltaEntity_Internal) |
-| `CNetworkGameServer::SendClientMessages` | engine2 | string `"ComputeClientPacks"` (split on Win — see §3) |
 
 ### 2a. String-anchored functions (the easy majority)
 
@@ -79,9 +79,9 @@ IDA-style pattern, or by hand: select the prologue, look at the hex, replace ope
 2. In the string's disassembly, click the `DATA XREF` comment → jump to the `lea` that loads it.
 3. `Ctrl+P` / scroll up to the function start (`proc near`). That's your sig start.
 
-Then take the prologue pattern (§1). Example — `EncodeField` Linux:
-`55 48 89 E5 41 57 49 89 D7 41 56 41 55 41 54 41 BC 01 00 00 00`; Windows:
-`48 89 5C 24 ? 88 54 24 ? 48 89 4C 24 ? 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ? 48 81 EC 20 01 00 00`.
+Then take the prologue pattern (§1). Example — `EncodeEntity` Linux (the per-entity wrapper):
+`55 48 89 E5 41 57 41 56 41 55 41 54 … 48 83 EC 88` (small frame, unique in networksystem);
+Windows twin at `0x1800a5160` — sig each platform independently (ABI differs, same logic).
 
 ### 2b. The encoder registry — string → `lea` → factory op-chain
 
@@ -126,11 +126,6 @@ loaded from a pointer table that the disassembler doesn't track as a code xref).
   `"…WriteDeltaEntity_Internal merging changes added in %d additional fields!"`. `PerClientEncode` is the fn
   that holds `"WriteDeltaEntities"` / `"WriteOOPVSDeltaEntities"` / `"Delta: [%d] deletions"` and *calls*
   the singular writer — find it by those strings, confirm it calls `WriteDeltaEntity_Internal`.
-- **`SendClientMessages`** — the per-client send/pack loop. Its `"SendClientMessages"`/`"PackWork_t"` vprof
-  names have no code xref, but the body strings `"ComputeClientPacks"` / `"PackEntities_Normal …"` /
-  `"PrepareSendClientMessages"` do. NOTE: on Windows this Linux monolith is **split** across multiple fns —
-  there is no single 1:1 twin; pick the representative (ComputeClientPacks owner) or resolve via
-  `refs.strings`. (The runtime doesn't actually hook this one, so an imperfect mapping is harmless.)
 
 **Ghidra**: callers via `References → Show References to` on the function entry, filter to CALL refs.
 **IDA**: `Ctrl+X` (xrefs to) on the function name, or the function's "Xrefs" pane.
@@ -164,7 +159,7 @@ gamedata). All confirmed `same_function` against the Linux twin unless noted.
 
 | Function | Windows addr | Notes |
 |---|---|---|
-| EncodeField | `0x1800661a0` | offsets identical to Linux (+0x38 encoder dispatch, +0xC9 params, bf_write +0x00/+0x10/+0x20, record stride 0x2e) |
+| EncodeEntity | `0x1800a5160` | per-entity wrapper; small frame, non-recursive; entity-capture hook target (IMidFuncHook) |
 | WriteFieldList | `0x18006f970` | contains the inlined GetBitRange assert |
 | EncoderRegistry init | `0x180073ae0` | table-load `lea rdi,[rip+…]` @`0x180074328` → table `0x18026b480` (8 buckets, counts 1/3/3/7/1/1/1/1) |
 | EncodeInt32 (signed) | `0x1801b7600` | zigzag wrapper → tail-jmp into varint writer |
@@ -172,7 +167,6 @@ gamedata). All confirmed `same_function` against the Linux twin unless noted.
 | WriteDeltaEntity_Internal | `0x1800d1240` | singular per-entity writer; 11/11 param-struct offsets match Linux |
 | PerClientEncode | `0x1800d2e90` | per-client encode; calls WriteDeltaEntity_Internal; RecipientCapture hook target |
 | GetBitRange | *(none)* | **inlined** into ~8 callers — no standalone entry (see below) |
-| SendClientMessages | *(split)* | Linux monolith → Windows split (ComputeClientPacks `0x1800e8ce0`, PackEntities_Normal `0x1800e81e0`); unused by runtime |
 
 **Two Windows traps that wasted time — learn from them:**
 1. **`0x1800d2e90` is PerClientEncode, NOT WriteDeltaEntity_Internal.** It holds the `WriteDeltaEntities`/
@@ -185,10 +179,9 @@ gamedata). All confirmed `same_function` against the Linux twin unless noted.
    inlined." It isn't: BitCopyPrimitive is the *generic* bit-block copy on the WriteFieldList/MergeDeltas
    path (`0x1801b6ec0`). Route via a known BitCopy caller, not via an encoder.
 
-**Inlining / splitting differs from Linux** (the compiler, not the layout): `GetBitRange` is inlined into
-all its callers (no standalone Windows fn). `SendClientMessages` is one ~10KB Linux fn but several smaller
-fns on Windows. When a Linux function has no clean Windows twin, that's a real compiler difference — record
-it and hook the enclosing/representative function rather than forcing a 1:1 address.
+**Inlining differs from Linux** (the compiler, not the layout): `GetBitRange` is inlined into
+all its callers (no standalone Windows fn). When a Linux function has no clean Windows twin, that's a real
+compiler difference — record it and hook the enclosing/representative function rather than forcing a 1:1 address.
 
 ## 4. Verifying a signature (do this every time)
 

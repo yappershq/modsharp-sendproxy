@@ -342,13 +342,13 @@ find the function that references it, makesig the prologue.
 
 | Target | Anchor string (in/near the function) |
 |---|---|
-| `EncodeField` | `"CFlattenedSerializer::EncodeField encoder wrote %d bits"` |
+| `EncodeEntity` (per-entity wrapper, capture hook) | prologue sig @ linux `0x38a130`, windows `0x1800a5160`; no anchor string — locate by call-site to `Encode` |
+| `Encode` (DO NOT HOOK — reference only) | `"CFlattenedSerializer::Encode failure for entity %d"` |
 | `WriteFieldList` | `"CFlattenedSerializer::WriteFieldList fieldDataBuf"` (debug name of its stack value buffer) |
 | `GetBitRange` (`CFieldPath` resolver) | `"GetBitRange( %d -> %d ) end is before or same as start\n"`, file `"../public/networksystem/serializedentity.h"` |
 | encoder registry | `"CNetworkSerializer: Unable to find network encoder named %s!"` (registry init / lookup) |
-| `Encode` (caller) | `"Encode failure for entity %d"` |
 | `EncodeInt32` | bucket-1 `default` entry fn (cross-checked against the registry walk) |
-| `BitCopyPrimitive`, `SendClientMessages`, `PerClientEncode`, `WriteDeltaEntity_Internal` | no direct literal — resolved by prologue sig / call-site structure; on the Windows port, reach them from their **callers** (e.g. `WriteFieldList`→`BitCopyPrimitive`, `SendClientMessages`→`PerClientEncode`→`WriteDeltaEntity_Internal`) which do anchor. |
+| `BitCopyPrimitive`, `PerClientEncode`, `WriteDeltaEntity_Internal` | no direct literal — resolved by prologue sig / call-site structure; on the Windows port, reach them from their **callers** (e.g. `WriteFieldList`→`BitCopyPrimitive`, `PerClientEncode`→`WriteDeltaEntity_Internal`) which do anchor. |
 
 Regeneration: find the string's vaddr, find the instruction referencing it, walk back to the nearest
 function prologue, emit the shortest unique prologue signature with nosoop's `makesig` (or the headless
@@ -462,7 +462,7 @@ type/size `+0x38`, no encoder.
   bucket encoder fns, dispatch by the live fn (`*(*(fieldInfo+0x38))`) → trampoline + type, match by
   field name, redirect the value pointer (`rcx`) at a scratch built in that encoder's layout.
 - `Native/RecipientCapture.cs` — `PerClientEncode` detour → `[ThreadStatic]` recipient.
-- `SendProxyManager.cs` / `ISendProxyManager` — the public API; the core library ships no commands.
+- `ProxyManager.cs` / `IProxyManager` — the public API (Identity `nameof(IProxyManager)`); the core library ships no commands.
 - `YappersHQ.SendProxy.Example` — drives the API through AdminManager-gated `sp_*` commands (split into
   `Commands/*` categories), and carries the read-only serializer probe (`SerializerProbe.cs`).
 
@@ -470,7 +470,7 @@ Engine addresses and encoder identities are resolved from
 `.assets/gamedata/yappershq.sendproxy.jsonc`.
 
 > **Port note (C++ .Core / C# .Shared):** the native engine above (`FieldSubstitution`,
-> `UniformEncoderHook`, `RecipientCapture`) is the reference for the C++ side; `ISendProxyManager` + the
+> `UniformEncoderHook`, `RecipientCapture`) is the reference for the C++ side; `IProxyManager` + the
 > delegates are the C# `.Shared` surface that survives. Before porting, settle the per-client value
 > model so the C++ hot path doesn't call a managed delegate per field per client — prefer a
 > native-readable value source (recipient mask + value), managed callback optional. See the pre-merge

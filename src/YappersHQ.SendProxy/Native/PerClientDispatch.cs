@@ -64,13 +64,33 @@ internal static class PerClientDispatch
             return;
         }
 
-        var arr = new (int, SpoofValue)[overrides.Count];
+        // Reuse the stored array in place when the recipient count is unchanged (the steady state — same
+        // players tick to tick), so this path allocates nothing across ticks. Safe because Record and
+        // TryResolve never run concurrently: both happen inside one synchronous per-tick
+        // CNetworkGameServer::SendClientMessages call — the PackEntities parallel-for fully JOINS (its
+        // results are consumed inline right after the thread-pool dispatch returns) before the per-client
+        // send, and that send is a plain synchronous do/while over clients (no async/threaded dispatch), so
+        // it completes before the call returns. Tick N+1 (next Record) cannot begin until tick N's send
+        // (last TryResolve) has returned on the same host thread. Verified by RE of libengine2.so
+        // (FUN_007a7280): pack dispatch + inline join, then the synchronous client loop. See docs.
+        var key = (entityIndex, field);
+
+        (int Slot, SpoofValue Val)[] arr;
+        if (_table.TryGetValue(key, out var existing) && existing.Overrides.Length == overrides.Count)
+        {
+            arr = existing.Overrides;
+        }
+        else
+        {
+            arr = new (int, SpoofValue)[overrides.Count];
+        }
+
         for (var i = 0; i < overrides.Count; i++)
         {
             arr[i] = (overrides[i].Client.Slot.AsPrimitive(), overrides[i].Value);
         }
 
-        _table[(entityIndex, field)] = new Rec(type, in def, arr);
+        _table[key] = new Rec(type, in def, arr);
     }
 
     // Resolve the value a given recipient slot should receive for (entity, field): its override if present,
