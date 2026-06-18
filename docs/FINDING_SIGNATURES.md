@@ -55,8 +55,7 @@ IDA-style pattern, or by hand: select the prologue, look at the hex, replace ope
 
 | Gamedata key | Library | Primary locator |
 |---|---|---|
-| `CFlattenedSerializer::EncodeEntity` | networksystem | prologue sig @ linux `0x38a130`, windows `0x1800a5160`; the per-entity wrapper — single caller of `Encode`, small frame (0x88), non-recursive; the entity-capture hook target |
-| `CFlattenedSerializer::Encode` | networksystem | string `"CFlattenedSerializer::Encode failure for entity %d"` — **DO NOT HOOK** (100 KB frame, indirect recursion → stack overflow); kept in gamedata as a documented reference only |
+| `CFlattenedSerializer::EncodeEntity` | networksystem | prologue sig @ linux `0x38a130`, windows `0x1800a5160`; the per-entity wrapper — single caller of the recursive `Encode` (`"CFlattenedSerializer::Encode failure for entity %d"`, ~100 KB frame, **DO NOT HOOK** — see ENCODE_CALLGRAPH_RE.md), small frame (0x88), non-recursive; the entity-capture hook target |
 | `CFlattenedSerializer::WriteFieldList` | networksystem | string `"CFlattenedSerializer::WriteFieldList fieldDataBuf"` |
 | `CFlattenedSerializer::GetBitRange` | networksystem | string `"GetBitRange( %d -> %d ) end is before or same as start"` |
 | `CFlattenedSerializer::EncoderRegistry` (+ buckets) | networksystem | string `"CNetworkSerializer: Unable to find network encoder named %s!"` → registry table-load `lea` |

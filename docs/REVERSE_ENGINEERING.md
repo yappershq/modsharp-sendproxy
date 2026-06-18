@@ -343,7 +343,7 @@ find the function that references it, makesig the prologue.
 | Target | Anchor string (in/near the function) |
 |---|---|
 | `EncodeEntity` (per-entity wrapper, capture hook) | prologue sig @ linux `0x38a130`, windows `0x1800a5160`; no anchor string — locate by call-site to `Encode` |
-| `Encode` (DO NOT HOOK — reference only) | `"CFlattenedSerializer::Encode failure for entity %d"` |
+| `Encode` (DO NOT HOOK — recursive; not a gamedata key, used only to locate its `EncodeEntity` caller) | `"CFlattenedSerializer::Encode failure for entity %d"` |
 | `WriteFieldList` | `"CFlattenedSerializer::WriteFieldList fieldDataBuf"` (debug name of its stack value buffer) |
 | `GetBitRange` (`CFieldPath` resolver) | `"GetBitRange( %d -> %d ) end is before or same as start\n"`, file `"../public/networksystem/serializedentity.h"` |
 | encoder registry | `"CNetworkSerializer: Unable to find network encoder named %s!"` (registry init / lookup) |
