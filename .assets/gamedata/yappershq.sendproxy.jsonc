@@ -16,11 +16,9 @@
 //
 // ── Windows cross-platform sigs (added 2026-06, RE from networksystem.dll/engine2.dll, build
 //    "csgo_rel_win64") ─────────────────────────────────────────────────────────────────────────
-// Windows sigs are function-prologue byte patterns at the Ghidra image base 0x180000000. Only the
-// four networksystem encode/registry functions resolved on Windows; the engine2 send-path functions
-// (SendClientMessages / PerClientEncode) and the un-RE'd helpers stay linux-only — see per-entry
-// "TODO windows:" notes. Where a Windows function was located by a string the C-literal anchor is
-// recorded under refs.strings with a TODO for the deref/offset op-chain (not yet derived).
+// Windows sigs are function-prologue byte patterns at the Ghidra image base 0x180000000. Every key
+// resolved at runtime has a Windows sig (PerClientEncode located by string-anchored call-graph match).
+// Where a Windows function was located by a string, the C-literal anchor is recorded under refs.strings.
 //
 // ✓ OFFSETS CONSISTENT cross-platform. The first Windows pass flagged three "mismatches"; all three were
 //    re-checked against the live-working Linux runtime and found FALSE (an automated-decompile misread,
@@ -28,11 +26,6 @@
 //    the OFFSET NOTES block at the bottom of this file. The Linux offsets DO hold on Windows.
 {
   "Addresses": {
-    "CFlattenedSerializer::EncodeField": {
-      "library": "networksystem",
-      "linux": "55 48 89 E5 41 57 49 89 D7 41 56 41 55 41 54 41 BC 01 00 00 00",
-      "windows": "48 89 5C 24 ? 88 54 24 ? 48 89 4C 24 ? 55 56 57 41 54 41 55 41 56 41 57 48 8D 6C 24 ? 48 81 EC 20 01 00 00"
-    },
     // The per-ENTITY encode wrapper @0x38a130 (the SINGLE caller of CFlattenedSerializer::Encode). This is
     // the crash-SAFE capture site: small 0x88 frame, non-recursive (the recursion is inside Encode, below),
     // and it holds the entity index (r8d) + serializer (*(rsi+0x8)). EncodeCapture detours THIS, not Encode.
@@ -86,22 +79,6 @@
       "windows": "4C 8B C2 48 03 D2 49 C1 F8 3F 49 33 D0 E9 ? ? ? ?"
     },
 
-    "CNetworkGameServer::SendClientMessages": {
-      "library": "engine",
-      "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 41 56 41 55 41 54 53 89 F3",
-      // NOTE: this entry is resolved at load but the result is DISCARDED (SendProxyModule.cs:157) — the
-      //   runtime does not hook SendClientMessages; only PerClientEncode is hooked. Kept for reference.
-      // NOTE windows: NO clean 1:1 twin. The Linux SendClientMessages (FUN_007a7280, ~10KB) is one
-      //   monolithic fn carrying "SV:  SendClientMessages" / "PrepareSendClientMessages" /
-      //   "ComputeClientPacks" / "PackEntities_Normal …". On Windows MSVC SPLIT that work across separate
-      //   fns: ComputeClientPacks @0x1800e8ce0 and PackEntities_Normal @0x1800e81e0 (the per-client send
-      //   loop entry's vprof string "PrepareSendClientMessages" @0x18053b149 has no code xref). Since the
-      //   runtime doesn't use this address, the imperfect split-mapping is harmless. Resolved via the
-      //   ModSharp refs.strings mechanism (array form) — picks the owning fn of the anchor on each build.
-      "refs": {
-        "strings": [ "ComputeClientPacks" ]
-      }
-    },
     "CNetworkGameServer::PerClientEncode": {
       "library": "engine",
       "linux": "55 48 8D 05 ? ? ? ? 48 89 E5 41 57 4C 8D BD ? ? ? ? 41 56 4C 8D 35",
@@ -126,21 +103,6 @@
       //   ptrs +0x90/+0x98/+0xa0, field-index vectors +0x900/+0x908/+0x918, dirty-baseline +0x8f0 etc — 11/11
       //   match). NOTE: do NOT confuse with WriteDeltaEntities (plural loop driver @0x1800d2e90), its caller.
       "windows": "4C 89 44 24 ? 48 89 54 24 ? 48 89 4C 24 ? 55 57 41 55 48 8D 6C 24 ? 48 81 EC 60 01 00 00"
-    },
-    // Serializer singleton GLOBAL (engine2). The CalcDelta virtual (vtable slot 8 / +0x40) lives on the
-    // object whose pointer this global holds — loaded inside WriteDeltaEntity_Internal as
-    // `mov rdi,[rip+<this global>]; mov rax,[rdi]; call [rax+0x40]`. Used ONLY by the gated, off-by-default
-    // force-resend (Option D): read *global -> object -> vtable, IVirtualHook slot 8, then append a hooked
-    // field's index to the delta output list so a per-client spoof applies live. See docs/FORCE_RESEND.md.
-    // The "+3 r" factory skips the 3-byte `48 8B 3D` opcode and RIP-resolves the rel32 to the global's address.
-    // CONFIRMED identical on both platforms: WriteDeltaEntity_Internal loads this singleton then calls its
-    // vtable slot 8 (+0x40 = CalcDelta) and slot 14 (+0x70 = WriteFields/encode). Force-resend (Option D)
-    // hooks slot 14 of *(*global) and sorted-inserts a hooked field's index into the field-index list arg.
-    "CNetworkSerialization::SerializerSingleton": {
-      "library": "engine",
-      "linux":   { "signature": "48 8B 3D ? ? ? ? 4D 8B AC 24 F8 08 00 00 8B 48 18", "factory": "+3 r" },
-      // windows: MOV RCX,[rip->0x1806858a0] in WriteDeltaEntity_Internal (0x1800d1240); same +3 r factory.
-      "windows": { "signature": "48 8B 0D ? ? ? ? 4C 8B 8F 98 00 00 00 48 89 44 24 ? 33 C0 49 8B 10 4C 8B 11", "factory": "+3 r" }
     },
     "CFlattenedSerializer::WriteFieldList": {
       "library": "networksystem",
