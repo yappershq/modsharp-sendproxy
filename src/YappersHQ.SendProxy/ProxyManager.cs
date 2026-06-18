@@ -20,6 +20,7 @@
 using System;
 using Microsoft.Extensions.Logging;
 using Sharp.Shared.GameEntities;
+using Sharp.Shared.Managers;
 using YappersHQ.SendProxy.Native;
 using YappersHQ.SendProxy.Shared;
 
@@ -27,13 +28,39 @@ namespace YappersHQ.SendProxy;
 
 internal sealed class ProxyManager : IProxyManager
 {
-    private readonly ILogger _logger;
+    private readonly ILogger         _logger;
+    private readonly IEntityManager  _entityManager;
 
     // Set by the module — installs the encode-capture + encoder hooks on first registration.
     private Func<bool>? _ensureHooks;
 
-    public ProxyManager(ILogger logger)
-        => _logger = logger;
+    public ProxyManager(ILogger logger, IEntityManager entityManager)
+    {
+        _logger        = logger;
+        _entityManager = entityManager;
+    }
+
+    // Dirty fieldName on every live entity using serializerName so a freshly (un)registered all-entities
+    // proxy applies on the NEXT pack instead of waiting for the field to change on its own / a full update.
+    // (Register/Unregister are rare setup actions, so walking the entity list here is off any hot path.)
+    private void DirtyAll(string serializerName, string fieldName)
+    {
+        IBaseEntity? cur = null;
+        while ((cur = _entityManager.FindEntityByClassname(cur, "*")) is { } e)
+        {
+            if (e is { IsValidEntity: true } && e.GetSchemaClassname() == serializerName)
+            {
+                try
+                {
+                    e.NetworkStateChanged(fieldName);
+                }
+                catch
+                {
+                    // non-fatal — a transient/odd entity; the proxy still applies on its next natural change
+                }
+            }
+        }
+    }
 
     internal void SetHookInstaller(Func<bool> installer)
         => _ensureHooks = installer;
@@ -73,6 +100,7 @@ internal sealed class ProxyManager : IProxyManager
         if (!EnsureHooks($"Register(\"{serializerName}::{fieldName}\")")) return;
 
         ProxyRegistry.Set(serializerName, fieldName, -1, callback);
+        DirtyAll(serializerName, fieldName); // apply on the next pack, don't wait for a change / full update
         _logger.LogDebug("SendProxy: proxy registered (all entities) for \"{Ser}::{Field}\"", serializerName, fieldName);
     }
 
@@ -103,6 +131,7 @@ internal sealed class ProxyManager : IProxyManager
     {
         if (string.IsNullOrEmpty(serializerName) || string.IsNullOrEmpty(fieldName)) return;
         ProxyRegistry.Remove(serializerName, fieldName, -1);
+        DirtyAll(serializerName, fieldName); // re-dirty so the real value re-sends now the proxy is gone
         _logger.LogDebug("SendProxy: proxy removed (all entities) for \"{Ser}::{Field}\"", serializerName, fieldName);
     }
 

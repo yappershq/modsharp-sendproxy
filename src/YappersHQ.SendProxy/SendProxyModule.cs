@@ -77,7 +77,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener, IGameLis
     {
         _logger       = sharedSystem.GetLoggerFactory().CreateLogger<SendProxyModule>();
         _bridge       = new InterfaceBridge(sharedSystem);
-        _proxyManager = new ProxyManager(_logger);
+        _proxyManager = new ProxyManager(_logger, _bridge.EntityManager);
     }
 
     public string DisplayName   => "SendProxy";
