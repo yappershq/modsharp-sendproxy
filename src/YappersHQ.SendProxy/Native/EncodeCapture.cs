@@ -61,7 +61,7 @@ internal static unsafe class EncodeCapture
     private static bool _captured;
 
     [ThreadStatic]
-    private static string? _serializerName;
+    private static nint _serNamePtr;
 
     [ThreadStatic]
     private static bool _serializerHasProxy;
@@ -69,8 +69,11 @@ internal static unsafe class EncodeCapture
     /// <summary>CFlattenedSerializer* of the entity being encoded on this thread (0 if none captured).</summary>
     public static nint Serializer => _captured ? _serializer : 0;
 
-    /// <summary>Resolved serializer name of the entity being encoded (empty if none).</summary>
-    public static string SerializerName => _captured ? _serializerName ?? string.Empty : string.Empty;
+    /// <summary>
+    ///     The engine's stable name char* of the serializer being encoded (0 if none). Used to match proxies
+    ///     by pointer/byte-compare instead of building a managed string per field.
+    /// </summary>
+    public static nint SerNamePtr => _captured ? _serNamePtr : 0;
 
     /// <summary>
     ///     Fast-path gate: true only when the current entity's serializer has at least one registered proxy.
@@ -164,12 +167,12 @@ internal static unsafe class EncodeCapture
         // can skip everything for entities no proxy touches. Cheap: once per entity, not per field.
         if (!ProxyRegistry.IsEmpty && NativeUtil.IsUserPtr(ser))
         {
-            _serializerName     = NativeUtil.ResolveName(*(nint*) ser);
-            _serializerHasProxy = _serializerName.Length > 0 && ProxyRegistry.HasSerializer(_serializerName);
+            _serNamePtr         = *(nint*) ser; // char* m_pszName — stable engine pointer, matched by byte-compare
+            _serializerHasProxy = ProxyRegistry.HasSerializerPtr(_serNamePtr);
         }
         else
         {
-            _serializerName     = null;
+            _serNamePtr         = 0;
             _serializerHasProxy = false;
         }
 

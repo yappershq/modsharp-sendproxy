@@ -138,7 +138,13 @@ internal static unsafe class FieldSubstitution
     // Windows index→name cache: serializerName -> string[] indexed by flattened-leaf DFS order.
     // Built lazily from WflShim the first time each serializer is seen (Windows only; never populated
     // on Linux — _currentFieldIndex stays -1 and the Windows branch in ValueCopyHook is unreachable).
-    private static readonly ConcurrentDictionary<string, string[]> _windowsIndexName = new();
+    // serializer name char* -> index→field-name-char* array (Windows index-based field-path resolution).
+    private static readonly ConcurrentDictionary<nint, nint[]> _windowsIndexName = new();
+
+    // Drop the cached serializer→index map. Called on level activation (serializer metadata can be rebuilt,
+    // so the cached name char* could become stale) and on shutdown.
+    public static void ClearWindowsIndex()
+        => _windowsIndexName.Clear();
 
     /// <summary>
     ///     Provide the gamedata-resolved encoder identities used for classification: the registry table
@@ -332,13 +338,12 @@ internal static unsafe class FieldSubstitution
         _currentSerializer  = a;
         _currentFieldIndex  = -1;
 
-        var serName = NativeUtil.ReadShortAscii(*(nint*) (a + 0x00), 48);
-
-        // Windows: build the index→name array the first time this serializer is seen so ValueCopyHook can
-        // resolve a field index captured by WindowsFieldIndexHook into a field name.
+        // Windows: build the index→namePtr array the first time this serializer is seen so ValueCopyHook can
+        // resolve a field index captured by WindowsFieldIndexHook into a field name pointer. (Linux walks the
+        // CFieldPath* directly and needs no serializer-name read here.)
         if (OperatingSystem.IsWindows())
         {
-            NoteSerializerWindows(serName, a);
+            NoteSerializerWindows(*(nint*) (a + 0x00), a);
         }
 
         var result = ((delegate* unmanaged[Cdecl]<
@@ -426,17 +431,18 @@ internal static unsafe class FieldSubstitution
         _currentFieldIndex = (int) ctx->r12;
     }
 
-    // Build and cache the index→name array for a serializer the first time it is seen (Windows only).
-    // Mirrors ForceResend.WalkLeaves but produces a string[] indexed by sequential DFS leaf order.
-    // Every deref is IsUserPtr-guarded; wrapped in try/catch so a bad walk never escapes.
-    private static void NoteSerializerWindows(string serName, nint serializer)
+    // Build and cache the index→name-POINTER array for a serializer the first time it is seen (Windows only),
+    // keyed by the serializer's stable name pointer. Index = sequential DFS leaf order. No managed string —
+    // the per-client consume path matches by name pointer. Every deref is IsUserPtr-guarded; try/catch so a
+    // bad walk never escapes.
+    private static void NoteSerializerWindows(nint serNamePtr, nint serializer)
     {
-        if (serName.Length == 0 || _windowsIndexName.ContainsKey(serName) || !NativeUtil.IsUserPtr(serializer))
+        if (serNamePtr == 0 || _windowsIndexName.ContainsKey(serNamePtr) || !NativeUtil.IsUserPtr(serializer))
         {
             return;
         }
 
-        var list = new List<string>();
+        var list = new List<nint>();
         try
         {
             WalkLeavesIndexed(serializer, list, 0);
@@ -446,13 +452,13 @@ internal static unsafe class FieldSubstitution
             return; // never let a bad walk poison the cache
         }
 
-        _windowsIndexName.TryAdd(serName, list.ToArray());
+        _windowsIndexName.TryAdd(serNamePtr, list.ToArray());
     }
 
-    // DFS walk producing an ordered leaf-name list (index = sequential position). Mirrors the structure of
-    // ForceResend.WalkLeaves: base @serializer+0x30, stride 0x2E; child serializer @rec+0x08; leaf
-    // fieldInfo @rec+0x00; name @*(fieldInfo+0x08). Guard: depth≤4, count≤4096.
-    private static void WalkLeavesIndexed(nint serializer, List<string> names, int depth)
+    // DFS walk producing an ordered leaf name-pointer list (index = sequential position): base
+    // @serializer+0x30, stride 0x2E; child serializer @rec+0x08; leaf fieldInfo @rec+0x00; name char*
+    // @*(fieldInfo+0x08). Guard: depth≤4, count≤4096.
+    private static void WalkLeavesIndexed(nint serializer, List<nint> namePtrs, int depth)
     {
         if (depth > 4 || !NativeUtil.IsUserPtr(serializer))
         {
@@ -477,18 +483,18 @@ internal static unsafe class FieldSubstitution
             var child = *(nint*) (rec + 0x08);
             if (NativeUtil.IsUserPtr(child))
             {
-                WalkLeavesIndexed(child, names, depth + 1);
+                WalkLeavesIndexed(child, namePtrs, depth + 1);
                 continue;
             }
 
             var fieldInfo = *(nint*) (rec + 0x00);
             if (!NativeUtil.IsUserPtr(fieldInfo))
             {
-                names.Add(string.Empty); // placeholder to keep index alignment
+                namePtrs.Add(0); // placeholder to keep index alignment
                 continue;
             }
 
-            names.Add(NativeUtil.ReadShortAscii(*(nint*) (fieldInfo + 0x08), 48));
+            namePtrs.Add(*(nint*) (fieldInfo + 0x08));
         }
     }
 
@@ -558,20 +564,20 @@ internal static unsafe class FieldSubstitution
 
         try
         {
-            var serPtr  = _currentSerializer;
-            var serName = NativeUtil.ResolveName(*(nint*) (serPtr + 0x00));
+            var serPtr     = _currentSerializer;
+            var serNamePtr = NativeUtil.IsUserPtr(serPtr) ? *(nint*) (serPtr + 0x00) : 0;
 
-            string fieldName;
-            nint   leafRec;
+            nint fieldNamePtr;
+            nint leafRec;
 
             if (OperatingSystem.IsWindows() && !NativeUtil.IsUserPtr(pathPtr))
             {
-                // Windows index-based path: resolve field name from the pre-built index→name array.
+                // Windows index-based path: resolve the field NAME POINTER from the pre-built index→ptr array.
                 leafRec = 0;
-                if (serName.Length == 0
-                    || !_windowsIndexName.TryGetValue(serName, out var indexNames)
-                    || _currentFieldIndex >= indexNames.Length
-                    || (fieldName = indexNames[_currentFieldIndex]).Length == 0)
+                if (serNamePtr == 0
+                    || !_windowsIndexName.TryGetValue(serNamePtr, out var indexPtrs)
+                    || _currentFieldIndex >= indexPtrs.Length
+                    || (fieldNamePtr = indexPtrs[_currentFieldIndex]) == 0)
                 {
                     return CallOriginal(dst, src, bitcount);
                 }
@@ -586,8 +592,8 @@ internal static unsafe class FieldSubstitution
             else
             {
                 // Linux CFieldPath* path.
-                fieldName = ResolveFieldName(serPtr, pathPtr, out leafRec);
-                if (fieldName.Length == 0)
+                fieldNamePtr = ResolveFieldNamePtr(serPtr, pathPtr, out leafRec);
+                if (fieldNamePtr == 0)
                 {
                     return CallOriginal(dst, src, bitcount);
                 }
@@ -604,7 +610,7 @@ internal static unsafe class FieldSubstitution
             // apply THIS client's value: its SetFor override, or the recorded default (uniform value if also
             // SetAll'd, else the real value — restoring non-recipients).
             if (!NativeUtil.IsUserPtr(clientPtr)
-                || !PerClientDispatch.TryResolve(entityIndex, fieldName,
+                || !PerClientDispatch.TryResolve(entityIndex, fieldNamePtr,
                     *(int*) (clientPtr + CServerSideClientSlotOffset), out var pcValue, out _))
             {
                 return CallOriginal(dst, src, bitcount);
@@ -861,12 +867,12 @@ internal static unsafe class FieldSubstitution
     // Walk the CFieldPath (filled by GetBitRange) through the flattened-serializer field array to the leaf
     // record + its field name. Every dereference is IsUserPtr-guarded; a guard failure returns empty (the
     // caller passes through). RE layout: docs/REVERSE_ENGINEERING.md §9b.
-    private static string ResolveFieldName(nint serializer, nint hdr, out nint leafRec)
+    private static nint ResolveFieldNamePtr(nint serializer, nint hdr, out nint leafRec)
     {
         leafRec = 0;
         if (!NativeUtil.IsUserPtr(serializer) || !NativeUtil.IsUserPtr(hdr))
         {
-            return string.Empty;
+            return 0;
         }
 
         // Path levels. CFieldPath is at most 3 deep (§9a); a larger/garbage count means a stale or bogus
@@ -874,7 +880,7 @@ internal static unsafe class FieldSubstitution
         var count = *(short*) (hdr + 0x18);
         if (count < 1 || count > 3)
         {
-            return string.Empty;
+            return 0;
         }
 
         nint idxArr;
@@ -883,7 +889,7 @@ internal static unsafe class FieldSubstitution
             idxArr = *(nint*) hdr;
             if (!NativeUtil.IsUserPtr(idxArr))
             {
-                return string.Empty;
+                return 0;
             }
         }
         else
@@ -901,7 +907,7 @@ internal static unsafe class FieldSubstitution
             {
                 if (k == 0)
                 {
-                    return string.Empty;
+                    return 0;
                 }
 
                 break;
@@ -913,7 +919,7 @@ internal static unsafe class FieldSubstitution
                 var child = *(nint*) (rec + 0x08);
                 if (!NativeUtil.IsUserPtr(child))
                 {
-                    return string.Empty;
+                    return 0;
                 }
 
                 serArr = child;
@@ -924,31 +930,31 @@ internal static unsafe class FieldSubstitution
             // precedes the data pointer at +0x30; fall back to a hard cap if it reads implausibly.
             if (!IndexInBounds(serArr, idxK))
             {
-                return string.Empty;
+                return 0;
             }
 
             var arr = *(nint*) (serArr + 0x30);
             if (!NativeUtil.IsUserPtr(arr))
             {
-                return string.Empty;
+                return 0;
             }
 
             rec = arr + idxK * 0x2E;
             if (!NativeUtil.IsUserPtr(rec))
             {
-                return string.Empty;
+                return 0;
             }
         }
 
         var pInfo = *(nint*) (rec + 0x00);
         if (!NativeUtil.IsUserPtr(pInfo))
         {
-            return string.Empty;
+            return 0;
         }
 
         leafRec = rec;
 
-        return NativeUtil.ResolveName(*(nint*) (pInfo + 0x08));
+        return *(nint*) (pInfo + 0x08);
     }
 
     // Windows: resolve the leafRec (record pointer) for a given flattened-leaf DFS index so Classify and
@@ -1165,8 +1171,7 @@ internal static unsafe class FieldSubstitution
                         continue;
                     }
 
-                    var name = NativeUtil.ReadShortAscii(*(nint*) (entry + 0x00), 32);
-                    var type = ClassifyEntry(bucket, name);
+                    var type = ClassifyEntry(bucket, *(nint*) (entry + 0x00));
                     if (type == FieldType.Unsupported)
                     {
                         continue;
@@ -1197,33 +1202,51 @@ internal static unsafe class FieldSubstitution
         => NativeUtil.IsUserPtr(_registryAddr) ? *(int*) (_registryAddr + bucket * 16 + 0x08) : 0;
 
     // Map (bucket, encoder-name) -> FieldType, matching the engine's encoder-registry semantics.
-    private static FieldType ClassifyEntry(int bucket, string name)
-        => bucket switch
+    // Known encoder names as UTF8 bytes — classification byte-compares the registry entry's name char*
+    // against these (no managed string built at load).
+    private static readonly byte[] _enDefault       = "default"u8.ToArray();
+    private static readonly byte[] _enFixed32        = "fixed32"u8.ToArray();
+    private static readonly byte[] _enFixed64        = "fixed64"u8.ToArray();
+    private static readonly byte[] _enQangle         = "qangle"u8.ToArray();
+    private static readonly byte[] _enQanglePitchYaw = "qangle_pitch_yaw"u8.ToArray();
+    private static readonly byte[] _enQanglePrecise  = "qangle_precise"u8.ToArray();
+    private static readonly byte[] _enNormal         = "normal"u8.ToArray();
+    private static readonly byte[] _enCoord          = "coord"u8.ToArray();
+    private static readonly byte[] _enCoordIntegral  = "coord_integral"u8.ToArray();
+
+    // Map an encoder registry entry's name char* (by bucket) to a FieldType via byte-compare. Bucket-3 names
+    // are exactly: default, qangle, normal, coord, coord_integral, qangle_pitch_yaw, qangle_precise. The
+    // "default" entry IS the quantized-float encoder (single-component quantized floats like m_flViewmodelFOV);
+    // the two extra qangle variants read the same float lanes as qangle.
+    private static FieldType ClassifyEntry(int bucket, nint name)
+    {
+        var def = NativeUtil.NameEquals(name, _enDefault);
+
+        return bucket switch
         {
-            1 => name switch { "default" => FieldType.Int32, "fixed32" => FieldType.Fixed32, "fixed64" => FieldType.Fixed64, _ => FieldType.Unsupported },
-            2 => name switch { "default" => FieldType.UInt32, "fixed32" => FieldType.Fixed32, "fixed64" => FieldType.Fixed64, _ => FieldType.Unsupported },
-            // Bucket-3 entry names are exactly (verified from the registry dump): default, qangle, normal,
-            // coord, coord_integral, qangle_pitch_yaw, qangle_precise. The "default" entry IS the quantized
-            // float encoder (single-component quantized floats like m_flViewmodelFOV); the two extra qangle
-            // variants read the same 2–3 float lanes as qangle. (Earlier "vector3"/"quantized" names were
-            // wrong — they don't exist in the registry — which left default/pitch_yaw/precise unhooked.)
-            3 => name switch
-            {
-                "default"          => FieldType.QuantizedFloat,
-                "qangle"           => FieldType.QAngle3,
-                "qangle_pitch_yaw" => FieldType.QAngle3,
-                "qangle_precise"   => FieldType.QAngle3,
-                "normal"           => FieldType.Normal3,
-                "coord"            => FieldType.Coord3,
-                "coord_integral"   => FieldType.CoordIntegral3,
-                _                  => FieldType.Unsupported,
-            },
-            4 => name == "default" ? FieldType.Float32 : FieldType.Unsupported,
-            5 => name == "default" ? FieldType.String : FieldType.Unsupported,
-            6 => name == "default" ? FieldType.ByteArray : FieldType.Unsupported,
-            7 => name == "default" ? FieldType.Bool : FieldType.Unsupported,
+            1 => def ? FieldType.Int32
+                : NativeUtil.NameEquals(name, _enFixed32) ? FieldType.Fixed32
+                : NativeUtil.NameEquals(name, _enFixed64) ? FieldType.Fixed64
+                : FieldType.Unsupported,
+            2 => def ? FieldType.UInt32
+                : NativeUtil.NameEquals(name, _enFixed32) ? FieldType.Fixed32
+                : NativeUtil.NameEquals(name, _enFixed64) ? FieldType.Fixed64
+                : FieldType.Unsupported,
+            3 => def ? FieldType.QuantizedFloat
+                : NativeUtil.NameEquals(name, _enQangle)
+                  || NativeUtil.NameEquals(name, _enQanglePitchYaw)
+                  || NativeUtil.NameEquals(name, _enQanglePrecise) ? FieldType.QAngle3
+                : NativeUtil.NameEquals(name, _enNormal) ? FieldType.Normal3
+                : NativeUtil.NameEquals(name, _enCoord) ? FieldType.Coord3
+                : NativeUtil.NameEquals(name, _enCoordIntegral) ? FieldType.CoordIntegral3
+                : FieldType.Unsupported,
+            4 => def ? FieldType.Float32 : FieldType.Unsupported,
+            5 => def ? FieldType.String : FieldType.Unsupported,
+            6 => def ? FieldType.ByteArray : FieldType.Unsupported,
+            7 => def ? FieldType.Bool : FieldType.Unsupported,
             _ => FieldType.Unsupported,
         };
+    }
 
     private static bool ValidateAddresses(ILogger logger)
     {

@@ -48,31 +48,6 @@ namespace YappersHQ.SendProxy.Native;
 // catch is the unmanaged-callback boundary).
 internal static unsafe class UniformEncoderHook
 {
-    // What the consumer asked to write. The hook checks this against the field's actual encoder type
-    // (so an int value isn't applied to a float field) and builds the scratch in that encoder's layout.
-    private enum ValueKind { Int, Float, Bool, Vector, String, Bytes }
-
-    private readonly struct Spoof
-    {
-        public readonly ValueKind Kind;
-        public readonly int       IntBits;
-        public readonly Vector3   Vec;
-        public readonly string?   Str;
-        public readonly byte[]?   Bytes;
-
-        public Spoof(ValueKind kind, int intBits, Vector3 vec, string? str, byte[]? bytes)
-        {
-            Kind    = kind;
-            IntBits = intBits;
-            Vec     = vec;
-            Str     = str;
-            Bytes   = bytes;
-        }
-    }
-
-    // Field name -> spoof. Uniform spoofs apply to every entity carrying a field of that name.
-    private static readonly ConcurrentDictionary<string, Spoof> _byName = new();
-
     // Hooked encoder fn -> (trampoline, FieldType). Read-only after Install.
     private static readonly Dictionary<nint, (nint Trampoline, FieldType Type)> _byFn = new();
     private static readonly List<IDetourHook> _hooks = new();
@@ -82,32 +57,6 @@ internal static unsafe class UniformEncoderHook
     private static IEntityManager? _entityManager;
 
     private const int MaxSubstituteBytes = 4096;
-
-    public static bool HasAny => !_byName.IsEmpty;
-
-    public static void SetInt(string field, int value)
-        => _byName[field] = new Spoof(ValueKind.Int, value, default, null, null);
-
-    public static void SetFloat(string field, float value)
-        => _byName[field] = new Spoof(ValueKind.Float, BitConverter.SingleToInt32Bits(value), default, null, null);
-
-    public static void SetBool(string field, bool value)
-        => _byName[field] = new Spoof(ValueKind.Bool, value ? 1 : 0, default, null, null);
-
-    public static void SetVector(string field, Vector3 value)
-        => _byName[field] = new Spoof(ValueKind.Vector, 0, value, null, null);
-
-    public static void SetString(string field, string value)
-        => _byName[field] = new Spoof(ValueKind.String, 0, default, value, null);
-
-    public static void SetBytes(string field, byte[] value)
-        => _byName[field] = new Spoof(ValueKind.Bytes, 0, default, null, value);
-
-    public static void Remove(string field)
-        => _byName.TryRemove(field, out _);
-
-    public static void Clear()
-        => _byName.Clear();
 
     // Install one detour per resolved encoder fn, all routed to SharedHook. Idempotent.
     public static bool Install(InterfaceBridge bridge, ILogger logger, IReadOnlyDictionary<nint, FieldType> encoderTypes)
@@ -157,7 +106,6 @@ internal static unsafe class UniformEncoderHook
 
         _hooks.Clear();
         _byFn.Clear();
-        _byName.Clear();
         _installed = false;
         _logger    = null;
     }
@@ -199,18 +147,22 @@ internal static unsafe class UniformEncoderHook
                 var entIdx = EncodeCapture.EntityIndex;
                 if (entIdx >= 0)
                 {
-                    var serName = EncodeCapture.SerializerName;
-                    var field   = NativeUtil.ReadFieldName(fieldInfo);
+                    // Match by the engine's stable name POINTERS (serializer + field) via byte-compare — no
+                    // managed string built on this per-field path. fieldInfo+0x08 = char* m_pszFieldName.
+                    var serNamePtr   = EncodeCapture.SerNamePtr;
+                    var fieldNamePtr = NativeUtil.IsUserPtr(fieldInfo) ? *(nint*) (fieldInfo + 0x08) : 0;
 
                     ProxyRegistry.Entry proxy = default;
-                    var matched = field.Length > 0 && ProxyRegistry.TryGet(serName, field, entIdx, out proxy);
+                    var matched = fieldNamePtr != 0
+                                  && ProxyRegistry.TryGetByPtr(serNamePtr, fieldNamePtr, entIdx, out proxy);
 
                     if (matched && proxy.Callback is not null)
                     {
                         var entity = em.FindEntityByIndex((EntityIndex) entIdx);
                         if (entity is not null)
                         {
-                            var ctx = new ProxyContext(entity, new ProxyField(field, MapKind(entry.Type)),
+                            // ProxyField.Name reuses the registration's own string — no new string here.
+                            var ctx = new ProxyContext(entity, new ProxyField(proxy.Field!, MapKind(entry.Type)),
                                 ReadOriginal(entry.Type, valuePtr), ProxyRegistry.RentPerClientBuffer());
 
                             var invoked = false;
@@ -221,7 +173,7 @@ internal static unsafe class UniformEncoderHook
                             }
                             catch (Exception ex)
                             {
-                                _logger?.LogWarning(ex, "SendProxy: proxy threw for \"{Ser}::{Field}\" — passthrough", serName, field);
+                                _logger?.LogWarning(ex, "SendProxy: proxy threw for \"{Ser}::{Field}\" — passthrough", proxy.Serializer, proxy.Field);
                             }
 
                             // SetFor (per-recipient): record the overrides for the per-client copy stage to
@@ -232,7 +184,7 @@ internal static unsafe class UniformEncoderHook
                             if (invoked && ctx.HasPerClient)
                             {
                                 var def = ctx.HasUniform ? ctx.UniformValue : ctx.Original;
-                                PerClientDispatch.Record(entIdx, field, entry.Type, in def, ctx.PerClientValues);
+                                PerClientDispatch.Record(entIdx, fieldNamePtr, entry.Type, in def, ctx.PerClientValues);
 
                                 if (!ctx.HasUniform && ctx.PerClientValues.Count > 0)
                                 {
@@ -258,114 +210,6 @@ internal static unsafe class UniformEncoderHook
                 }
             }
 
-            if (!_byName.IsEmpty)
-            {
-                var name = NativeUtil.ReadFieldName(fieldInfo);
-                if (name.Length > 0 && _byName.TryGetValue(name, out var sp))
-                {
-                    var scratch    = stackalloc byte[0x30];
-                    var stringSlot = stackalloc nint[1];
-
-                    // String and byte-array payloads must be allocated HERE, in SharedHook's own frame:
-                    // the engine encoder dereferences the value pointer during Invoke, so a buffer
-                    // stackalloc'd in a callee (TryBuildScratch) would already be reclaimed and the
-                    // encoder would walk freed stack → garbage on the wire. Scalars are written straight
-                    // into `scratch`, so they have no such lifetime issue and stay in TryBuildScratch.
-                    if (sp.Kind == ValueKind.String && entry.Type == FieldType.String)
-                    {
-                        var s       = sp.Str ?? string.Empty;
-                        var byteLen = Encoding.UTF8.GetByteCount(s);
-                        if (byteLen <= MaxSubstituteBytes)
-                        {
-                            var strBuf = stackalloc byte[byteLen + 1];
-                            Encoding.UTF8.GetBytes(s, new Span<byte>(strBuf, byteLen));
-                            strBuf[byteLen] = 0;
-                            *stringSlot    = (nint) strBuf;   // encoder reads *valuePtr as char*
-                            return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) stringSlot, extra);
-                        }
-                    }
-                    else if (sp.Kind == ValueKind.Bytes && entry.Type == FieldType.ByteArray)
-                    {
-                        var b = sp.Bytes ?? Array.Empty<byte>();
-                        if (b.Length <= MaxSubstituteBytes)
-                        {
-                            var buf = stackalloc byte[b.Length == 0 ? 1 : b.Length];
-                            for (var i = 0; i < b.Length; i++)
-                            {
-                                buf[i] = b[i];
-                            }
-
-                            for (var i = 0; i < 0x30; i++)
-                            {
-                                scratch[i] = 0;
-                            }
-
-                            *(nint*) (scratch + 0x00) = (nint) buf;     // {data*, +0x28 count}
-                            *(uint*) (scratch + 0x28) = (uint) b.Length;
-                            return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
-                        }
-                    }
-                    else if (sp.Kind == ValueKind.Vector && IsVectorScratchType(entry.Type))
-                    {
-                        // The vector family splits in two: qangle/normal/vector3 read 3 bare floats at
-                        // valuePtr+0; coord/coord_integral/quantized read a value STRUCT with a
-                        // component-count/mode at +0x28 and extra float lanes. Writing only 3 floats into a
-                        // bare scratch leaves +0x28 garbage → the struct encoders loop a garbage count and
-                        // corrupt the stream. So copy the REAL value struct (the original valuePtr, which
-                        // carries the correct +0x28 and layout) and patch the leading x/y/z. Correct for the
-                        // 3-float encoders (they read exactly the patched lanes) and safe for the struct
-                        // encoders (count/extra lanes preserved). Falls back to a zeroed scratch if the real
-                        // pointer is unreadable.
-                        if (NativeUtil.IsUserPtr(valuePtr))
-                        {
-                            for (var i = 0; i < 0x30; i++)
-                            {
-                                scratch[i] = *(byte*) (valuePtr + i);
-                            }
-                        }
-                        else
-                        {
-                            for (var i = 0; i < 0x30; i++)
-                            {
-                                scratch[i] = 0;
-                            }
-                        }
-
-                        ((float*) scratch)[0] = sp.Vec.X;
-                        ((float*) scratch)[1] = sp.Vec.Y;
-                        ((float*) scratch)[2] = sp.Vec.Z;
-                        return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
-                    }
-                    else if (sp.Kind == ValueKind.Float && IsStructFloatType(entry.Type))
-                    {
-                        // A float spoof on a struct-float encoder (single-component quantized float such as
-                        // m_flViewmodelFOV, or coord/normal). These read a value STRUCT (floats + a
-                        // count/mode at +0x28), NOT a bare double like the b4 float32 encoder — so copy the
-                        // real struct to preserve +0x28 and patch the leading component with the fake float.
-                        if (NativeUtil.IsUserPtr(valuePtr))
-                        {
-                            for (var i = 0; i < 0x30; i++)
-                            {
-                                scratch[i] = *(byte*) (valuePtr + i);
-                            }
-                        }
-                        else
-                        {
-                            for (var i = 0; i < 0x30; i++)
-                            {
-                                scratch[i] = 0;
-                            }
-                        }
-
-                        ((float*) scratch)[0] = BitConverter.Int32BitsToSingle(sp.IntBits);
-                        return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
-                    }
-                    else if (TryBuildScratch(in sp, entry.Type, scratch, stringSlot, out var fakeValuePtr))
-                    {
-                        return Invoke(tramp, bf, fieldInfo, paramsPtr, fakeValuePtr, extra);
-                    }
-                }
-            }
         }
         catch
         {
@@ -373,67 +217,6 @@ internal static unsafe class UniformEncoderHook
         }
 
         return Invoke(tramp, bf, fieldInfo, paramsPtr, valuePtr, extra);
-    }
-
-    // Build the fake value in the layout the field's actual encoder (targetType) reads, but only if the
-    // consumer's value kind is compatible with that encoder — otherwise pass through untouched (e.g. an
-    // int value registered against a float field, or a vector against a string). Returns false to skip.
-    private static bool TryBuildScratch(in Spoof sp, FieldType targetType, byte* scratch, nint* stringSlot, out nint valuePtr)
-    {
-        valuePtr = (nint) scratch;
-
-        switch (sp.Kind)
-        {
-            case ValueKind.Int:
-                switch (targetType)
-                {
-                    case FieldType.UInt32:
-                        *(ulong*) scratch = (uint) sp.IntBits;
-
-                        return true;
-                    case FieldType.Int32:
-                    case FieldType.Int64:
-                    case FieldType.Fixed32:
-                    case FieldType.Fixed64:
-                        *(long*) scratch = sp.IntBits;
-
-                        return true;
-                    default:
-                        return false;
-                }
-
-            case ValueKind.Float:
-                if (targetType != FieldType.Float32)
-                {
-                    return false;
-                }
-
-                *(double*) scratch = BitConverter.Int32BitsToSingle(sp.IntBits);
-
-                return true;
-
-            case ValueKind.Bool:
-                if (targetType != FieldType.Bool)
-                {
-                    return false;
-                }
-
-                *scratch = (byte) (sp.IntBits != 0 ? 1 : 0);
-
-                return true;
-
-            // Vector family is handled in SharedHook (it needs the original value struct to preserve the
-            // component-count/mode at +0x28 that coord/coord_integral/quantized read).
-            case ValueKind.Vector:
-                return false;
-
-            // String / ByteArray are handled in SharedHook (their payload buffer must live in the calling
-            // frame because the engine encoder dereferences it after this method would have returned).
-            case ValueKind.String:
-            case ValueKind.Bytes:
-            default:
-                return false;
-        }
     }
 
     // The encoder families a Vector spoof can drive — all read their components from valuePtr as floats
@@ -484,15 +267,11 @@ internal static unsafe class UniformEncoderHook
             case FieldType.Vector3:
                 return SpoofValue.Vector(new System.Numerics.Vector3(
                     ((float*) valuePtr)[0], ((float*) valuePtr)[1], ((float*) valuePtr)[2]));
-            case FieldType.String:
-            {
-                var p = *(nint*) valuePtr; // encoder reads *valuePtr as char*
-                return NativeUtil.IsUserPtr(p)
-                    ? SpoofValue.String(NativeUtil.ReadShortAscii(p, 256))
-                    : default;
-            }
+            // String / ByteArray: Original is left empty. Materializing a String field's live value here
+            // would allocate a managed string on the encode path; proxies that need the original string can
+            // read it from the entity via schema. (The substitute value the callback SETS is unaffected.)
             default:
-                return default; // ByteArray / unknown — leave Original empty
+                return default;
         }
     }
 

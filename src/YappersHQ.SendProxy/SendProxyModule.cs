@@ -145,7 +145,8 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener, IGameLis
         PerClientDispatch.Clear();
         RecipientCapture.Uninstall();
         FieldSubstitution.Uninstall();
-        NativeUtil.ClearNameCache();
+        FieldSubstitution.ClearWindowsIndex();
+        ProxyRegistry.ClearPtrCaches();
         _bridge.EntityManager.RemoveEntityListener(this);
         _bridge.ModSharp.RemoveGameListener(this);
     }
@@ -179,10 +180,13 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener, IGameLis
     int IGameListener.ListenerVersion  => IGameListener.ApiVersion;
     int IGameListener.ListenerPriority => 0;
 
-    // Drop the interned-name cache when a new level activates — see InstallGameListener note in PostInit.
+    // Drop the pointer-resolution caches when a new level activates — see InstallGameListener note in PostInit.
     // Runs on the main thread during level setup (no snapshot packing in flight), so the clear is safe.
     void IGameListener.OnServerActivate()
-        => NativeUtil.ClearNameCache();
+    {
+        ProxyRegistry.ClearPtrCaches();
+        FieldSubstitution.ClearWindowsIndex();
+    }
 
     #endregion
 
