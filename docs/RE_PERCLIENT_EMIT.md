@@ -1,12 +1,10 @@
 # Per-client emit RE — root-cause analysis (libnetworksystem.so)
 
-Overnight RE session 2026-06-15. Goal: find why per-client field substitution fires
-`SUBST-FAKE` (correct value + slot bits) but the client still sees the real value, while
-the **uniform** path (encoder hook during shared pack) works.
+Root-cause analysis of why a per-client field substitution could write the correct value +
+slot bits yet the client still see the real value, while the **uniform** path (encoder hook
+during the shared pack) works.
 
-All addresses are **file offsets**; Ghidra addr = file + 0x100000. Binary:
-`libnetworksystem.so`. Decompiles captured in `cs2-bins/re-dumps/sp_noop_raw.log`
-(script `ghidra_scripts/SPNoOpRE.java`).
+All addresses are **file offsets**; Ghidra addr = file + 0x100000. Binary: `libnetworksystem.so`.
 
 ## The per-client write path, end to end (decompile-cited)
 
@@ -151,10 +149,8 @@ engine's own `BitCopyPrimitive`, identical to the working uniform path.
    field's own encoder into it, read `encodedBits` from scratch+0x10, bail on overflow/zero,
    advance the real `src` cursor by `bitcount`, rewind scratch to 0, and
    `CallOriginal(dst, scratch, encodedBits)`.
-3. Two capped diagnostics for the one confirming deploy: `SUBST-EMIT` (encodedBits, bitcount,
-   first two scratch bytes, dst cursor before) and `SUBST-EMIT-DONE` (copyOk, dst cursor
-   after). If the dst cursor advances by `encodedBits`, the fake bits landed in the value
-   buffer.
+3. Verify: after the copy, the destination `bf_write` cursor advances by exactly `encodedBits`
+   — confirming the fake bits landed in the value buffer.
 
 ## SendFake (one-shot push) — mechanism, verified
 
@@ -172,26 +168,11 @@ Goal: push a fake to a single client *now*, without a persistent hook, then opti
   `RecipientCapture.CurrentClient`). In `ValueCopyHook`, non-target clients pass through; the
   target client gets the fake via the same redirect-src emit and the registration self-removes.
 
-`SendFake` therefore rides the exact same emit path as per-client `Hook` — confirming that
-path is the single thing the morning deploy must validate.
+`SendFake` therefore rides the exact same emit path as per-client `Hook` — so that emit path
+is the single thing per-client correctness hinges on.
 
 > **Dependency note:** entity-scoped registrations (entity `Hook` and `SendFake`) match on the
 > runtime entity index from `WriteDeltaEntity` ctx+0x34 (`WdeEntityCaptureHook`). If that
 > capture is unreliable, the ent-scoped lookup misses → passthrough. The all-entities `Hook`
-> path does not depend on it. Check the `SUBST-EMIT` log shows the expected `ent` on test.
+> path does not depend on it.
 
-## Morning test plan (one deploy)
-
-1. Deploy build to `ttt`, rewrite + readback-verify gamedata (`yappershq.sendproxy.jsonc`,
-   buckets 1–7 present), delete any nested `gamedata/gamedata/`, restart. (Gamedata was **not**
-   changed this session — same file as before.)
-2. `sp_setpc CCSPlayerController m_iPawnHealth int`, then `slap @me 1`. Watch logs:
-   - `SUBST-EMIT … encodedBits=N bitcount=8 scratch=[XX YY] dstCursorBefore=…`
-   - `SUBST-EMIT-DONE … copyOk=… dstCursorAfter=…`  ⇒ `dstCursorAfter - dstCursorBefore == N`.
-   - If the cursor advanced by N and the HUD shows the fake (1–64), per-client works.
-3. `sp_sendfake 1337` — HUD should show 1337 once on the next update (one-shot), then revert.
-4. If the cursor advances but the HUD still shows real: the fake bits *are* in the value
-   buffer, so the gap is upstream (path-stream/decoder) — capture a fresh `SUBST-EMIT` set and
-   re-RE `FUN_005064c0` (the flush) vs the client decoder.
-5. Once confirmed: strip `PCDIAG`, `SUBST-FAKE`, `SUBST-EMIT*`, the boot encoder-map diag, and
-   `LogDiscoveredField`.

@@ -215,12 +215,6 @@ Deploy:
 The gamedata source is `.assets/gamedata/yappershq.sendproxy.jsonc`. `GameData.Register("yappershq.sendproxy")`
 loads it from `<sharp>/gamedata/yappershq.sendproxy.jsonc`.
 
-> ⚠️ **`modsharp-deploy` gamedata-nesting gotcha:** the deploy step can nest the asset into a
-> `gamedata/gamedata/` subfolder (build copy + deploy copy double up), leaving the file the server
-> actually loads at `<sharp>/gamedata/yappershq.sendproxy.jsonc` stale or missing. After deploying,
-> write the gamedata **directly** to `/game/sharp/gamedata/yappershq.sendproxy.jsonc` rather than
-> trusting the deploy step.
-
 ## Lifecycle & safety
 
 Hook lifecycle is managed so a consumer can't dangle a registration and crash the server (mirrors how

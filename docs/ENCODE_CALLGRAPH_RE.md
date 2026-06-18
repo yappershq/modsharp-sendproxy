@@ -106,7 +106,7 @@ PackEntities_Normal (per-frame, too coarse). The `PackWork_t` lambda is the only
 **IMPLEMENTED.** The gamedata entry `CFlattenedSerializer::EncodeEntity` is present (linux prologue sig
 `55 48 89 E5 41 57 41 56 41 55 41 54 … 48 83 EC 88`, windows `0x1800a5160`). `EncodeCapture` hooks
 `0x38a130`; reads entity index from r8d and serializer from *(arg2+8); re-entrancy guard installed.
-Live-validated on ttt: no crash, proxy fires once per (entity, field) as expected.
+Live-validated: no crash, proxy fires once per (entity, field) as expected.
 
 ## Phase ordering: PackEntities vs per-client send (why in-place SetFor reuse is safe)
 

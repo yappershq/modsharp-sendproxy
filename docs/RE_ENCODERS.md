@@ -2,8 +2,7 @@
 
 Every per-field encoder has the ABI `enc(rdi=bf_write*, rsi=fieldInfo*, rdx=paramsPtr,
 rcx=valuePtr, r8d=extra) -> ret`. What differs per encoder is **how it reads `valuePtr` (rcx)**.
-A substitution must build the scratch in exactly that layout or the wire is garbage. Decompiled
-2026-06-16 (`ghidra_scripts/SPAllEncoders.java`, `cs2-bins/re-dumps/sp_allenc_raw.log`). File
+A substitution must build the scratch in exactly that layout or the wire is garbage. File
 offsets; Ghidra addr = file + 0x100000.
 
 | Bucket / name | file | reads valuePtr as | our scratch | OK? |

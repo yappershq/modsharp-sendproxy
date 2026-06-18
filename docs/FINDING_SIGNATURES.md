@@ -215,7 +215,7 @@ share one project:
 
 ```
 $GHIDRA/support/analyzeHeadless <projDir> <projName> -process <binary> \
-    -noanalysis -readOnly -scriptPath /home/claude/ghidra_scripts -postScript <Script>.java [args]
+    -noanalysis -readOnly -scriptPath <path-to>/ghidra_scripts -postScript <Script>.java [args]
 ```
 
 | Script | Purpose |
