@@ -5,18 +5,19 @@ what clients *receive* for a networked entity field and substitute the value —
 real server-side state**. (SourceMod's `SendProxyManager` was a conceptual reference only; the API is
 ModSharp-native — see the unified `SpoofValue` API below.)
 
-A consumer plugin asks the `ISendProxyManager` interface to spoof a field; the library installs the
-necessary native detours into CS2's serializer/send path and rewrites the per-client bit-stream as
-each snapshot is encoded. Three targeting modes:
+A consumer plugin resolves the `IProxyManager` interface and registers a `ProxyCallback` for a
+`(serializerName, fieldName)` pair. The callback fires **once per (entity, field)** during the
+shared `PackEntities` pass — never per client — and uses `SetAll` / `SetFor` to declare the
+substituted value. Three targeting modes:
 
-- **Uniform** — every client sees the same fake value for the field (`SetUniform`).
-- **Per-client** — one `SendProxyCallback` returns a (potentially different) value *per recipient*
-  (`Hook`), reading/writing a tagged `SpoofValue`.
-- **Per-entity** — scope a spoof or callback to a single `IBaseEntity` (`SetUniform(entity, ...)` /
-  `Hook(entity, ...)`).
+- **Uniform** (`SetAll`) — every client sees the same substituted value for that field.
+- **Per-client** (`SetFor`) — each call to `SetFor` in the callback gives a specific client its own
+  value; clients without an override see the real value. Per-viewer effects (ESP, etc.).
+- **Per-entity** — the `Register(entity, …)` overload scopes a proxy to a single `IBaseEntity`;
+  wins over the all-entities proxy when both exist.
 
 Values flow through one `SpoofValue` type (factories `SpoofValue.Int/Float/Bool/Vector/String/Bytes`;
-typed `v.AsInt`/`v.AsFloat`/… accessors in callbacks) — a single API surface for every field type.
+typed `v.AsInt`/`v.AsFloat`/… accessors) — a single API surface for every field type.
 
 > **Why this is hard on CS2:** Source 1's SendProxy swapped each `SendProp`'s `m_pProxyFn`, a
 > per-field function the engine called *while serializing each client's snapshot* — so per-client
@@ -55,24 +56,24 @@ the int32 encoder against its own standalone signature) and builds a fn-pointer 
 per-field hot path is then a single dictionary lookup of the field's live dispatch fn. There is no
 heuristic runtime registry walk on the send path.
 
-## Consumer API — `ISendProxyManager`
+## Consumer API — `IProxyManager`
 
 ### Resolving the interface
 
-`ISendProxyManager` is published in the library's `PostInit`. ModSharp does **not** order
+`IProxyManager` is published in the library's `PostInit`. ModSharp does **not** order
 `PostInit`/`OnAllModulesLoaded` across plugins, but it does guarantee every plugin's `PostInit`
 finishes before any `OnAllModulesLoaded` fires — so resolve the interface in **`OnAllModulesLoaded`**,
 not `Init`/`PostInit`. Cache the reference for the plugin's lifetime.
 
 ```csharp
-private ISendProxyManager? _sendProxy;
+private IProxyManager? _proxy;
 
 public void OnAllModulesLoaded()
 {
-    _sendProxy = _modules
-        .GetOptionalSharpModuleInterface<ISendProxyManager>(ISendProxyManager.Identity)?.Instance;
+    _proxy = _modules
+        .GetOptionalSharpModuleInterface<IProxyManager>(IProxyManager.Identity)?.Instance;
 
-    if (_sendProxy is null)
+    if (_proxy is null)
         _logger.LogWarning("SendProxy not loaded — feature disabled");
 }
 ```
@@ -81,131 +82,121 @@ public void OnAllModulesLoaded()
 
 All registration is through two overload families:
 
-- `Hook(serializerName, fieldName, callback)` — per-client callback, all entities of that serializer.
-- `Hook(entity, serializerName, fieldName, callback)` — per-client callback, scoped to one `IBaseEntity`.
-- `SetUniform(serializerName, fieldName, value)` — same value for every client, all entities.
-- `SetUniform(entity, serializerName, fieldName, value)` — same value for every client, single entity.
-- `Unhook(serializerName, fieldName)` — remove all-entities registration.
-- `Unhook(entity, serializerName, fieldName)` — remove single-entity registration.
-- `UnhookAll()` — remove every registration and uninstall the substitution detours.
-- `IsHooked(serializerName, fieldName)` — returns true if any registration exists for that field.
+- `Register(serializerName, fieldName, callback)` — proxy for every entity of that serializer.
+- `Register(entity, serializerName, fieldName, callback)` — proxy scoped to one `IBaseEntity`
+  (wins over the all-entities proxy for that entity).
+- `Unregister(serializerName, fieldName)` — remove the all-entities proxy for this field.
+- `Unregister(entity, serializerName, fieldName)` — remove the proxy scoped to one entity.
+- `IsRegistered(serializerName, fieldName)` — returns `true` if any proxy exists for that field.
 
-There's a single callback delegate — `SendProxyCallback(nint client, int entityIndex, ref SpoofValue value)`
-— and a single value type, `SpoofValue`, used by both `Hook` (callback) and `SetUniform`/`SendFake`
-(fixed value). Build a value with `SpoofValue.Int(…)` / `.Float(…)` / `.Bool(…)` / `.Vector(…)` /
-`.String(…)` / `.Bytes(…)`; inside a callback, read/write `value.AsInt` / `.AsFloat` / `.AsBool` /
-`.AsVector` / `.AsString` / `.AsBytes`.
+The callback delegate is `ProxyCallback`: `public delegate void ProxyCallback(ref ProxyContext ctx)`.
+The `ProxyContext` carries `Entity`, `Field` (`.Name` + `.Kind`), `Original` (the real value the
+engine would send), and the `SetAll`/`SetFor` output methods.
 
-`SendFake(client, entity, serializerName, fieldName, in SpoofValue)` pushes a one-shot fake to a single
-client. Per-entity registrations win over all-entities registrations for that entity when both exist.
-Detours install lazily on first registration. `SetForceResend(bool)` toggles live application (see below).
+`SpoofValue` is the value type used everywhere — build one with `SpoofValue.Int(…)` / `.Float(…)` /
+`.Bool(…)` / `.Vector(…)` / `.String(…)` / `.Bytes(…)`; read its contents with `.AsInt` / `.AsFloat` /
+`.AsBool` / `.AsVector` / `.AsString` / `.AsBytes`. `.Kind` is a `SpoofKind` enum: `Int, Float, Bool,
+Vector, String, Bytes`.
 
-### Uniform spoof (all clients, all entities)
+### Performance & thread-safety
+
+The callback fires **once per (entity, field)** during the shared `PackEntities` pass —
+**O(1) in player count**, never per recipient. `SetAll` writes the shared snapshot so it enters
+every client's delta naturally (no extra cost). `SetFor` overrides are applied at the per-client
+bit-copy stage — still only one managed call per entity per tick.
+
+Callbacks run on a **pack worker thread**. They are never invoked concurrently for the same
+(entity, field), so there is no race on their own local state, but the callback **must not** call
+main-thread-only engine APIs or mutate shared state without guards — read schema / compute values
+only.
+
+### Uniform proxy (all clients, all entities)
 
 ```csharp
-// Everyone sees 1337 HP on every player pawn; real m_iHealth still drives damage/death.
-_sendProxy.SetUniform("CCSPlayerPawn", "m_iHealth", SpoofValue.Int(1337));
+// Every client sees 1 HP for every player pawn; real m_iHealth still drives damage/death.
+_proxy.Register("CCSPlayerPawn", "m_iHealth", static (ref ProxyContext ctx) =>
+{
+    ctx.SetAll(SpoofValue.Int(1));
+});
 
 // Force a string field to a fixed value for all clients.
-_sendProxy.SetUniform("CCSGameRulesProxy", "m_szMatchStatTxt", SpoofValue.String("custom text"));
+_proxy.Register("CCSGameRulesProxy", "m_szMatchStatTxt", static (ref ProxyContext ctx) =>
+{
+    ctx.SetAll(SpoofValue.String("custom text"));
+});
 ```
 
-### Per-client callback
+### Per-client (per-viewer) proxy
 
-The callback runs as each client's snapshot is encoded; return `true` to substitute the value you
-wrote via `ref`, `false` to leave the original.
+`SetFor` lets the callback give specific clients a different value. Clients that do not receive a
+`SetFor` call see the real value.
 
 ```csharp
-// Per-client int — each recipient sees a value derived from their client pointer.
-_sendProxy.Hook("CCSPlayerPawn", "m_iHealth",
-    (nint client, int entityIndex, ref SpoofValue value) =>
-    {
-        value.AsInt = SomeLookup(client);
-        return true;
-    });
+// Only `viewer` sees this pawn's health as 1 — every other client sees the real value.
+_proxy.Register(pawn, "CCSPlayerPawn", "m_iHealth", (ref ProxyContext ctx) =>
+{
+    ctx.SetFor(viewer, SpoofValue.Int(1));
+});
 
-// Per-client string field.
-_sendProxy.Hook("SomeSerializer", "m_szSomeField",
-    (nint client, int entityIndex, ref SpoofValue value) =>
-    {
-        value.AsString = GetStringForClient(client);
-        return true;
-    });
+// All-entities: every pawn, but still only viewer sees the fake.
+_proxy.Register("CCSPlayerPawn", "m_iHealth", (ref ProxyContext ctx) =>
+{
+    ctx.SetFor(viewer, SpoofValue.Int(1));
+});
 ```
 
-#### Callback contract — read before writing one
-
-- **Runs on the engine's send worker threads** (~6 of them). The callback **must be thread-safe and
-  fast** — no locks held long, no blocking, no allocation on the hot path. Capture immutable data by
-  value or index into a pre-sized slot array.
-- **`client`** is the raw `CServerSideClient*` (`nint`) for the recipient. Use as an opaque key;
-  do not dereference from managed code.
-- **`entityIndex`** is the entity currently being sent (`-1` if not captured).
-- **Return `false`** to leave the original value for that client; **`true`** to substitute the value
-  you wrote into the `ref SpoofValue` (via `value.AsInt`/`.AsFloat`/…). The `SpoofValue` is seeded
-  with the registered uniform value, or the type zero/empty if none is registered.
-- A throwing callback is caught and treated as passthrough for that field/client.
-
-### Per-entity targeting
+### Per-entity proxy
 
 ```csharp
-// All clients see 1 HP for one specific entity; other pawns unaffected.
-_sendProxy.SetUniform(someEntity, "CCSPlayerPawn", "m_iHealth", SpoofValue.Int(1));
+// Scope a proxy to one specific entity; other entities of the same serializer are unaffected.
+_proxy.Register(someEntity, "CCSPlayerPawn", "m_iHealth", static (ref ProxyContext ctx) =>
+{
+    ctx.SetAll(SpoofValue.Int(1));
+});
 
-// Per-client callback scoped to one entity.
-_sendProxy.Hook(someEntity, "CCSPlayerPawn", "m_iHealth",
-    (nint client, int entityIndex, ref SpoofValue value) => { value.AsInt = 1; return true; });
+// Per-client + per-entity.
+_proxy.Register(someEntity, "CCSPlayerPawn", "m_iHealth", (ref ProxyContext ctx) =>
+{
+    ctx.SetFor(viewer, SpoofValue.Int(1));
+});
 ```
 
 `someEntity` is an `IBaseEntity` reference resolved at registration time. Do not store `IBaseEntity`
-long-term — resolve it fresh, call the registration once, then let the reference go.
+long-term — resolve it fresh, call `Register`, then let the reference go.
 
-### Unhooking
+### Unregistering
 
 ```csharp
-_sendProxy.Unhook("CCSPlayerPawn", "m_iHealth");           // remove all-entities registration
-_sendProxy.Unhook(someEntity, "CCSPlayerPawn", "m_iHealth"); // remove single-entity registration
-_sendProxy.UnhookAll();                                     // remove everything + uninstall detours
+_proxy.Unregister("CCSPlayerPawn", "m_iHealth");           // remove all-entities proxy
+_proxy.Unregister(someEntity, "CCSPlayerPawn", "m_iHealth"); // remove per-entity proxy
 ```
 
-Call `UnhookAll()` in your plugin's `Shutdown()` — it clears all registrations and uninstalls the
-native detours, avoiding dangling delegate references.
+Call `Unregister` in your plugin's `Shutdown()` to clear registrations promptly.
 
 ## Example plugin
 
-`YappersHQ.SendProxy.Example` is a working consumer of the interface. The core library itself ships
-**no commands** — all demo/diagnostic commands live in the example and are registered through ModSharp's
-**AdminManager** (admin-gated, dispatched from chat `!cmd` / `sm_cmd`, the server console and RCON).
-They require the `sendproxy:example` permission; grant it (or `*`) via your admin source. The example
-resolves AdminManager in `OnAllModulesLoaded` and retries in `OnLibraryConnected` (so it survives
-CommandCenter loading late); AdminManager auto-unregisters the commands on disconnect.
+`YappersHQ.SendProxy.Example` is a working consumer of the interface. All commands are admin-gated
+via ModSharp's **AdminManager** and dispatched from chat `!cmd` / `sm_cmd`, the server console, or
+RCON. They require the `sendproxy:example` permission (grant it or `*` via your admin source). The
+example resolves `AdminManager` in `OnAllModulesLoaded` and retries in `OnLibraryConnected` (so it
+survives CommandCenter loading late); AdminManager auto-unregisters the commands on disconnect.
 
-It is a **test matrix**: the generic commands hit any encoder type, on any field, in any mode, with no
-recompile. `<type>` is one of `int uint float bool vec string bytes` (mapping: `int`→bucket 1, `uint`→2,
-`vec`→3 qangle/vector/coord/quantized, `float`→4, `string`→5, `bytes`→6, `bool`→7). `vec` takes three
-floats; `string` takes free text; `bytes` takes a contiguous hex string (e.g. `DEADBEEF`).
+The example is a **test matrix** for the new proxy-field API. Commands registered in the source:
 
 | Command | Demonstrates |
 |---|---|
-| `sp_set <ser> <field> <type> <value...>` | **Uniform** spoof (all clients) — dispatches to the matching `SetUniform` overload |
-| `sp_setpc <ser> <field> <type>` | **Per-client** callback — registers a `Hook(...)` proxy whose value varies per recipient |
-| `sp_setent <idx> <ser> <field> <type> <value...>` | **Per-entity** uniform spoof — `SetUniform(entity, ...)` scoped to one entity |
-| `sp_unset <ser> <field>` | `Unhook` the all-entities registration for a field |
-| `sp_clear` | `UnhookAll` — clear everything, uninstall the substitution detours |
-| `sp_help` | Print the matrix + ready-to-paste examples |
-| `sp_sendfake <value>` | **SendFake** one-shot — push a fake HP to the issuer once (force-dirty + fire once), no persistent hook |
-| `sp_fakeaim <target>` | **Per-client + per-entity** showcase — resolve a target string via TargetingManager (`@aim`, a nick, `@t`, multi) and fake each target's HP/team/cycling-colour/glow **only to the issuer** |
-| `sp_fakeaim_off` | Tear down `sp_fakeaim` + re-send the real values |
-| `sp_fakehp <value>` | Preset — `SetUniform("CCSPlayerPawn","m_iHealth", value)` |
-| `sp_fakename <text>` | Preset — `SetUniform("CCSPlayerController","m_iszPlayerName", text)` (b5 string) |
-| `sp_encoder1`..`sp_encoder7` | One canned visible demo per encoder bucket — 1 int `m_iPawnHealth`+`m_iHealth`=1337, 2 uint `m_iTeamNum` (pawn+controller — all appear CT), 3 qangle `m_angEyeAngles` (spectate a target to see), 4 float `m_flScale`=0.3 (tiny players), 5 string `m_iszPlayerName`, 6 bytes (none common — guidance), 7 bool `m_bIsScoped`. Each force-resends so it shows at once |
-| `sp_encoders_off` | Revert all `sp_encoder1..7` demos (re-sends real values) |
-| `sp_probe_scan` | Read-only serializer probe — list live entities + classes, dump the first |
-| `sp_probe_dump <entityIndex>` | Read-only — dump one entity's serializer class info / field[0] |
-| `sp_probe_field <serializerClass> <fieldName>` | Read-only — dump a field record's qword window (RE aid) |
+| `sp_proxy <ser> <field> <int\|float\|bool> <value>` | **Uniform** proxy via `Register` + `SetAll` — every client sees the value |
+| `sp_proxy_off <ser> <field>` | `Unregister` the all-entities proxy for a field |
+| `sp_proxyfor <ser> <field> int <value>` | **Per-viewer** proxy via `Register` + `SetFor` — only the issuer sees the fake value |
+| `sp_proxyfor_off <ser> <field>` | `Unregister` the proxy registered by `sp_proxyfor` |
+| `sp_fakeaim [target]` | **Per-client + per-entity** showcase — resolve a target via TargetingManager (`@aim`, a nick, `@t`, multi) and fake each target's HP/team/cycling-colour/glow **only to the issuer** |
+| `sp_fakeaim_off` | Tear down `sp_fakeaim` + re-dirty so real values go back out |
 
-Examples: `sp_set CCSPlayerPawn m_iHealth int 1337` · `sp_set CCSPlayerController m_iszPlayerName string Hacker`
-· `sp_setpc CCSPlayerPawn m_iHealth int` (each client a different HP) · `sp_setent 3 CCSPlayerPawn m_iHealth int 1`.
+Examples:
+- `sp_proxy CCSPlayerPawn m_iHealth int 1` — every client sees 1 HP on every pawn
+- `sp_proxyfor CCSPlayerPawn m_iHealth int 1` — only you see 1 HP
+- `sp_fakeaim @aim` — fake HP/team/colour/glow on whoever you're aiming at, only for you
+- `sp_proxy_off CCSPlayerPawn m_iHealth` — remove the proxy
 
 ## Build / deploy
 
@@ -235,18 +226,19 @@ loads it from `<sharp>/gamedata/yappershq.sendproxy.jsonc`.
 Hook lifecycle is managed so a consumer can't dangle a registration and crash the server (mirrors how
 SourceMod's SendProxyManager purges hooks on plugin unload / entity removal):
 
-- **Consumer module unload** — every per-client callback records the assembly that registered it. When
-  that module disconnects (`OnLibraryDisconnect`), its callbacks are purged automatically, so the send
-  path never invokes a delegate into an unloaded `AssemblyLoadContext`. You should still call `Unhook`
-  in your own `Shutdown` for promptness, but forgetting to won't crash anything.
-- **Entity removal** — entity-scoped registrations are dropped on `OnEntityDeleted` (entity indices are
-  reused after disconnect / round restart, so stale scoping can't bleed onto a new entity).
-- **Client disconnect** — the per-client path stores **no** per-client state; the recipient is captured
-  transiently (`[ThreadStatic]`) only for the duration of that client's own encode, so a disconnect
-  needs no cleanup.
-- **Dispatch is stateless & guarded** — each field is re-resolved per call (no stored entity pointers),
-  every native read is `IsUserPtr`-gated, and any field whose encoder isn't a known substitutable type
-  classifies as `Unsupported` and passes through untouched. A throwing callback is caught → passthrough.
+- **Consumer module unload** — every callback records the assembly that registered it. When that
+  module disconnects (`OnLibraryDisconnect`), its callbacks are purged automatically, so the send
+  path never invokes a delegate into an unloaded `AssemblyLoadContext`. You should still call
+  `Unregister` in your own `Shutdown` for promptness, but forgetting to won't crash anything.
+- **Entity removal** — entity-scoped registrations are dropped on `OnEntityDeleted` (entity indices
+  are reused after disconnect / round restart, so stale scoping can't bleed onto a new entity).
+- **Client disconnect** — the per-client path stores **no** per-client state; the recipient is
+  captured transiently only for the duration of that client's own encode, so a disconnect needs no
+  cleanup.
+- **Dispatch is stateless & guarded** — each field is re-resolved per call (no stored entity
+  pointers), every native read is `IsUserPtr`-gated, and any field whose encoder isn't a known
+  substitutable type classifies as `Unsupported` and passes through untouched. A throwing callback
+  is caught → passthrough.
 
 ## Status / caveats
 
@@ -259,11 +251,19 @@ SourceMod's SendProxyManager purges hooks on plugin unload / entity removal):
   relink that only shifts addresses is fine; a code change to a hooked engine function is not.
   Re-derive on engine updates with **[`docs/FINDING_SIGNATURES.md`](docs/FINDING_SIGNATURES.md)** and the
   offsets/sig notes in **[`docs/REVERSE_ENGINEERING.md`](docs/REVERSE_ENGINEERING.md)**.
-- **Cross-platform:** Linux is the validated platform. Windows signatures are in the gamedata (each
-  verified by side-by-side decompile vs its Linux twin) but the Windows substitution path awaits live
-  validation on a Windows server — see `docs/FORCE_RESEND.md` / `docs/FINDING_SIGNATURES.md`.
-- **Live application:** a freshly-registered spoof on an unchanged field applies on the next full update
-  by default; `SetForceResend(true)` makes it apply live (gated off — see `docs/FORCE_RESEND.md`).
+- **Cross-platform — ⚠️ Windows is UNTESTED LIVE, help wanted.** Linux is fully validated. Every Windows
+  signature is in the gamedata, derived by side-by-side decompile vs its Linux twin (the `EncodeEntity`
+  capture wrapper's entity-index read at `[rsp+0x28]` is proven end-to-end against `Encode`'s `entity %d`
+  log — see the gamedata note), but **no part of the Windows path has been run on a live Windows server.**
+  If you can test on Windows, please verify and open an issue with the result:
+  1. Plugin loads — boot log shows `EncodeCapture midhook installed @ 0x...` (no "address not resolved").
+  2. `sp_proxy CCSPlayerPawn m_iHealth int 1` → all clients see 1 HP, **no crash on player join**.
+  3. `sp_proxyfor` → the per-viewer value shows only to the issuer; everyone else sees the real value.
+  4. An entity-scoped proxy hits the right entity (sanity-checks the `[rsp+0x28]` entity-index read).
+  See `docs/FINDING_SIGNATURES.md` for re-deriving the sigs if a game update breaks them.
+- **Live application:** a freshly-registered proxy on an unchanged field applies on the next full
+  update by default; force the field dirty with `entity.NetworkStateChanged("fieldName")` to show it
+  immediately (see `docs/FORCE_RESEND.md`).
 
 ## Documentation
 
@@ -272,11 +272,10 @@ SourceMod's SendProxyManager purges hooks on plugin unload / entity removal):
 - **[`docs/FINDING_SIGNATURES.md`](docs/FINDING_SIGNATURES.md)** — human Ghidra/IDA guide to (re-)deriving every signature, with the Windows-specific gotchas.
 - **[`docs/FORCE_RESEND.md`](docs/FORCE_RESEND.md)** — live application of a per-client spoof (why the delta is value-compared, and the gated `SetForceResend` design).
 - **[`docs/MERGE_READINESS.md`](docs/MERGE_READINESS.md)** — review notes for bundling into ModSharp core.
+- **[`docs/ENCODE_CALLGRAPH_RE.md`](docs/ENCODE_CALLGRAPH_RE.md)** — crash/hook-type analysis for the per-entity encode wrapper hook.
 
 ## License & attribution
 
 AGPL-3.0. Signature tooling in `tools/` vendors
 [nosoop's `makesig`](https://github.com/nosoop/ghidra_scripts/blob/master/makesig.py)
 (attribution kept in `tools/README.md`).
-</content>
-</invoke>

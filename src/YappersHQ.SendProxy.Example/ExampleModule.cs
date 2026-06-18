@@ -31,11 +31,10 @@ using YappersHQ.SendProxy.Shared;
 namespace YappersHQ.SendProxy.Example;
 
 /// <summary>
-///     Example consumer of <see cref="ISendProxyManager"/> — a field-substitution test bench. The generic
-///     commands (<c>sp_set</c> / <c>sp_setpc</c> / <c>sp_setent</c>) exercise every encoder type across
-///     every mode against any field, so a tester can hit the whole matrix without recompiling; a handful
-///     of presets and the read-only serializer probe round it out. All commands are AdminManager-gated;
-///     the Core library ships none.
+///     Example consumer of <see cref="IProxyManager"/> — a field-substitution test bench. The proxy
+///     commands (<c>sp_proxy</c> / <c>sp_proxyfor</c>) exercise per-entity spoofs via the new proxy API;
+///     FakeAim shows per-viewer issuer-only fakes; ProbeCommands handles serializer introspection.
+///     All commands are AdminManager-gated; the Core library ships none.
 /// </summary>
 public sealed class ExampleModule : IModSharpModule
 {
@@ -46,9 +45,6 @@ public sealed class ExampleModule : IModSharpModule
 
     private readonly ILogger<ExampleModule>  _logger;
     private readonly ISharpModuleManager     _modules;
-
-    private IModSharpModuleInterface<ISendProxyManager>? _sendProxyHandle;
-    private ISendProxyManager?                           _sendProxy => _sendProxyHandle?.Instance;
 
     private IModSharpModuleInterface<IAdminManager>? _adminManager;
     private bool                                     _commandsRegistered;
@@ -95,27 +91,24 @@ public sealed class ExampleModule : IModSharpModule
     // (ModSharp guarantees all PostInits run before any OnAllModulesLoaded).
     public void OnAllModulesLoaded()
     {
-        _sendProxyHandle = _modules.GetOptionalSharpModuleInterface<ISendProxyManager>(ISendProxyManager.Identity);
+        var proxyHandle = _modules.GetOptionalSharpModuleInterface<IProxyManager>(IProxyManager.Identity);
+        var targeting   = _modules.GetOptionalSharpModuleInterface<ITargetingManager>(ITargetingManager.Identity);
 
-        var targeting = _modules.GetOptionalSharpModuleInterface<ITargetingManager>(ITargetingManager.Identity);
+        _ctx!.ProxyHandle = proxyHandle;
+        _ctx.Targeting    = targeting;
 
-        _ctx!.Handle    = _sendProxyHandle;
-        _ctx.Targeting  = targeting;
-
-        if (_sendProxy is null)
+        if (_ctx.Proxy is null)
         {
-            _logger.LogWarning("SendProxy not loaded — example disabled");
+            _logger.LogWarning("ProxyManager not loaded — example disabled");
 
             return;
         }
 
         _categories =
         [
-            new GenericCommands(_ctx),
-            new PresetCommands(_ctx),
-            new EncoderDemoCommands(_ctx),
             new FakeAimCommands(_ctx),
             new ProbeCommands(_ctx),
+            new ProxyCommands(_ctx),
         ];
 
         TryRegisterCommands();
@@ -127,8 +120,6 @@ public sealed class ExampleModule : IModSharpModule
         {
             c.Unregister();
         }
-
-        _sendProxy?.UnhookAll();
     }
 
     #endregion
@@ -137,7 +128,7 @@ public sealed class ExampleModule : IModSharpModule
 
     private void TryRegisterCommands()
     {
-        if (_commandsRegistered || _sendProxy is null)
+        if (_commandsRegistered || _ctx?.Proxy is null)
         {
             return;
         }

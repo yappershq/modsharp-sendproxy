@@ -29,6 +29,7 @@ using Sharp.Shared.Objects;
 using Sharp.Shared.Types;
 using YappersHQ.SendProxy.Shared;
 
+
 namespace YappersHQ.SendProxy.Example;
 
 internal sealed class ExampleContext
@@ -36,10 +37,10 @@ internal sealed class ExampleContext
     public const string Permission = "sendproxy:example";
 
     // Cache the interface WRAPPER, not the instance: GetOptionalSharpModuleInterface returns a handle that
-    // tracks the live interface, so reading .Instance per use always gives the current SendProxy even if it
+    // tracks the live interface, so reading .Instance per use always gives the current proxy even if it
     // hot-reloads. Caching the raw .Instance would dangle on reload (per ModSharp authors / laper).
-    public IModSharpModuleInterface<ISendProxyManager>? Handle { get; set; }
-    public ISendProxyManager?                           SendProxy => Handle?.Instance;
+    public IModSharpModuleInterface<IProxyManager>? ProxyHandle { get; set; }
+    public IProxyManager?                           Proxy => ProxyHandle?.Instance;
 
     public IEntityManager                              EntityManager { get; }
     public IClientManager                              ClientManager { get; }
@@ -83,34 +84,6 @@ internal sealed class ExampleContext
         }
 
         Logger.LogInformation("{Message}", message);
-    }
-
-    public void ForceResendAll(string serializerName, string fieldName)
-    {
-        var onController = serializerName.Contains("Controller", StringComparison.Ordinal);
-        foreach (var client in ClientManager.GetGameClients(inGame: true))
-        {
-            // Bots have no screen and the engine never sends them snapshots, so there's nothing to
-            // re-transmit on their behalf — skip them.
-            if (client.IsFakeClient || client.IsHltv)
-            {
-                continue;
-            }
-
-            if (client.GetPlayerController() is not { } controller)
-            {
-                continue;
-            }
-
-            if (onController)
-            {
-                controller.NetworkStateChanged(fieldName);
-            }
-            else if (controller.GetPlayerPawn() is { } pawn)
-            {
-                pawn.NetworkStateChanged(fieldName);
-            }
-        }
     }
 
     // ── Static parse helpers ──────────────────────────────────────────────────────────────────────

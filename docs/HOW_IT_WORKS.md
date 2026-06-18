@@ -37,32 +37,41 @@ SendProxy does both.
 
 ## 2. Two substitution paths
 
-SendProxy has two independent mechanisms, chosen automatically by which API you call.
+SendProxy has two independent mechanisms, chosen automatically by which output method the callback
+calls.
 
-### Uniform — hook the encoder (everyone sees the same fake)
+### Uniform — intercept the encoder (everyone sees the same fake)
 
 CS2 encodes each field through a small set of **encoder functions** (one per value family — see
-§3). SendProxy detours those functions. When a field you've registered is being packed, the hook
-points the encoder at a **scratch value** holding your fake instead of the real one, then lets the
-original encoder run. The fake bits go into the shared snapshot, so **every** client that receives
-that field sees the fake.
+§3). SendProxy intercepts those functions via an `IMidFuncHook` (observe-and-resume) at the
+per-entity encode wrapper (`CFlattenedSerializer::EncodeEntity`). When a field you've registered is
+being packed, the hook points the encoder at a **scratch value** holding your fake instead of the
+real one, then lets the original encoder run. The fake bits go into the shared snapshot, so
+**every** client that receives that field sees the fake.
 
-This is cheap (the encoder runs once, as usual) and is what `SetUniform(...)` uses.
+This is cheap (the encoder runs once, as usual) and is what `SetAll(value)` in the callback
+produces.
+
+> **Why an `IMidFuncHook`, not a detour?**
+> Detouring the recursive `EncodeEntity` path causes a stack overflow — each recursive call re-enters
+> the detour. `IMidFuncHook` (observe-and-resume, a mid-function hook) lets the library intercept the
+> field write point without re-entering on recursion. See
+> [`docs/ENCODE_CALLGRAPH_RE.md`](ENCODE_CALLGRAPH_RE.md) for the full crash and hook-type analysis.
 
 ### Per-client — rewrite the bits in the send loop (each client can differ)
 
 For different values per recipient, the encoder hook is useless (it runs once, with no idea who the
 packet is for). Instead SendProxy hooks the **per-client delta writer**:
 
-- A detour on the per-client encode entry captures **which client** is currently being written
+- A hook on the per-client encode entry captures **which client** is currently being written
   (stored in a thread-local for that client's encode chain).
-- A detour on `WriteFieldList` (the function that copies each changed field's bits into the
-  client's delta) intercepts the per-field copy. For a registered field it asks your callback for a
-  value *for this recipient*, encodes that value into a small scratch buffer, and copies **those**
-  bits into the client's stream instead of the real ones.
+- A hook on `WriteFieldList` (the function that copies each changed field's bits into the
+  client's delta) intercepts the per-field copy. For a field with a per-client override it uses the
+  value supplied via `SetFor`, encodes it into a small scratch buffer, and copies **those** bits
+  into the client's stream instead of the real ones.
 
 Because this runs per client, each recipient can get a different value — true per-client spoofing.
-`Hook(...)` with a `PerClient*Proxy` callback uses this path. (Deep detail:
+`SetFor(client, value)` in the callback uses this path. (Deep detail:
 [`RE_PERCLIENT_EMIT.md`](RE_PERCLIENT_EMIT.md).)
 
 > **Key insight that made per-client work:** the encoder can't be driven straight into the live
@@ -101,48 +110,68 @@ corrupts the stream.
 
 ## 4. The API
 
-Everything goes through `ISendProxyManager` (resolve it like any ModSharp module interface — and
-cache the **handle**, reading `.Instance` per use, so a SendProxy hot-reload can't dangle you).
+Everything goes through `IProxyManager` (resolve it in `OnAllModulesLoaded`, not `Init`/`PostInit`
+— ModSharp doesn't order publish across plugins; cache the handle and read `.Instance` per use so a
+SendProxy hot-reload can't dangle you).
 
 Fields are addressed by `(serializerName, fieldName)`, e.g. `("CCSPlayerPawn", "m_iHealth")`.
+
+The callback delegate is `ProxyCallback(ref ProxyContext ctx)`. It fires **once per (entity, field)**
+during the shared `PackEntities` pass — never per recipient. O(1) in player count.
 
 ### Uniform — same value for everyone
 
 ```csharp
-sp.SetUniform("CCSPlayerPawn", "m_iHealth", 1337);          // int
-sp.SetUniform("CCSPlayerController", "m_iszPlayerName", "Hacker");
-sp.SetUniform("CCSPlayerPawn", "m_bIsScoped", true);
-```
-
-### Per-client — a value computed per recipient
-
-```csharp
-// Each receiving client can be sent a different value. Runs on send worker threads — keep it fast
-// and thread-safe. Return false to pass the real value through for this client.
-sp.Hook("CCSPlayerPawn", "m_iHealth", (nint client, int entityIndex, ref int value) =>
+// Every client sees 1 HP for every player pawn.
+_proxy.Register("CCSPlayerPawn", "m_iHealth", static (ref ProxyContext ctx) =>
 {
-    value = PerClientHpFor(client);
-    return true;
+    ctx.SetAll(SpoofValue.Int(1));
+});
+
+_proxy.Register("CCSPlayerController", "m_iszPlayerName", static (ref ProxyContext ctx) =>
+{
+    ctx.SetAll(SpoofValue.String("Hacker"));
+});
+
+_proxy.Register("CCSPlayerPawn", "m_bIsScoped", static (ref ProxyContext ctx) =>
+{
+    ctx.SetAll(SpoofValue.Bool(true));
 });
 ```
+
+### Per-client — a value delivered only to a specific recipient
+
+```csharp
+// Only `viewer` sees this pawn's health as 1. Runs on pack worker — keep it fast and pure.
+_proxy.Register(pawn, "CCSPlayerPawn", "m_iHealth", (ref ProxyContext ctx) =>
+{
+    ctx.SetFor(viewer, SpoofValue.Int(1));
+});
+```
+
+`SetFor` may be called multiple times in one invocation to give different clients different values.
+Clients that receive no `SetFor` call see the real value.
 
 ### Per-entity — scope to one entity
 
 ```csharp
-sp.SetUniform(entity, "CCSPlayerPawn", "m_iHealth", 1);     // only this entity
-sp.Hook(entity, "CCSPlayerPawn", "m_iHealth", callback);    // per-client + per-entity
-```
+_proxy.Register(entity, "CCSPlayerPawn", "m_iHealth", static (ref ProxyContext ctx) =>
+{
+    ctx.SetAll(SpoofValue.Int(1));      // only this entity
+});
 
-### SendFake — push once, no persistent hook
-
-```csharp
-// Force the field to re-transmit now and carry the fake on that one send, then stop.
-sp.SendFake(client, entity, "CCSPlayerController", "m_iPawnHealth", 1337);
+_proxy.Register(entity, "CCSPlayerPawn", "m_iHealth", (ref ProxyContext ctx) =>
+{
+    ctx.SetFor(viewer, SpoofValue.Int(1));  // per-client + per-entity
+});
 ```
 
 ### Removing
 
-`Unhook(ser, field)` / `Unhook(entity, ser, field)` / `UnhookAll()`.
+```csharp
+_proxy.Unregister("CCSPlayerPawn", "m_iHealth");           // all-entities
+_proxy.Unregister(entity, "CCSPlayerPawn", "m_iHealth");   // entity-scoped
+```
 
 ---
 
@@ -150,17 +179,17 @@ sp.SendFake(client, entity, "CCSPlayerController", "m_iPawnHealth", 1337);
 
 ### "It only shows after the value changes"
 
-Registering a hook doesn't re-send anything. A static field (HP that isn't changing, a name) isn't
+Registering a proxy doesn't re-send anything. A static field (HP that isn't changing, a name) isn't
 re-transmitted until it **changes**, so the fake only appears on the next natural change. To show it
 immediately, force the field dirty — `entity.NetworkStateChanged("m_iHealth")` — which schedules a
-re-send. (That's also why, after `Unhook`, the client keeps the last fake until you re-dirty the
-field so the real value goes back out.) `SendFake` does this force-dirty for you.
+re-send. (That's also why, after `Unregister`, the client keeps the last fake until you re-dirty the
+field so the real value goes back out.) See `docs/FORCE_RESEND.md` for more detail.
 
 ### "Some values live in two places"
 
 HP is mirrored: the pawn's `CCSPlayerPawn::m_iHealth` is the real value (and drives your own HUD),
 while `CCSPlayerController::m_iPawnHealth` is the controller mirror used by the scoreboard, observer
-UI, and what other players see. To fake HP everywhere you spoof **both**. Most fields (team, name,
+UI, and what other players see. To fake HP everywhere you proxy **both**. Most fields (team, name,
 scoped, …) live in a single place.
 
 Also note **whose view a field affects**. `m_angEyeAngles` changes where a player *appears to be
@@ -178,8 +207,9 @@ on yourself shows on your own HUD; a fake you set on a bot shows when you look a
   is written unchanged.
 - **Consumer unloads.** When a consumer plugin unloads, SendProxy purges that module's callbacks, so
   the send path never invokes a delegate into an unloaded assembly.
-- **Detours install at startup.** All detours are installed once at load (not lazily mid-game),
-  avoiding a frame stall the first time a spoof is registered.
+- **Hook install.** The `IMidFuncHook` on the per-entity encode wrapper and the per-client delta
+  hooks are installed once at load (not lazily mid-game), avoiding a frame stall the first time a
+  proxy is registered.
 
 ---
 
@@ -199,5 +229,7 @@ on yourself shows on your own HUD; a fake you set on a bot shows when you look a
 
 - [`RE_ENCODERS.md`](RE_ENCODERS.md) — every encoder's value-pointer convention.
 - [`RE_PERCLIENT_EMIT.md`](RE_PERCLIENT_EMIT.md) — the per-client write path, decompile-cited.
+- [`ENCODE_CALLGRAPH_RE.md`](ENCODE_CALLGRAPH_RE.md) — crash analysis and hook-type choice for the
+  per-entity encode wrapper (`CFlattenedSerializer::EncodeEntity`).
 - [`REVERSE_ENGINEERING.md`](REVERSE_ENGINEERING.md) — the full pipeline RE (snapshot pack, send
   loop, gamedata signatures).

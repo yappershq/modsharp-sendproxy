@@ -38,7 +38,9 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private const string BitCopyKey                     = "CFlattenedSerializer::BitCopyPrimitive";
     private const string EncoderRegistryKey             = "CFlattenedSerializer::EncoderRegistry";
     private const string EncodeInt32Key                 = "CFlattenedSerializer::EncodeInt32";
-    private const string SerializerSingletonKey         = "CNetworkSerialization::SerializerSingleton";
+    // Capture site = the per-entity wrapper (the single, non-recursive, small-frame caller of Encode) — NOT
+    // CFlattenedSerializer::Encode itself (recursive 100KB frame → stack overflow). See ENCODE_CALLGRAPH_RE.md.
+    private const string EncodeKey                       = "CFlattenedSerializer::EncodeEntity";
 
     private static readonly string[] EncoderBucketKeys =
     {
@@ -53,7 +55,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
     private readonly ILogger<SendProxyModule> _logger;
     private readonly InterfaceBridge          _bridge;
-    private readonly SendProxyManager         _manager;
+    private readonly ProxyManager             _proxyManager;
 
     private nint _wdeAddr;
     private nint _perClientEncodeAddr;
@@ -63,6 +65,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     private nint _bitCopyAddr;
     private nint _registryAddr;
     private nint _encodeInt32Addr;
+    private nint _encodeAddr;
 
     public SendProxyModule(
         ISharedSystem   sharedSystem,
@@ -72,9 +75,9 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         IConfiguration? coreConfiguration,
         bool            hotReload)
     {
-        _logger  = sharedSystem.GetLoggerFactory().CreateLogger<SendProxyModule>();
-        _bridge  = new InterfaceBridge(sharedSystem);
-        _manager = new SendProxyManager(_logger);
+        _logger       = sharedSystem.GetLoggerFactory().CreateLogger<SendProxyModule>();
+        _bridge       = new InterfaceBridge(sharedSystem);
+        _proxyManager = new ProxyManager(_logger);
     }
 
     public string DisplayName   => "SendProxy";
@@ -100,11 +103,10 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
 
     public void PostInit()
     {
-        _manager.SetSubDetourInstaller(EnsureSubDetours);
-        _manager.SetUniformHookInstaller(EnsureUniformHook);
+        _proxyManager.SetHookInstaller(EnsureProxyHooks);
 
-        _bridge.SharpModuleManager.RegisterSharpModuleInterface<ISendProxyManager>(
-            this, ISendProxyManager.Identity, _manager);
+        _bridge.SharpModuleManager.RegisterSharpModuleInterface<IProxyManager>(
+            this, IProxyManager.Identity, _proxyManager);
 
         // Build the encoder classification map eagerly at load (resolution was set in Init) so
         // classification is ready and diagnosable from the boot log.
@@ -116,6 +118,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         // Ensure* paths (still wired above) become no-ops after this.
         EnsureUniformHook();
         EnsureSubDetours();
+        EnsureProxyHooks();
 
         _bridge.EntityManager.InstallEntityListener(this);
     }
@@ -123,11 +126,16 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     // A consumer module unloaded — purge any per-client callbacks it owns before the send path can
     // invoke a delegate into its unloaded AssemblyLoadContext (which would crash the server).
     public void OnLibraryDisconnect(string name)
-        => _manager.RemoveOwnerRegistrations(name);
+    {
+        _proxyManager.RemoveOwnerRegistrations(name);
+    }
 
     public void Shutdown()
     {
         UniformEncoderHook.Uninstall();
+        EncodeCapture.Uninstall();
+        ProxyRegistry.Clear();
+        PerClientDispatch.Clear();
         RecipientCapture.Uninstall();
         FieldSubstitution.Uninstall();
         _bridge.EntityManager.RemoveEntityListener(this);
@@ -144,10 +152,16 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     // is deleted (mirrors TransmitManager): indices are reused, and a delete+create of the same index in
     // one frame could otherwise leak a stale spoof onto the new entity for a frame.
     void IEntityListener.OnEntityCreated(IBaseEntity entity)
-        => _manager.RemoveEntityRegistrations((int) entity.Index);
+    {
+        _proxyManager.RemoveEntityRegistrations((int) entity.Index);
+        PerClientDispatch.ClearEntity((int) entity.Index);
+    }
 
     void IEntityListener.OnEntityDeleted(IBaseEntity entity)
-        => _manager.RemoveEntityRegistrations((int) entity.Index);
+    {
+        _proxyManager.RemoveEntityRegistrations((int) entity.Index);
+        PerClientDispatch.ClearEntity((int) entity.Index);
+    }
 
     #endregion
 
@@ -167,6 +181,8 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         _bitCopyAddr                     = ResolveFromGameData(BitCopyKey);
         _registryAddr                    = ResolveFromGameData(EncoderRegistryKey);
         _encodeInt32Addr                 = ResolveFromGameData(EncodeInt32Key);
+        _encodeAddr                      = ResolveFromGameData(EncodeKey);
+        EncodeCapture.Addr               = _encodeAddr;
 
         var bucketAddrs = new nint[EncoderBucketKeys.Length];
         for (var i = 0; i < EncoderBucketKeys.Length; i++)
@@ -175,11 +191,6 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         }
 
         FieldSubstitution.SetEncoderResolution(_registryAddr, bucketAddrs, _encodeInt32Addr);
-
-        // Force-resend (off by default): hand it the serializer-singleton global so it CAN install its
-        // WriteFields vtable hook later if enabled. Resolving the address is harmless; nothing is hooked
-        // until ForceResend.SetEnabled(true).
-        ForceResend.Configure(_bridge, _logger, ResolveFromGameData(SerializerSingletonKey));
     }
 
     private nint ResolveFromGameData(string key)
@@ -187,7 +198,7 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
         try
         {
             var addr = _bridge.GameData.GetAddress(key);
-            _logger.LogInformation("SendProxy resolve {Key}: addr=0x{Addr:X}", key, addr);
+            _logger.LogDebug("SendProxy resolve {Key}: addr=0x{Addr:X}", key, addr);
 
             return addr;
         }
@@ -203,6 +214,16 @@ public sealed class SendProxyModule : IModSharpModule, IEntityListener
     // the encoder map FieldSubstitution prebuilds at load.
     private bool EnsureUniformHook()
         => UniformEncoderHook.Install(_bridge, _logger, FieldSubstitution.EncoderTypeMap);
+
+    // Proxy dispatch (IProxyManager) rides the same per-field encoder detours as the uniform path and needs
+    // the per-entity encode capture for entity/serializer context. Idempotent.
+    private bool EnsureProxyHooks()
+    {
+        var encoderOk = EnsureUniformHook();
+        var captureOk = EncodeCapture.Install(_bridge, _logger);
+
+        return encoderOk && captureOk;
+    }
 
     private bool EnsureSubDetours()
     {

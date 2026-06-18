@@ -34,9 +34,13 @@ public enum SpoofKind : byte
 }
 
 /// <summary>
-///     A discriminated-union value that carries any spoofable field value. The struct is seeded by the
-///     dispatch layer from the live field and passed by <c>ref</c> to the <see cref="SendProxyCallback"/>;
-///     the callback reads the current seed and writes its desired output, then returns <c>true</c> to apply.
+///     A discriminated-union value that carries any spoofable field value. The real value is exposed in
+///     <see cref="ProxyContext.Original"/> when the callback fires; the callback produces a replacement via
+///     <see cref="ProxyContext.SetAll"/> (every client sees the override) or
+///     <see cref="ProxyContext.SetFor"/> (a specific client sees it). A <see cref="SpoofValue"/> is never
+///     passed by <c>ref</c> to be mutated and returned — construct one with the static factories
+///     (<see cref="Int"/>, <see cref="Float"/>, <see cref="Bool"/>, <see cref="Vector"/>,
+///     <see cref="String"/>, <see cref="Bytes"/>) and pass it to <c>SetAll</c>/<c>SetFor</c>.
 /// </summary>
 public struct SpoofValue
 {

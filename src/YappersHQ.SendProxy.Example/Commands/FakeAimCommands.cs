@@ -37,10 +37,9 @@ internal sealed class FakeAimCommands : ISpCommandCategory
     private readonly ExampleContext _ctx;
 
     // sp_fakeaim session state: a per-client (issuer-only) HP/team/cycling-color spoof on resolved targets.
-    private nint               _aimIssuer;            // recipient client ptr that sees the fakes
     private readonly List<int> _aimPawns       = new(); // target pawn entity indices (color re-dirtied each tick)
     private readonly List<int> _aimControllers = new();
-    private volatile uint      _aimColor;             // current cycling render color (RGBA), read on send threads
+    private volatile uint      _aimColor;               // current cycling render color (RGBA), read on send threads
     private int                _aimHue;
     private Guid               _aimTimer;
 
@@ -54,9 +53,9 @@ internal sealed class FakeAimCommands : ISpCommandCategory
 
     public void Unregister()
     {
-        if (_ctx.SendProxy is { } sp)
+        if (_ctx.Proxy is { } proxy)
         {
-            ClearFakeAim(sp);
+            ClearFakeAim(proxy);
         }
         else if (_aimTimer != Guid.Empty)
         {
@@ -71,7 +70,7 @@ internal sealed class FakeAimCommands : ISpCommandCategory
     // A repeating timer advances the colour and re-dirties m_clrRender on the targets so it keeps changing.
     private void OnFakeAim(IGameClient? issuer, StringCommand command)
     {
-        if (_ctx.SendProxy is not { } sp || issuer is null)
+        if (_ctx.Proxy is not { } proxy || issuer is null)
         {
             return;
         }
@@ -86,7 +85,7 @@ internal sealed class FakeAimCommands : ISpCommandCategory
         var targetArg = command.ArgCount >= 1 ? command.GetArg(1) : PredefinedTargets.Aim;
 
         // Clear any previous session so hooks/timer don't stack.
-        ClearFakeAim(sp);
+        ClearFakeAim(proxy);
 
         var targets = targeting.GetByTarget(issuer, targetArg).ToList();
         if (targets.Count == 0)
@@ -96,8 +95,6 @@ internal sealed class FakeAimCommands : ISpCommandCategory
             return;
         }
 
-        _aimIssuer = issuer.GetAbsPtr();
-        var issuerPtr = _aimIssuer;
         _aimHue   = 0;
         _aimColor = 0xFF0000FFu; // opaque red to start (RGBA)
 
@@ -109,32 +106,46 @@ internal sealed class FakeAimCommands : ISpCommandCategory
             }
 
             _aimControllers.Add((int) ctrl.Index);
-            sp.Hook(ctrl, "CCSPlayerController", "m_iPawnHealth", (IGameClient c, IBaseEntity _, ref SpoofValue v) => { if (c.GetAbsPtr() != issuerPtr) return false; v.AsInt = 1; return true; });
-            sp.Hook(ctrl, "CCSPlayerController", "m_iTeamNum",    (IGameClient c, IBaseEntity _, ref SpoofValue v) => { if (c.GetAbsPtr() != issuerPtr) return false; v.AsInt = 3; return true; });
-            SafeDirty(ctrl, "m_iPawnHealth");   // force an initial re-send so it shows at once
+
+            proxy.Register(ctrl, "CCSPlayerController", "m_iPawnHealth",
+                (ref ProxyContext ctx) => ctx.SetFor(issuer, SpoofValue.Int(1)));
+            proxy.Register(ctrl, "CCSPlayerController", "m_iTeamNum",
+                (ref ProxyContext ctx) => ctx.SetFor(issuer, SpoofValue.Int(3)));
+
+            SafeDirty(ctrl, "m_iPawnHealth");
             SafeDirty(ctrl, "m_iTeamNum");
 
             if (ctrl.GetPlayerPawn() is { } pawn)
             {
                 _aimPawns.Add((int) pawn.Index);
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iHealth",          (IGameClient c, IBaseEntity _, ref SpoofValue v) => { if (c.GetAbsPtr() != issuerPtr) return false; v.AsInt = 1; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iTeamNum",         (IGameClient c, IBaseEntity _, ref SpoofValue v) => { if (c.GetAbsPtr() != issuerPtr) return false; v.AsInt = 3; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_clrRender",        (IGameClient c, IBaseEntity _, ref SpoofValue v) => { if (c.GetAbsPtr() != issuerPtr) return false; v.AsInt = unchecked((int) _aimColor); return true; });
+
+                proxy.Register(pawn, "CCSPlayerPawn", "m_iHealth",
+                    (ref ProxyContext ctx) => ctx.SetFor(issuer, SpoofValue.Int(1)));
+                proxy.Register(pawn, "CCSPlayerPawn", "m_iTeamNum",
+                    (ref ProxyContext ctx) => ctx.SetFor(issuer, SpoofValue.Int(3)));
+                proxy.Register(pawn, "CCSPlayerPawn", "m_clrRender",
+                    (ref ProxyContext ctx) => ctx.SetFor(issuer, SpoofValue.Int(unchecked((int) _aimColor))));
                 // Glow: a coloured outline. The fields live on the EMBEDDED CGlowProperty (m_Glow), not on
                 // the pawn class — so the per-client hook matches by leaf name but the force-dirty goes
                 // through the parent m_Glow + sub-offset (see ReDirtyPawn). Full enable set (mirrors the
                 // known glow recipe: type=3, team=-1 all-see, wide range): type/team/range/rangemin/colour.
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iGlowType",         (IGameClient c, IBaseEntity _, ref SpoofValue v) => { if (c.GetAbsPtr() != issuerPtr) return false; v.AsInt = 3; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_iGlowTeam",         (IGameClient c, IBaseEntity _, ref SpoofValue v) => { if (c.GetAbsPtr() != issuerPtr) return false; v.AsInt = -1; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_nGlowRange",        (IGameClient c, IBaseEntity _, ref SpoofValue v) => { if (c.GetAbsPtr() != issuerPtr) return false; v.AsInt = 99999; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_nGlowRangeMin",     (IGameClient c, IBaseEntity _, ref SpoofValue v) => { if (c.GetAbsPtr() != issuerPtr) return false; v.AsInt = 0; return true; });
-                sp.Hook(pawn, "CCSPlayerPawn", "m_glowColorOverride", (IGameClient c, IBaseEntity _, ref SpoofValue v) => { if (c.GetAbsPtr() != issuerPtr) return false; v.AsInt = unchecked((int) _aimColor); return true; });
+                proxy.Register(pawn, "CCSPlayerPawn", "m_iGlowType",
+                    (ref ProxyContext ctx) => ctx.SetFor(issuer, SpoofValue.Int(3)));
+                proxy.Register(pawn, "CCSPlayerPawn", "m_iGlowTeam",
+                    (ref ProxyContext ctx) => ctx.SetFor(issuer, SpoofValue.Int(-1)));
+                proxy.Register(pawn, "CCSPlayerPawn", "m_nGlowRange",
+                    (ref ProxyContext ctx) => ctx.SetFor(issuer, SpoofValue.Int(99999)));
+                proxy.Register(pawn, "CCSPlayerPawn", "m_nGlowRangeMin",
+                    (ref ProxyContext ctx) => ctx.SetFor(issuer, SpoofValue.Int(0)));
+                proxy.Register(pawn, "CCSPlayerPawn", "m_glowColorOverride",
+                    (ref ProxyContext ctx) => ctx.SetFor(issuer, SpoofValue.Int(unchecked((int) _aimColor))));
+
                 ReDirtyPawn(pawn);
             }
         }
 
         // Drive the colour cycle: every 100ms advance the hue and re-dirty the colour fields on each target
-        // so the engine re-sends them (the per-client hook then writes the new colour). Repeatable timer.
+        // so the engine re-sends them (the per-client proxy then writes the new colour). Repeatable timer.
         _aimTimer = _ctx.ModSharp.PushTimer(CycleFakeAim, 0.1, GameTimerFlags.Repeatable);
 
         _ctx.Reply(issuer, $"sp_fakeaim: faking HP/team/colour/glow on {targets.Count} target(s) — only YOU see it. sp_fakeaim_off to clear.");
@@ -142,9 +153,9 @@ internal sealed class FakeAimCommands : ISpCommandCategory
 
     private void OnFakeAimOff(IGameClient? issuer, StringCommand command)
     {
-        if (_ctx.SendProxy is { } sp)
+        if (_ctx.Proxy is { } proxy)
         {
-            ClearFakeAim(sp);
+            ClearFakeAim(proxy);
         }
 
         _ctx.Reply(issuer, "sp_fakeaim_off: cleared (real values re-sent)");
@@ -202,7 +213,7 @@ internal sealed class FakeAimCommands : ISpCommandCategory
     }
 
     // Timer tick: advance the cycling colour and re-dirty the colour/glow on every target so they
-    // re-transmit (the per-client hooks then write the new colour).
+    // re-transmit (the per-client proxy then writes the new colour).
     private void CycleFakeAim()
     {
         _aimHue   = (_aimHue + 15) % 360;
@@ -218,9 +229,9 @@ internal sealed class FakeAimCommands : ISpCommandCategory
         }
     }
 
-    // Tear down a fakeaim session: stop the timer, unhook every per-entity registration on the targets, then
+    // Tear down a fakeaim session: stop the timer, unregister every per-entity proxy on the targets, then
     // re-dirty so the real values go back out, and clear state.
-    private void ClearFakeAim(ISendProxyManager sp)
+    private void ClearFakeAim(IProxyManager proxy)
     {
         if (_aimTimer != Guid.Empty)
         {
@@ -235,8 +246,8 @@ internal sealed class FakeAimCommands : ISpCommandCategory
                 continue;
             }
 
-            sp.Unhook(ctrl, "CCSPlayerController", "m_iPawnHealth");
-            sp.Unhook(ctrl, "CCSPlayerController", "m_iTeamNum");
+            proxy.Unregister(ctrl, "CCSPlayerController", "m_iPawnHealth");
+            proxy.Unregister(ctrl, "CCSPlayerController", "m_iTeamNum");
             SafeDirty(ctrl, "m_iPawnHealth");
             SafeDirty(ctrl, "m_iTeamNum");
         }
@@ -248,20 +259,19 @@ internal sealed class FakeAimCommands : ISpCommandCategory
                 continue;
             }
 
-            sp.Unhook(pawn, "CCSPlayerPawn", "m_iHealth");
-            sp.Unhook(pawn, "CCSPlayerPawn", "m_iTeamNum");
-            sp.Unhook(pawn, "CCSPlayerPawn", "m_clrRender");
-            sp.Unhook(pawn, "CCSPlayerPawn", "m_iGlowType");
-            sp.Unhook(pawn, "CCSPlayerPawn", "m_iGlowTeam");
-            sp.Unhook(pawn, "CCSPlayerPawn", "m_nGlowRange");
-            sp.Unhook(pawn, "CCSPlayerPawn", "m_nGlowRangeMin");
-            sp.Unhook(pawn, "CCSPlayerPawn", "m_glowColorOverride");
+            proxy.Unregister(pawn, "CCSPlayerPawn", "m_iHealth");
+            proxy.Unregister(pawn, "CCSPlayerPawn", "m_iTeamNum");
+            proxy.Unregister(pawn, "CCSPlayerPawn", "m_clrRender");
+            proxy.Unregister(pawn, "CCSPlayerPawn", "m_iGlowType");
+            proxy.Unregister(pawn, "CCSPlayerPawn", "m_iGlowTeam");
+            proxy.Unregister(pawn, "CCSPlayerPawn", "m_nGlowRange");
+            proxy.Unregister(pawn, "CCSPlayerPawn", "m_nGlowRangeMin");
+            proxy.Unregister(pawn, "CCSPlayerPawn", "m_glowColorOverride");
             ReDirtyPawn(pawn);
         }
 
         _aimControllers.Clear();
         _aimPawns.Clear();
-        _aimIssuer = 0;
     }
 
     // Full-saturation hue (0..359) -> packed RGBA (R | G<<8 | B<<16 | A<<24), opaque.

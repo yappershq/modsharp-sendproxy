@@ -25,7 +25,11 @@ using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Text;
 using Microsoft.Extensions.Logging;
+using Sharp.Shared.GameEntities;
 using Sharp.Shared.Hooks;
+using Sharp.Shared.Managers;
+using Sharp.Shared.Units;
+using YappersHQ.SendProxy.Shared;
 
 namespace YappersHQ.SendProxy.Native;
 
@@ -73,8 +77,9 @@ internal static unsafe class UniformEncoderHook
     private static readonly Dictionary<nint, (nint Trampoline, FieldType Type)> _byFn = new();
     private static readonly List<IDetourHook> _hooks = new();
 
-    private static volatile bool _installed;
-    private static ILogger?      _logger;
+    private static volatile bool   _installed;
+    private static ILogger?        _logger;
+    private static IEntityManager? _entityManager;
 
     private const int MaxSubstituteBytes = 4096;
 
@@ -112,7 +117,8 @@ internal static unsafe class UniformEncoderHook
             return true;
         }
 
-        _logger = logger;
+        _logger        = logger;
+        _entityManager = bridge.EntityManager;
 
         var hookFn = (nint) (delegate* unmanaged[Cdecl]<nint, nint, nint, nint, uint, nint>) &SharedHook;
 
@@ -181,6 +187,77 @@ internal static unsafe class UniformEncoderHook
 
         try
         {
+            // Proxy dispatch (IProxyManager model): fire the registered proxy ONCE here in the shared pack,
+            // with the entity context captured by EncodeCapture. SetAll → substitute into the shared snapshot
+            // (seen by every client, enters the delta naturally). SetFor (per-recipient) is applied at the
+            // per-client copy stage (consumed from the buffer). This is the O(1), thread-safe path.
+            // Fast-path gate: EncodeCapture resolved (once per entity) whether ANY proxy targets this
+            // entity's serializer. For the overwhelming majority of entities it does not, so skip the
+            // per-field name-read + lookup entirely — this branch only runs for proxied serializers.
+            if (EncodeCapture.SerializerHasProxy && _entityManager is { } em)
+            {
+                var entIdx = EncodeCapture.EntityIndex;
+                if (entIdx >= 0)
+                {
+                    var serName = EncodeCapture.SerializerName;
+                    var field   = NativeUtil.ReadFieldName(fieldInfo);
+
+                    ProxyRegistry.Entry proxy = default;
+                    var matched = field.Length > 0 && ProxyRegistry.TryGet(serName, field, entIdx, out proxy);
+
+                    if (matched && proxy.Callback is not null)
+                    {
+                        var entity = em.FindEntityByIndex((EntityIndex) entIdx);
+                        if (entity is not null)
+                        {
+                            var ctx = new ProxyContext(entity, new ProxyField(field, MapKind(entry.Type)),
+                                ReadOriginal(entry.Type, valuePtr), ProxyRegistry.RentPerClientBuffer());
+
+                            var invoked = false;
+                            try
+                            {
+                                proxy.Callback(ref ctx);
+                                invoked = true;
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger?.LogWarning(ex, "SendProxy: proxy threw for \"{Ser}::{Field}\" — passthrough", serName, field);
+                            }
+
+                            // SetFor (per-recipient): record the overrides for the per-client copy stage to
+                            // consume, and — if there's no uniform value — write one recipient's value into
+                            // the SHARED snapshot so the field differs from baseline and enters EVERY client's
+                            // delta. The per-client copy (FieldSubstitution) then applies each recipient's
+                            // value or restores the real value for non-recipients.
+                            if (invoked && ctx.HasPerClient)
+                            {
+                                var def = ctx.HasUniform ? ctx.UniformValue : ctx.Original;
+                                PerClientDispatch.Record(entIdx, field, entry.Type, in def, ctx.PerClientValues);
+
+                                if (!ctx.HasUniform && ctx.PerClientValues.Count > 0)
+                                {
+                                    var force = ctx.PerClientValues[0].Value;
+                                    var fr    = EncodeWith(in force, entry.Type, tramp, bf, fieldInfo, paramsPtr, valuePtr, extra, out var fok);
+                                    if (fok)
+                                    {
+                                        return fr;
+                                    }
+                                }
+                            }
+
+                            if (invoked && ctx.HasUniform)
+                            {
+                                var r = EncodeWith(in ctx.UniformValue, entry.Type, tramp, bf, fieldInfo, paramsPtr, valuePtr, extra, out var ok);
+                                if (ok)
+                                {
+                                    return r;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             if (!_byName.IsEmpty)
             {
                 var name = NativeUtil.ReadFieldName(fieldInfo);
@@ -373,4 +450,233 @@ internal static unsafe class UniformEncoderHook
 
     private static nint Invoke(nint tramp, nint bf, nint fieldInfo, nint paramsPtr, nint valuePtr, uint extra)
         => ((delegate* unmanaged[Cdecl]<nint, nint, nint, nint, uint, nint>) tramp)(bf, fieldInfo, paramsPtr, valuePtr, extra);
+
+    // Read the field's REAL value (the value the encoder is about to write) into a SpoofValue, so the proxy
+    // callback can see Original and so the per-viewer path can restore it for non-recipients. valuePtr is the
+    // value pointer the encoder reads; its shape matches the encoder family. Guarded — returns default on any
+    // bad pointer (the callback then just gets an empty Original, which is safe).
+    private static SpoofValue ReadOriginal(FieldType type, nint valuePtr)
+    {
+        if (!NativeUtil.IsUserPtr(valuePtr))
+        {
+            return default;
+        }
+
+        switch (type)
+        {
+            case FieldType.Int32:
+            case FieldType.Fixed32:
+                return SpoofValue.Int(*(int*) valuePtr);
+            case FieldType.UInt32:
+                return SpoofValue.Int(unchecked((int) *(uint*) valuePtr));
+            case FieldType.Int64:
+            case FieldType.Fixed64:
+                return SpoofValue.Int(unchecked((int) *(long*) valuePtr));
+            case FieldType.Bool:
+                return SpoofValue.Bool(*(byte*) valuePtr != 0);
+            case FieldType.Float32:
+            case FieldType.QuantizedFloat:
+            case FieldType.Coord3:
+            case FieldType.Normal3:
+            case FieldType.CoordIntegral3:
+                return SpoofValue.Float(*(float*) valuePtr);
+            case FieldType.QAngle3:
+            case FieldType.Vector3:
+                return SpoofValue.Vector(new System.Numerics.Vector3(
+                    ((float*) valuePtr)[0], ((float*) valuePtr)[1], ((float*) valuePtr)[2]));
+            case FieldType.String:
+            {
+                var p = *(nint*) valuePtr; // encoder reads *valuePtr as char*
+                return NativeUtil.IsUserPtr(p)
+                    ? SpoofValue.String(NativeUtil.ReadShortAscii(p, 256))
+                    : default;
+            }
+            default:
+                return default; // ByteArray / unknown — leave Original empty
+        }
+    }
+
+    // Map a resolved encoder FieldType to the SpoofValue family a proxy callback uses (for ProxyField.Kind).
+    private static SpoofKind MapKind(FieldType t)
+        => t switch
+        {
+            FieldType.Float32 or FieldType.Coord3 or FieldType.Normal3
+                or FieldType.CoordIntegral3 or FieldType.QuantizedFloat => SpoofKind.Float,
+            FieldType.QAngle3 or FieldType.Vector3 => SpoofKind.Vector,
+            FieldType.Bool      => SpoofKind.Bool,
+            FieldType.String    => SpoofKind.String,
+            FieldType.ByteArray => SpoofKind.Bytes,
+            _                   => SpoofKind.Int,
+        };
+
+    // Encode a SpoofValue into the field via the engine encoder, building the scratch in the layout the
+    // field's actual encoder (type) reads. The stackalloc + Invoke both happen in THIS frame so string/byte
+    // buffers stay live during the encode. ok=false → the value kind is incompatible or oversized for this
+    // field; the caller then passes the real value through.
+    private static nint EncodeWith(in SpoofValue v, FieldType type, nint tramp, nint bf, nint fieldInfo,
+        nint paramsPtr, nint valuePtr, uint extra, out bool ok)
+    {
+        ok = true;
+        var scratch    = stackalloc byte[0x30];
+        var stringSlot = stackalloc nint[1];
+
+        switch (v.Kind)
+        {
+            case SpoofKind.Int:
+                switch (type)
+                {
+                    case FieldType.UInt32:
+                        *(ulong*) scratch = (uint) v.RawIntBits;
+
+                        return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
+                    case FieldType.Int32:
+                    case FieldType.Int64:
+                    case FieldType.Fixed32:
+                    case FieldType.Fixed64:
+                        *(long*) scratch = v.RawIntBits;
+
+                        return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
+                    case FieldType.Bool:
+                        *scratch = (byte) (v.RawIntBits != 0 ? 1 : 0);
+
+                        return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
+                    default:
+                        ok = false;
+
+                        return 0;
+                }
+
+            case SpoofKind.Bool:
+                if (type != FieldType.Bool)
+                {
+                    ok = false;
+
+                    return 0;
+                }
+
+                *scratch = (byte) (v.RawIntBits != 0 ? 1 : 0);
+
+                return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
+
+            case SpoofKind.Float:
+                if (type == FieldType.Float32)
+                {
+                    *(double*) scratch = v.RawFloat;
+
+                    return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
+                }
+
+                if (IsStructFloatType(type))
+                {
+                    CopyRealOrZero(scratch, valuePtr);
+                    ((float*) scratch)[0] = v.RawFloat;
+
+                    return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
+                }
+
+                ok = false;
+
+                return 0;
+
+            case SpoofKind.Vector:
+                if (!IsVectorScratchType(type))
+                {
+                    ok = false;
+
+                    return 0;
+                }
+
+                CopyRealOrZero(scratch, valuePtr);
+                ((float*) scratch)[0] = v.RawVec.X;
+                ((float*) scratch)[1] = v.RawVec.Y;
+                ((float*) scratch)[2] = v.RawVec.Z;
+
+                return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
+
+            case SpoofKind.String:
+            {
+                if (type != FieldType.String)
+                {
+                    ok = false;
+
+                    return 0;
+                }
+
+                var s       = v.RawStr ?? string.Empty;
+                var byteLen = Encoding.UTF8.GetByteCount(s);
+                if (byteLen > MaxSubstituteBytes)
+                {
+                    ok = false;
+
+                    return 0;
+                }
+
+                var strBuf = stackalloc byte[byteLen + 1];
+                Encoding.UTF8.GetBytes(s, new Span<byte>(strBuf, byteLen));
+                strBuf[byteLen] = 0;
+                *stringSlot     = (nint) strBuf;
+
+                return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) stringSlot, extra);
+            }
+
+            case SpoofKind.Bytes:
+            {
+                if (type != FieldType.ByteArray)
+                {
+                    ok = false;
+
+                    return 0;
+                }
+
+                var b = v.RawBytes ?? Array.Empty<byte>();
+                if (b.Length > MaxSubstituteBytes)
+                {
+                    ok = false;
+
+                    return 0;
+                }
+
+                var buf = stackalloc byte[b.Length == 0 ? 1 : b.Length];
+                for (var i = 0; i < b.Length; i++)
+                {
+                    buf[i] = b[i];
+                }
+
+                for (var i = 0; i < 0x30; i++)
+                {
+                    scratch[i] = 0;
+                }
+
+                *(nint*) (scratch + 0x00) = (nint) buf;
+                *(uint*) (scratch + 0x28) = (uint) b.Length;
+
+                return Invoke(tramp, bf, fieldInfo, paramsPtr, (nint) scratch, extra);
+            }
+
+            default:
+                ok = false;
+
+                return 0;
+        }
+    }
+
+    // Copy the real value struct (preserving the component-count/mode at +0x28 that coord/quant encoders
+    // read) into scratch, or zero it if the real pointer is unreadable.
+    private static void CopyRealOrZero(byte* scratch, nint valuePtr)
+    {
+        if (NativeUtil.IsUserPtr(valuePtr))
+        {
+            for (var i = 0; i < 0x30; i++)
+            {
+                scratch[i] = *(byte*) (valuePtr + i);
+            }
+        }
+        else
+        {
+            for (var i = 0; i < 0x30; i++)
+            {
+                scratch[i] = 0;
+            }
+        }
+    }
 }
